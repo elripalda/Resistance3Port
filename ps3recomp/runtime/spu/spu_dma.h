@@ -213,12 +213,20 @@ extern "C" {
  * lanes, with the first 32 bytes moved. Dumped by the solver guard. */
 void spu_phys_trace(const spu_context* spu, uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size);
 void spu_phys_trace_dump(const char* path);
+extern int g_spu_jobtrace_id;
+void spu_jobtrace(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd, int unused);
+int spu_ls_window_transfer(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd);
 #ifdef __cplusplus
 }
 #endif
 static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
+    if (g_spu_jobtrace_id) spu_jobtrace(spu, lsa, ea, size, cmd, 0);
+    /* Records the issuing context as resident on its SPU lane, and serves the
+     * SPU-thread LS window (EA 0xF0000000 + n*0x100000 + off) from the
+     * context resident on lane n. */
+    { int w = spu_ls_window_transfer(spu, lsa, ea, size, cmd); if (w) return w > 0 ? 0 : -1; }
     { spu_dma_trace_ent* te = &g_spu_dma_ring[g_spu_dma_ring_n++ & 511u];
       te->cmd = cmd; te->lsa = lsa; te->ea = (uint32_t)ea; te->size = size; }
     if (((uint32_t)ea - 0x400F0000u) < 0x00510000u || ((uint32_t)ea - 0x10320000u) < 0x00010000u)

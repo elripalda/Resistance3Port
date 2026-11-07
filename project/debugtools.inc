@@ -330,6 +330,46 @@ static void dbg_projscan(void)
     dbg_printf("  %d projection matrices%c", found, 10);
 }
 
+/* nanscan: every word in guest RAM whose float exponent is 255 (Inf/NaN) and
+ * that is not a common all-ones sentinel. The first call remembers the set;
+ * later calls print the words that are new since the previous call, with the
+ * 16 words around each new cluster as floats. */
+#include <unordered_set>
+static std::unordered_set<uint32_t> s_nanset;
+static bool s_nanset_live = false;
+static void dbg_nanscan(unsigned maxprint)
+{
+    if (!maxprint) maxprint = 40;
+    std::unordered_set<uint32_t> cur;
+    guest_ram_walk([&](uint32_t b, uint32_t e) {
+        for (uint32_t q = b; q + 4 <= e; q += 4) {
+            uint32_t v; memcpy(&v, vm_base + q, 4);
+            v = (v >> 24) | ((v >> 8) & 0xFF00u) | ((v << 8) & 0xFF0000u) | (v << 24);
+            if ((v & 0x7F800000u) != 0x7F800000u) continue;
+            if ((v & 0x7FFFFFFFu) == 0x7FFFFFFFu || (v & 0xFFFF0000u) == 0xFFFF0000u || (v & 0xFFFF0000u) == 0x7FFF0000u) continue;
+            cur.insert(q);
+        } });
+    dbg_printf("  %zu Inf/NaN words%c", cur.size(), 10);
+    if (s_nanset_live) {
+        std::vector<uint32_t> nw;
+        for (uint32_t q : cur) if (!s_nanset.count(q)) nw.push_back(q);
+        std::sort(nw.begin(), nw.end());
+        dbg_printf("  %zu new since last scan%c", nw.size(), 10);
+        uint32_t last = 0; unsigned shown = 0;
+        for (uint32_t q : nw) {
+            if (last && q - last < 64) { last = q; continue; }
+            last = q;
+            if (shown++ >= maxprint) break;
+            uint32_t v; memcpy(&v, vm_base + q, 4);
+            dbg_printf("  new 0x%08X:", q);
+            for (uint32_t s = (q & ~15u) - 16; s < (q & ~15u) + 48; s += 4) dbg_printf(" %.4g", be_f32_at(s));
+            dbg_printf("%c", 10);
+        }
+    }
+    s_nanset.swap(cur);
+    s_nanset_live = true;
+}
+
 static void dbg_knobs(const char* prefix)
 {
     /* Which diagnostics this run was actually started with. */
@@ -621,8 +661,40 @@ extern "C" void port_pad_slot_note(uint32_t obj, uint32_t slot)
     if (n < 4) { s_pw_obj[n] = obj; s_pw_slot[n] = slot; s_pw_nobj = n + 1; }
 }
 static volatile LONG s_pw_on = 0;
-static struct { DWORD64 rip; LONG n; DWORD dr; DWORD tid; } s_pw_hits[128];
+static struct { DWORD64 rip; LONG n; DWORD dr; DWORD tid; void* stk[12]; USHORT nstk; } s_pw_hits[128];
 static volatile LONG s_pw_n = 0;
+static DWORD64 s_pw_rw = 3;          /* Dr7 R/W bits: 3 = read/write, 1 = write only (hwwatch) */
+static volatile LONG s_pw_stack = 0; /* hwwatch: capture a stack for each new site */
+/* hwwatch full log lines: the guest state at each hit (first few per site). */
+extern "C" PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+struct hw_line { LONG site; DWORD dr; uint32_t ea, val, lr, r1, g[8], bt[8]; double f1; DWORD ms; };
+static hw_line s_hw_lines[512]; static volatile LONG s_hw_nl = 0;
+static uint32_t s_hw_watch_ea[4];
+static void hw_note(LONG site, DWORD st, LONG nth)
+{
+    if (!s_pw_stack || nth > 6) return;
+    ppu_context* c = g_active_ctx;
+    const LONG k = InterlockedIncrement(&s_hw_nl) - 1;
+    if (k >= 512) return;
+    hw_line& L = s_hw_lines[k];
+    memset(&L, 0, sizeof L);
+    L.site = site; L.dr = st; L.ms = GetTickCount();
+    for (int d = 0; d < 4; d++) if (st & (1u << d)) { L.ea = s_hw_watch_ea[d]; break; }
+    if (L.ea) L.val = vm_read32(L.ea);
+    if (c) {
+        L.lr = (uint32_t)c->lr; L.r1 = (uint32_t)c->gpr[1]; L.f1 = c->fpr[1];
+        for (int i = 0; i < 8; i++) L.g[i] = (uint32_t)c->gpr[3 + i];
+        /* guest back chain: each frame's [sp] is the caller frame, caller's
+         * LR save word at caller_sp+0x10 */
+        uint32_t sp = L.r1;
+        for (int i = 0; i < 8 && sp && sp < 0xF0000000u && !(sp & 7); i++) {
+            const uint32_t up = (uint32_t)vm_read64(sp);
+            if (!up || up <= sp) break;
+            L.bt[i] = (uint32_t)vm_read64(up + 0x10);
+            sp = up;
+        }
+    }
+}
 static LONG WINAPI pw_veh(EXCEPTION_POINTERS* ep)
 {
     if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP || !s_pw_on) return EXCEPTION_CONTINUE_SEARCH;
@@ -632,8 +704,13 @@ static LONG WINAPI pw_veh(EXCEPTION_POINTERS* ep)
     const DWORD64 rip = (DWORD64)ep->ExceptionRecord->ExceptionAddress;
     LONG n = s_pw_n; int found = 0;
     for (LONG i = 0; i < n && i < 128; i++)
-        if (s_pw_hits[i].rip == rip) { s_pw_hits[i].n++; s_pw_hits[i].dr |= (DWORD)st; found = 1; break; }
-    if (!found && n < 128) { s_pw_hits[n].rip = rip; s_pw_hits[n].n = 1; s_pw_hits[n].dr = (DWORD)st; s_pw_hits[n].tid = GetCurrentThreadId(); s_pw_n = n + 1; }
+        if (s_pw_hits[i].rip == rip) { const LONG nth = ++s_pw_hits[i].n; s_pw_hits[i].dr |= (DWORD)st; hw_note(i, (DWORD)st, nth); found = 1; break; }
+    if (!found && n < 128) {
+        s_pw_hits[n].rip = rip; s_pw_hits[n].n = 1; s_pw_hits[n].dr = (DWORD)st; s_pw_hits[n].tid = GetCurrentThreadId();
+        s_pw_hits[n].nstk = s_pw_stack ? RtlCaptureStackBackTrace(0, 12, s_pw_hits[n].stk, NULL) : 0;
+        s_pw_n = n + 1;
+        hw_note(n, (DWORD)st, 1);
+    }
     c->Dr6 = 0;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -653,7 +730,7 @@ static int pw_set(DWORD tid, const DWORD64* a, int on)
                 /* 4 bytes when 4-aligned, else the 8 around it */
                 const DWORD64 len = (a[k] & 3) ? 2 : 3;
                 *dr[k] = (a[k] & 3) ? (a[k] & ~7ull) : a[k];
-                c.Dr7 |= (1ull << (2 * k)) | (3ull << (16 + 4 * k)) | (len << (18 + 4 * k));
+                c.Dr7 |= (1ull << (2 * k)) | (s_pw_rw << (16 + 4 * k)) | (len << (18 + 4 * k));
             }
         }
         c.Dr6 = 0;
@@ -721,6 +798,72 @@ static void pad_watch_run(void)
     fprintf(stderr, "[padwatch] done: %ld instruction sites -> %s%c", (long)s_pw_n, pwn, 10);
 }
 static DWORD WINAPI pad_watch_thread(LPVOID) { pad_watch_run(); return 0; }
+/* hwwatch <ea> [secs] [ea2 ea3 ea4]: hardware WRITE breakpoints on guest
+ * words, armed on every thread; each distinct writing instruction is logged
+ * with a host stack (module RVAs) to logs\hwwatch_N.txt. Catches lifted PPU
+ * stores and SPU DMA (memcpy under the MFC) alike. */
+static volatile LONG s_hw_busy = 0;
+static uint32_t s_hw_ea[4]; static unsigned s_hw_secs;
+static DWORD WINAPI hw_watch_thread(LPVOID)
+{
+    static PVOID h = NULL;
+    if (!h) h = AddVectoredExceptionHandler(1, pw_veh);
+    DWORD64 a[4] = { 0, 0, 0, 0 };
+    for (int k = 0; k < 4; k++) if (s_hw_ea[k]) a[k] = (DWORD64)(vm_base + (s_hw_ea[k] & ~3u));
+    for (int k = 0; k < 4; k++) s_hw_watch_ea[k] = s_hw_ea[k] & ~3u;
+    s_hw_nl = 0;
+    s_pw_n = 0; s_pw_rw = 1; s_pw_stack = 1; s_pw_on = 1;
+    static DWORD tids[512]; int nt = 0;
+    { HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+      THREADENTRY32 te; te.dwSize = sizeof te;
+      if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) {
+          do { if (te.th32OwnerProcessID == GetCurrentProcessId() && te.th32ThreadID != GetCurrentThreadId() && nt < 512)
+                   tids[nt++] = te.th32ThreadID; } while (Thread32Next(snap, &te));
+      }
+      if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap); }
+    int ok = 0;
+    for (int i = 0; i < nt; i++) ok += pw_set(tids[i], a, 1);
+    fprintf(stderr, "[hwwatch] 0x%08X 0x%08X 0x%08X 0x%08X for %u s (%d of %d threads)%c",
+            s_hw_ea[0], s_hw_ea[1], s_hw_ea[2], s_hw_ea[3], s_hw_secs, ok, nt, 10);
+    Sleep(s_hw_secs * 1000);
+    { const DWORD64 z[4] = { 0, 0, 0, 0 }; for (int i = 0; i < nt; i++) pw_set(tids[i], z, 0); }
+    Sleep(50);
+    s_pw_on = 0; s_pw_rw = 3; s_pw_stack = 0;
+    const DWORD64 mb = (DWORD64)GetModuleHandleA(NULL);
+    static int run = 0; char fn[64]; snprintf(fn, sizeof fn, "logs\\hwwatch_%d.txt", ++run);
+    FILE* f = fopen(fn, "w");
+    if (f) {
+        fprintf(f, "# module base 0x%llX; watched 0x%08X 0x%08X 0x%08X 0x%08X\n", (unsigned long long)mb,
+                s_hw_ea[0], s_hw_ea[1], s_hw_ea[2], s_hw_ea[3]);
+        for (LONG i = 0; i < s_pw_n && i < 128; i++) {
+            fprintf(f, "site rva=0x%llX hits=%ld dr=%lu tid=%lu\n", (unsigned long long)(s_pw_hits[i].rip - mb),
+                    s_pw_hits[i].n, s_pw_hits[i].dr, s_pw_hits[i].tid);
+            for (USHORT j = 0; j < s_pw_hits[i].nstk; j++) {
+                const DWORD64 r = (DWORD64)s_pw_hits[i].stk[j];
+                HMODULE m = NULL; char b[MAX_PATH] = "?";
+                GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)r, &m);
+                if ((DWORD64)m == mb) fprintf(f, "  ret rva=0x%llX\n", (unsigned long long)(r - mb));
+                else { if (m) GetModuleFileNameA(m, b, sizeof b); fprintf(f, "  %s+0x%llX\n", strrchr(b, '\\') ? strrchr(b, '\\') + 1 : b, (unsigned long long)(r - (DWORD64)m)); }
+            }
+        }
+        const LONG nl = s_hw_nl < 512 ? s_hw_nl : 512;
+        fprintf(f, "# %ld guest hit lines (first 6 per site)\n", (long)nl);
+        for (LONG i = 0; i < nl; i++) {
+            const hw_line& L = s_hw_lines[i];
+            float fv; memcpy(&fv, &L.val, 4);
+            fprintf(f, "hit site=%ld t=%lu ea=%08X val=%08X (%g) lr=%08X r1=%08X f1=%g r3=%08X r4=%08X r5=%08X r6=%08X r7=%08X r8=%08X r9=%08X r10=%08X bt=",
+                    (long)L.site, (unsigned long)L.ms, L.ea, L.val, fv, L.lr, L.r1, L.f1,
+                    L.g[0], L.g[1], L.g[2], L.g[3], L.g[4], L.g[5], L.g[6], L.g[7]);
+            for (int j = 0; j < 8 && L.bt[j]; j++) fprintf(f, "%08X ", L.bt[j]);
+            fputc('\n', f);
+        }
+        fclose(f);
+    }
+    fprintf(stderr, "[hwwatch] done: %ld writer sites -> %s%c", (long)s_pw_n, fn, 10);
+    dbg_printf("[hwwatch] done: %ld writer sites -> %s%c", (long)s_pw_n, fn, 10);
+    InterlockedExchange(&s_hw_busy, 0);
+    return 0;
+}
 static DWORD WINAPI debug_console(LPVOID param)
 {
     const char* path = (const char*)param;
@@ -961,6 +1104,16 @@ static DWORD WINAPI debug_console(LPVOID param)
             g_pad_inj_btn = bt; g_pad_inj_sticks = ((lx & 255) << 24) | ((ly & 255) << 16) | ((rx & 255) << 8) | (ry & 255);
             g_pad_inj_until = ps3_ms_now() + ms;
             dbg_printf("  pad btn=0x%04X l=(%u,%u) r=(%u,%u) for %u ms%c", bt, lx, ly, rx, ry, ms, 10);
+        } else if (!strcmp(verb, "hwwatch") && sscanf(cmd, "%*s %x", &a) == 1) {
+            uint32_t e2 = 0, e3 = 0, e4 = 0; unsigned secs = 3;
+            sscanf(cmd, "%*s %*x %u %x %x %x", &secs, &e2, &e3, &e4);
+            if (!vm_base) dbg_printf("  vm_base not live yet%c", 10);
+            else if (s_pw_on || InterlockedExchange(&s_hw_busy, 1)) dbg_printf("  a watch is already running%c", 10);
+            else {
+                s_hw_ea[0] = a; s_hw_ea[1] = e2; s_hw_ea[2] = e3; s_hw_ea[3] = e4; s_hw_secs = secs ? secs : 3;
+                CloseHandle(CreateThread(NULL, 0, hw_watch_thread, NULL, 0, NULL));
+                dbg_printf("  hwwatch armed on 0x%08X for %u s -> logs\\hwwatch_N.txt%c", a, s_hw_secs, 10);
+            }
         } else if (!strcmp(verb, "spu")) {
             spu_dbg_dump_all(dbg_out_str);
         } else if (!strcmp(verb, "spuls") && sscanf(cmd, "%*s %u %x %u", &a, &b, &c) >= 2) {
@@ -993,6 +1146,8 @@ static DWORD WINAPI debug_console(LPVOID param)
             sscanf(cmd, "%*s %u", &a); dbg_flist(a);
         } else if (!strcmp(verb, "projscan")) {
             dbg_projscan();
+        } else if (!strcmp(verb, "nanscan")) {
+            sscanf(cmd, "%*s %u", &a); dbg_nanscan(a);
         } else if (!strcmp(verb, "pokef") && sscanf(cmd, "%*s %x", &a) == 1) {
             float f = 0; sscanf(cmd, "%*s %*x %f", &f);
             uint32_t v; memcpy(&v, &f, 4);

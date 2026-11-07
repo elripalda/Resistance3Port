@@ -1980,6 +1980,30 @@ static void spu_report_cross_image(uint32_t addr, int want, int got)
  * time. A registration since then (count changed) invalidates the miss. */
 typedef struct { uint32_t addr; int image_id; spu_fn fn; uint32_t gen; } spu_lk_cache_ent;
 static SPU_THREAD_LOCAL spu_lk_cache_ent t_spu_lk_cache[1024];
+/* SPU_FORCE_INTERP=<id>[-<id>][,...]: lifted images whose functions are hidden
+ * from dispatch, so their job code runs in the interpreter (lifter bisection). */
+static uint8_t s_force_interp[4096];
+static int s_force_interp_on = -1;
+int spu_force_interp_any(void)
+{
+    if (s_force_interp_on < 0) {
+        const char* e = getenv("SPU_FORCE_INTERP"); int on = 0;
+        while (e && *e) {
+            int a = atoi(e), b = a;
+            while (*e >= '0' && *e <= '9') e++;
+            if (*e == '-') { e++; b = atoi(e); while (*e >= '0' && *e <= '9') e++; }
+            for (int i = a; i <= b && i >= 0 && i < 4096; i++) { s_force_interp[i] = 1; on = 1; }
+            if (*e == ',') e++; else if (*e) break;
+        }
+        if (on) fprintf(stderr, "[spu] SPU_FORCE_INTERP=%s: those images run interpreted\n", getenv("SPU_FORCE_INTERP"));
+        s_force_interp_on = on;
+    }
+    return s_force_interp_on;
+}
+static inline int spu_forced_interp(int image_id)
+{
+    return spu_force_interp_any() && image_id > 0 && image_id < 4096 && s_force_interp[image_id];
+}
 spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
 {
     spu_lk_cache_ent* c = &t_spu_lk_cache[((addr >> 2) ^ ((uint32_t)image_id * 0x9E5u)) & 1023u];
@@ -1990,6 +2014,7 @@ spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-p
      * any, for back-compat with single-image contexts. */
     for (uint32_t n = s_hash_head[spu_fn_hash(addr)]; n; n = s_hash_next[n - 1]) {
         const spu_reg_entry* e = &s_registry[n - 1];
+        if (spu_forced_interp(e->image_id)) continue;
         if (e->addr == addr &&
             (image_id == 0 || e->image_id == 0 || e->image_id == image_id)) {
             /* One compare on the return path; the report itself is rare. */
@@ -2032,6 +2057,16 @@ int spu_have_function(uint32_t addr)
  * spu_fn_registry.c before the registry was consolidated into this TU. */
 spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
 {
+    /* A forced image's resident span must stay interpreted: never rejoin into
+     * the kernel's (stale) lifts at the same LS addresses. */
+    if (ctx && spu_force_interp_any()) {
+        const uint32_t pc = lsa & SPU_LS_MASK;
+        for (unsigned s = 0; s < SPU_RESIDENT_CODE_SLOTS; ++s)
+            if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
+                pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size &&
+                spu_forced_interp(ctx->resident_code[s].image_id))
+                return NULL;
+    }
     return (spu_lifted_fn)spu_lookup(lsa, ctx ? ctx->image_id : 0);
 }
 
@@ -3767,6 +3802,34 @@ static void spu_indirect_branch_full(spu_context* ctx)
     /* No lift claims pc: a plugin delivered inside a job buffer is only
      * recognisable by its bytes. */
     if (!fn && ctx->policy_mode) fn = spu_pic_content_match(ctx, (uint32_t)ctx->pc);
+    /* SPU_FORCE_INTERP: the hidden images' code (R3 jobs sit at LS 0x100+, below
+     * the WWS range handled next) runs in the interpreter, which rejoins at the
+     * first lifted, non-hidden address (the kernel, another job). */
+    if (!fn && ctx->policy_mode && spu_force_interp_any() &&
+        (!code_owner || spu_forced_interp(code_owner))) {
+        const uint32_t fpc = ctx->pc & SPU_LS_MASK;
+        const uint32_t w0 = ((uint32_t)ctx->ls[fpc] << 24) | ((uint32_t)ctx->ls[fpc+1] << 16) |
+                            ((uint32_t)ctx->ls[fpc+2] << 8) | ctx->ls[fpc+3];
+        if (fpc >= 0x100u && fpc < 0x3E000u && (w0 >> 21) != 0u) {
+            static volatile LONG n_fi = 0;
+            const LONG nfi = InterlockedIncrement(&n_fi);
+            /* Hand back where the lifted caller's drain waits (the job's
+             * return into the kernel is mid-function, never a lifted entry). */
+            const uint32_t ret = ctx->drain_ret_pc;
+            extern SPU_THREAD_LOCAL uint32_t g_spu_interp_stop2;
+            const uint32_t sv2 = g_spu_interp_stop2;
+            g_spu_interp_stop2 = ctx->gpr[0]._u32[0] & SPU_LS_MASK;   /* direct call: link */
+            spu_interp_run_until(ctx, fpc, ret);
+            g_spu_interp_stop2 = sv2;
+            if (nfi <= 12)
+                fprintf(stderr, "[spu] forced interp: img=%d owner=%d LS 0x%05X -> 0x%05X status=%X\n",
+                        ctx->image_id, code_owner, fpc, ctx->pc & SPU_LS_MASK, ctx->status);
+            ctx->pc &= SPU_LS_MASK;
+            g_spu_trampoline_fn = (ctx->status & (SPU_STATUS_STOPPED_BY_STOP | SPU_STATUS_STOPPED_BY_HALT))
+                                ? 0 : spu_indirect_branch;
+            return;
+        }
+    }
     /* Resistance 2: WWS job code with no lifted module (R2 streams job modules
      * that were not extracted from the EBOOT) used to fall into the
      * empty-function path below and "return" without doing the job's work.
@@ -4178,6 +4241,7 @@ static void spu_indirect_branch_full(spu_context* ctx)
      * The pm-flow drain hook can't see a job that performs no channel ops
      * (LBP's frozen job runs as a complete no-op: entry, no DMAs, return);
      * this names its early-out path instead. */
+    if (g_spu_jobtrace_id > 0) { extern void spu_jobtrace_branch(spu_context*, int); spu_jobtrace_branch(ctx, fn != 0); }
     { static int s_jt = -1;
       if (s_jt < 0) { const char* e = getenv("SPU_JOBTRACE"); s_jt = e ? 1 : 0; }
       if (s_jt && ctx->resident_ovl >= 200) { static int _n = 0;
@@ -4534,3 +4598,152 @@ void spu_trace_rt(spu_context* ctx, uint32_t rt)
 #ifdef __cplusplus
 }
 #endif
+
+/* SPU_JOBTRACE=<image id>: log every DMA an SPU issues while that job image is
+ * resident (GET source bytes / PUT LS bytes, up to 256 B each) to
+ * SPU_JOBTRACE_FILE (default jobtrace.txt), starting SPU_JOBTRACE_AFTER seconds
+ * after the first DMA, capped at SPU_JOBTRACE_MAX lines. Used to diff a job's
+ * inputs against RPCS3 guest memory. */
+int g_spu_jobtrace_id = -1;
+static FILE* s_jtf; static long s_jtn, s_jtmax; static ULONGLONG s_jt0, s_jtafter; static SRWLOCK s_jtlk = SRWLOCK_INIT;
+#define f s_jtf
+#define n s_jtn
+#define maxn s_jtmax
+#define t0 s_jt0
+#define after s_jtafter
+#define lk s_jtlk
+static int jt_resident(spu_context* spu)
+{
+    for (int i = 0; i < SPU_RESIDENT_CODE_SLOTS; i++)
+        if (spu->resident_code[i].image_id == g_spu_jobtrace_id && spu->resident_code[i].size) return 1;
+    return 0;
+}
+void spu_jobtrace_branch(spu_context* spu, int lifted)
+{
+    if (!f || n >= maxn || GetTickCount64() - t0 < after || !jt_resident(spu)) return;
+    AcquireSRWLockExclusive(&lk);
+    if (n < maxn) {
+        n++;
+        fprintf(f, "BR  t=%llu spu=%p pc=%05X lr=%05X r3=%08X.%08X.%08X.%08X%s\n",
+                (unsigned long long)(GetTickCount64() - t0), (void*)spu, spu->pc & 0x3FFFF,
+                spu->gpr[0]._u32[0] & 0x3FFFF, spu->gpr[3]._u32[0], spu->gpr[3]._u32[1],
+                spu->gpr[3]._u32[2], spu->gpr[3]._u32[3], lifted ? "" : " NOLIFT");
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
+void spu_jobtrace(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd, int unused)
+{
+    (void)unused;
+    if (g_spu_jobtrace_id < 0) {
+        const char* e = getenv("SPU_JOBTRACE");
+        if (!e || !*e) { g_spu_jobtrace_id = 0; return; }
+        const char* a = getenv("SPU_JOBTRACE_AFTER"); const char* m = getenv("SPU_JOBTRACE_MAX");
+        const char* p = getenv("SPU_JOBTRACE_FILE");
+        after = a ? (ULONGLONG)(atof(a) * 1000.0) : 0; maxn = m ? atol(m) : 4000;
+        t0 = GetTickCount64(); f = fopen(p ? p : "jobtrace.txt", "w");
+        g_spu_jobtrace_id = (int)strtol(e, 0, 0);
+        if (!f) { g_spu_jobtrace_id = 0; return; }
+    }
+    if (n >= maxn || GetTickCount64() - t0 < after) return;
+    static int id2 = -2; if (id2 == -2) { const char* e2 = getenv("SPU_JOBTRACE2"); id2 = e2 ? (int)strtol(e2, 0, 0) : -1; }
+    int hit = 0;
+    for (int i = 0; i < SPU_RESIDENT_CODE_SLOTS; i++)
+        if ((spu->resident_code[i].image_id == g_spu_jobtrace_id || spu->resident_code[i].image_id == id2) && spu->resident_code[i].size) { hit = spu->resident_code[i].image_id; break; }
+    if (!hit) return;
+    const int get = mfc_is_get(cmd & 0xFFu);
+    const uint32_t c = cmd & 0xFFu;
+    AcquireSRWLockExclusive(&lk);
+    if (n < maxn) {
+        n++;
+        { extern SPU_THREAD_LOCAL uint32_t g_spurs_pm_cur_wid, g_spurs_pm_cur_spu;
+          fprintf(f, "[img%d w%u l%u] ", hit, g_spurs_pm_cur_wid, g_spurs_pm_cur_spu); }
+        fprintf(f, "%s t=%llu spu=%p c=%02X lsa=%05X ea=%08X sz=%X r3=%08X pc=%05X:",
+                get ? "GET" : (mfc_is_put(c) ? "PUT" : "OTH"),
+                (unsigned long long)(GetTickCount64() - t0), (void*)spu, c, lsa, (uint32_t)ea, size,
+                spu->gpr[3]._u32[0], spu->pc & 0x3FFFF);
+        uint32_t k = size < 256u ? size : 256u;
+        if (get && vm_base && mfc_ea_range_committed(ea, k)) {
+            const uint8_t* s = vm_base + (uint32_t)ea;
+            for (uint32_t i = 0; i < k; i++) fprintf(f, "%s%02X", (i & 15) ? "" : " ", s[i]);
+        } else if (!get) {
+            for (uint32_t i = 0; i < k; i++) fprintf(f, "%s%02X", (i & 15) ? "" : " ", spu->ls[(lsa + i) & 0x3FFFF]);
+        }
+        fputc('\n', f);
+        if ((n & 63) == 0 || n == maxn) fflush(f);
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
+
+static void jt_hex(uint32_t a, uint32_t n, spu_context* spu)
+{
+    for (uint32_t o = 0; o < n; o += 16) {
+        fprintf(f, "   LS %05X:", (a + o) & 0x3FFFF);
+        for (int b = 0; b < 16; b++) fprintf(f, "%s%02X", (b & 3) ? "" : " ", spu->ls[(a + o + b) & SPU_LS_MASK]);
+        fprintf(f, "\n");
+    }
+}
+void spu_jt_dump(spu_context* spu, const char* tag)
+{
+    if (!f || n >= maxn || GetTickCount64() - t0 < after) return;
+    AcquireSRWLockExclusive(&lk);
+    if (n < maxn) {
+        n += 20;
+        fprintf(f, "DUMP %s t=%llu spu=%p\n", tag, (unsigned long long)(GetTickCount64() - t0), (void*)spu);
+        for (int r = 3; r <= 9; r++)
+            fprintf(f, "   r%d=%08X %08X %08X %08X\n", r, spu->gpr[r]._u32[0], spu->gpr[r]._u32[1], spu->gpr[r]._u32[2], spu->gpr[r]._u32[3]);
+        if (tag[0] == '6') { jt_hex(spu->gpr[4]._u32[0], 0x100, spu); jt_hex(0xC500, 0xC0, spu); jt_hex(0x5F40, 0x10, spu); jt_hex(0x60A0, 0x10, spu); }
+        else if (tag[0] == '5') jt_hex(0x32100, 0x40, spu);
+        else if (tag[0] == 'L') { for (int q = 3; q <= 6; q++) if (spu->gpr[q]._u32[0] && spu->gpr[q]._u32[0] < 0x40000) jt_hex(spu->gpr[q]._u32[0], 0x20, spu); for (int q = 80; q <= 113; q++) fprintf(f, "   r%d=%08X %08X %08X %08X\n", q, spu->gpr[q]._u32[0], spu->gpr[q]._u32[1], spu->gpr[q]._u32[2], spu->gpr[q]._u32[3]); }
+        else if (tag[1] == '3') { jt_hex(spu->gpr[4]._u32[0] + 0x100, 0xA0, spu); jt_hex(spu->gpr[5]._u32[0], 0x180, spu); jt_hex(0x7350, 0x10, spu); jt_hex(0xBF40, 0x10, spu); }
+        else jt_hex(spu->gpr[6]._u32[0], 0x10, spu);
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
+#undef f
+#undef n
+#undef maxn
+#undef t0
+#undef after
+#undef lk
+
+
+/* ---- SPU-thread LS window (EA 0xF0000000 + lane*0x100000 + off) ----------
+ * Real SPURS jobs on different physical SPUs exchange data by DMAing straight
+ * out of each other's local store (Resistance 3's narrow-phase collision job
+ * GETs the broadphase job's candidate list from 0xF0007400 = SPU0 LS 0x7400).
+ * The port runs each (workload, lane) in its own spu_context, so remember
+ * which context last issued DMA on each lane and serve the window from it. */
+static spu_context* volatile g_spu_lane_ctx[16][8];
+static spu_context* volatile g_spu_lane_any[8];
+int spu_ls_window_transfer(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd)
+{
+    extern SPU_THREAD_LOCAL uint32_t g_spurs_pm_cur_wid, g_spurs_pm_cur_spu;
+    const uint32_t wid = g_spurs_pm_cur_wid & 15u, lane = g_spurs_pm_cur_spu & 7u;
+    if (g_spu_lane_ctx[wid][lane] != spu) g_spu_lane_ctx[wid][lane] = spu;
+    if (g_spu_lane_any[lane] != spu) g_spu_lane_any[lane] = spu;
+    const uint32_t e = (uint32_t)ea;
+    if ((ea >> 32) || e < 0xF0000000u || e >= 0xF8000000u) return 0;
+    const uint32_t c = cmd & 0xFFu;
+    const int get = mfc_is_get(c), put = mfc_is_put(c);
+    if (!get && !put) return 0;
+    const uint32_t n = (e - 0xF0000000u) >> 20, off = e & 0xFFFFFu;
+    spu_context* peer = g_spu_lane_ctx[wid][n];
+    if (!peer) peer = g_spu_lane_any[n];
+    if (n == lane) peer = spu;
+    static volatile long s_log = 0;
+    if (!peer || off + size > SPU_LS_SIZE || lsa + size > SPU_LS_SIZE) {
+        if (InterlockedIncrement(&s_log) <= 16)
+            fprintf(stderr, "[ls-window] unhandled %s ea=%08X size=%X lane=%u peer=%p\n",
+                    get ? "GET" : "PUT", e, size, n, (void*)peer);
+        return -1;
+    }
+    MemoryBarrier();
+    if (get) memmove(spu->ls + (lsa & SPU_LS_MASK), peer->ls + off, size);
+    else     memmove(peer->ls + off, spu->ls + (lsa & SPU_LS_MASK), size);
+    MemoryBarrier();
+    static int s_wl = -1; if (s_wl < 0) s_wl = getenv("SPU_LSWIN_LOG") ? 1 : 0;
+    if (s_wl && InterlockedIncrement(&s_log) <= 64)
+        fprintf(stderr, "[ls-window] %s ea=%08X size=%X w%u l%u -> lane %u ctx=%p\n",
+                get ? "GET" : "PUT", e, size, wid, lane, n, (void*)peer);
+    return 1;
+}

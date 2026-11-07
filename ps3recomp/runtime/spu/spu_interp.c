@@ -398,6 +398,7 @@ SPU_THREAD_LOCAL uint32_t g_spu_interp_stop_sp = 0;
 SPU_THREAD_LOCAL uint64_t g_spu_interp_maxsteps = 0;
 SPU_THREAD_LOCAL int      g_spu_interp_jobonly = 0;  /* job-interp: hand back at pc < 0x4000 */
 SPU_THREAD_LOCAL int      g_spu_interp_nowall = 0;   /* job-interp: real run, no 2 s bound */
+SPU_THREAD_LOCAL uint32_t g_spu_interp_stop2 = 0;    /* second hand-back pc (rejoin mode), 0 = none */
 
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
     ctx->pc = start_lsa & 0x3FFFC;
@@ -473,7 +474,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
                 }
             }
         } else
-        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
+        if (ctx->image_id >= 0 && ((stop_lsa && ctx->pc == stop_lsa) || (g_spu_interp_stop2 && steps && ctx->pc == g_spu_interp_stop2) || spu_lifted_lookup(ctx, ctx->pc))) { g_spu_interp_steps = steps; g_spu_interp_last_pc = ctx->pc; return ctx->pc; }  /* rejoin fast path */
         g_spu_interp_last_pc = ctx->pc;
         if (_g1>0) {
             int inr = (ctx->pc >= 0x26E80u && ctx->pc < 0x26F14u);

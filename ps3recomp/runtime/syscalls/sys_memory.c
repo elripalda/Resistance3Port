@@ -5,6 +5,7 @@
 #include "sys_memory.h"
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "../../include/ps3emu/log_first.h"   /* relative: tools/test_*memory*.py compile this file alone */
 
 /* ---------------------------------------------------------------------------
@@ -534,6 +535,10 @@ void sys_memory_init(lv2_syscall_table* tbl)
     g_sys_mem_bump_ptr = 0;
     s_total_allocated  = 0;
     s_mapper_bump_ptr = SYS_MAPPER_BASE;
+    {
+        const char* mb = getenv("PS3_MAPPER_BASE");
+        if (mb && *mb) s_mapper_bump_ptr = (uint32_t)strtoul(mb, NULL, 16);
+    }
     memset(s_mapper_reservations, 0, sizeof(s_mapper_reservations));
     bump_unlock();
 
