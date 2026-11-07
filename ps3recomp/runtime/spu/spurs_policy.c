@@ -49,6 +49,9 @@ SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_jobs = 0, g_spurs_pm_jobs_seen = 0
 /* Resistance port: which workload/instance/lane this thread's policy module
  * run belongs to, for the kernel poll's yield decision (spu_channels.c). */
 SPU_THREAD_LOCAL uint32_t g_spurs_pm_cur_wid = 0, g_spurs_pm_cur_ea = 0, g_spurs_pm_cur_spu = 0;
+/* The SPURS policy context running on this host thread (NULL otherwise): the
+ * wid/spu TLS above is stale/zero on threads that run plain SPU threads. */
+SPU_THREAD_LOCAL spu_context* g_spurs_pm_cur_ctx = NULL;
 SPU_THREAD_LOCAL volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
 
 /* Port of undecuple's qwarks-awakening patch 7034 (MIT): the signal
@@ -521,7 +524,9 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     { const uint8_t* L = ctx->ls; uint32_t eaWL = ((uint32_t)L[0x13F0] << 24) | ((uint32_t)L[0x13F1] << 16) | ((uint32_t)L[0x13F2] << 8) | L[0x13F3];
       spu_pmtrace(ctx, spu_num, 5, wid, eaWL, ((uint32_t)L[0x12A2] << 8) | L[0x12A3]); }
     spurs_snr_enter(spurs_ea, spu_num, ctx);
+    g_spurs_pm_cur_ctx = ctx;
     const int pm_halted = spu_run_with_halt(entry, ctx);
+    g_spurs_pm_cur_ctx = NULL;
     spurs_snr_leave(spurs_ea, spu_num, ctx);
     { const uint8_t* L = ctx->ls; spu_pmtrace(ctx, spu_num, 6, wid, (uint32_t)ctx->pc & SPU_LS_MASK,
                                               ((uint32_t)L[0x12A2] << 8) | L[0x12A3]); }

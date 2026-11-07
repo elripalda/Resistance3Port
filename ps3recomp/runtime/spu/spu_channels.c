@@ -4718,21 +4718,25 @@ static spu_context* volatile g_spu_lane_any[8];
 int spu_ls_window_transfer(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd)
 {
     extern SPU_THREAD_LOCAL uint32_t g_spurs_pm_cur_wid, g_spurs_pm_cur_spu;
+    extern SPU_THREAD_LOCAL spu_context* g_spurs_pm_cur_ctx;
     const uint32_t wid = g_spurs_pm_cur_wid & 15u, lane = g_spurs_pm_cur_spu & 7u;
-    if (g_spu_lane_ctx[wid][lane] != spu) g_spu_lane_ctx[wid][lane] = spu;
-    if (g_spu_lane_any[lane] != spu) g_spu_lane_any[lane] = spu;
+    /* Only SPURS lanes own a slot; plain SPU threads leave wid/lane at stale
+     * defaults and would otherwise hijack lane 0. */
+    const int spurs = g_spurs_pm_cur_ctx == spu;
+    if (spurs && g_spu_lane_ctx[wid][lane] != spu) g_spu_lane_ctx[wid][lane] = spu;
+    if (spurs && g_spu_lane_any[lane] != spu) g_spu_lane_any[lane] = spu;
     const uint32_t e = (uint32_t)ea;
     if ((ea >> 32) || e < 0xF0000000u || e >= 0xF8000000u) return 0;
     const uint32_t c = cmd & 0xFFu;
     const int get = mfc_is_get(c), put = mfc_is_put(c);
     if (!get && !put) return 0;
     const uint32_t n = (e - 0xF0000000u) >> 20, off = e & 0xFFFFFu;
-    spu_context* peer = g_spu_lane_ctx[wid][n];
+    spu_context* peer = spurs ? g_spu_lane_ctx[wid][n] : NULL;
     if (!peer) peer = g_spu_lane_any[n];
-    if (n == lane) peer = spu;
+    if (spurs && n == lane) peer = spu;
     static volatile long s_log = 0;
     if (!peer || off + size > SPU_LS_SIZE || lsa + size > SPU_LS_SIZE) {
-        if (InterlockedIncrement(&s_log) <= 16)
+        if (InterlockedIncrement(&s_log) <= 500)
             fprintf(stderr, "[ls-window] unhandled %s ea=%08X size=%X lane=%u peer=%p\n",
                     get ? "GET" : "PUT", e, size, n, (void*)peer);
         return -1;
@@ -4742,7 +4746,19 @@ int spu_ls_window_transfer(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t
     else     memmove(peer->ls + off, spu->ls + (lsa & SPU_LS_MASK), size);
     MemoryBarrier();
     static int s_wl = -1; if (s_wl < 0) s_wl = getenv("SPU_LSWIN_LOG") ? 1 : 0;
-    if (s_wl && InterlockedIncrement(&s_log) <= 64)
+    if (s_wl) {
+        static volatile LONG64 s_last; static volatile long s_chg;
+        const LONG64 key = ((LONG64)(uintptr_t)peer << 12) ^ ((LONG64)(uintptr_t)spu << 3) ^ (wid << 6) ^ (lane << 3) ^ n;
+        if (s_last != key && InterlockedIncrement(&s_chg) <= 2000) {
+            s_last = key;
+            extern unsigned long long ps3_ms_now(void);
+            const uint8_t* d = peer->ls + off;
+            fprintf(stderr, "[ls-window] t=%llu %s ea=%08X size=%X w%u l%u ctx=%p -> lane %u ctx=%p data=%02X%02X%02X%02X%02X%02X%02X%02X\n",
+                    ps3_ms_now(), get ? "GET" : "PUT", e, size, wid, lane, (void*)spu, n, (void*)peer,
+                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7]);
+        }
+    }
+    if (0)
         fprintf(stderr, "[ls-window] %s ea=%08X size=%X w%u l%u -> lane %u ctx=%p\n",
                 get ? "GET" : "PUT", e, size, wid, lane, n, (void*)peer);
     return 1;

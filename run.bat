@@ -7,6 +7,9 @@ rem ---- settings the port needs (Launcher.exe's choices come after, from settin
 set "SPURS_PM_YIELD=0"
 set "SPURS_IDLE_POLL=0"
 set "FREEZE_RELAUNCH=900"
+set "PS3_MAPPER_BASE=30000000"
+rem skip the logo + "story so far" recap movie (plays during the first load)
+set "SKIP_INTRO=1"
 rem your copy of the game (Setup.bat put it here)
 set "PS3_VFS_ROOT=%~dp0gamefiles"
 rem Launcher.exe writes settings.bat (display mode, frame limit, vsync, filtering, keys)
