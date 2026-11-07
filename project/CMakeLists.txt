@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 if(NOT DEFINED PORT_NAME)
-    set(PORT_NAME Resistance2)
+    set(PORT_NAME Resistance3)
 endif()
 project(${PORT_NAME}
     VERSION 0.1.0

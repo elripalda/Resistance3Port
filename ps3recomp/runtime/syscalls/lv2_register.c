@@ -2348,6 +2348,11 @@ static int64_t sys_process_is_spu_lock_line_reservation_address(ppu_context* ctx
     return rc;
 }
 
+/* Port of undecuple's qwarks-awakening patch 7034 (MIT): a SPURS instance's
+ * SPUs are not lv2 SPU threads here; cellSpurs installs this to take writes to
+ * the synthetic ids its GetInfo hands out (0 = taken). */
+int (*g_spurs_snr_hook)(uint32_t tid, uint32_t num, uint32_t val) = 0;
+
 /* sys_spu_thread_write_snr (sc-184): write an SPU Signal Notification Register.
  * In OR mode (spu_cfg bit 0/1) the value is ORed into the pending register;
  * in overwrite mode (default) it replaces it. The SPU reads via RdSigNotify1/2
@@ -2362,6 +2367,10 @@ static int64_t sys_spu_thread_write_snr_handler(ppu_context* ctx)
         return -1;
     }
     spu_thread_t* t = spu_find_thread(tid);
+    if (!t && g_spurs_snr_hook && g_spurs_snr_hook(tid, num, val) == 0) {
+        ctx->gpr[3] = 0;
+        return 0;
+    }
     if (!t) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010005;
         return -1;

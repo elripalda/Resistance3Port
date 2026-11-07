@@ -423,7 +423,11 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         if (ctx->pc == 0xA70u) {
             uint32_t sc = ((uint32_t)ctx->ls[0x27C4]<<24)|((uint32_t)ctx->ls[0x27C5]<<16)
                         | ((uint32_t)ctx->ls[0x27C6]<<8) | ctx->ls[0x27C7];
-            if (ctx->image_id == 22 || (ctx->policy_mode && sc == 0xA70u)) {
+            /* standalone: a task dispatched without a policy module (nothing
+             * at 0xA70 in its LS) -- as the lifted path does in spu_channels.c. */
+            const int standalone = !ctx->policy_mode && sc == 0xA70u &&
+                (ctx->ls[0xA70] | ctx->ls[0xA71] | ctx->ls[0xA72] | ctx->ls[0xA73]) == 0;
+            if (ctx->image_id == 22 || standalone || (ctx->policy_mode && sc == 0xA70u)) {
                 extern void spu_spurs_taskset_syscall(spu_context*);
                 int _save = ctx->image_id; ctx->image_id = 22;
                 spu_spurs_taskset_syscall(ctx);

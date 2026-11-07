@@ -1,0 +1,297 @@
+{
+ "funcs": {},
+ "preamble": [],
+ "header": [
+  {
+   "at": 23,
+   "ctx": "#    include <atomic>",
+   "rm": [
+    "#    define PPU_FENCE(o) std::atomic_thread_fence(std::memory_order_##o)"
+   ],
+   "add": [
+    "#    define PPU_FENCE_STD(o) std::atomic_thread_fence(std::memory_order_##o)"
+   ]
+  },
+  {
+   "at": 26,
+   "ctx": "#    include <stdatomic.h>",
+   "rm": [
+    "#    define PPU_FENCE(o) atomic_thread_fence(memory_order_##o)"
+   ],
+   "add": [
+    "#    define PPU_FENCE_STD(o) atomic_thread_fence(memory_order_##o)"
+   ]
+  },
+  {
+   "at": 28,
+   "ctx": "#  endif",
+   "rm": [],
+   "add": [
+    "/* Resistance port (v141): the full barrier (PPC sync) as a locked no-op",
+    " * read-modify-write of the stack top -- what Linux uses for smp_mb() on",
+    " * x86-64. Same StoreLoad ordering for ordinary memory as mfence, at a",
+    " * fraction of the cost on Zen 2; the game's job-list helpers",
+    " * (func_005290DC & co., ~7% of the main thread) run one per call.",
+    " * PPU_FENCE_MFENCE=1 at build time keeps mfence. */",
+    "#  if (defined(__x86_64__) || defined(_M_X64)) && (defined(__clang__) || defined(__GNUC__)) && !defined(PPU_FENCE_MFENCE)",
+    "#    define PPU_FENCE_seq_cst() __asm__ __volatile__(\"lock orl $0,(%%rsp)\" ::: \"memory\", \"cc\")",
+    "#  else",
+    "#    define PPU_FENCE_seq_cst() PPU_FENCE_STD(seq_cst)",
+    "#  endif",
+    "#  define PPU_FENCE_acq_rel() PPU_FENCE_STD(acq_rel)",
+    "#  define PPU_FENCE_acquire() PPU_FENCE_STD(acquire)",
+    "#  define PPU_FENCE_release() PPU_FENCE_STD(release)",
+    "#  define PPU_FENCE_consume() PPU_FENCE_STD(acquire)",
+    "#  define PPU_FENCE_relaxed() ((void)0)",
+    "#  define PPU_FENCE(o) PPU_FENCE_##o()"
+   ]
+  },
+  {
+   "at": 99,
+   "ctx": "#endif",
+   "rm": [],
+   "add": [
+    "#ifdef PPU_FIXED_BOUNDS",
+    "extern uint8_t* const vm_base;   /* v163: set once at boot, before any lifted code runs */",
+    "#else"
+   ]
+  },
+  {
+   "at": 100,
+   "ctx": "extern uint8_t* vm_base;",
+   "rm": [],
+   "add": [
+    "#endif"
+   ]
+  },
+  {
+   "at": 134,
+   "ctx": "    (void)n;",
+   "rm": [],
+   "add": [
+    "#ifdef PPU_FIXED_BOUNDS",
+    "    /* v163: the bounds as immediates (main.cpp maps the full space, ppu_vm_size",
+    "     * = 0xE0000000; the gcm ref-poll word is ppu_hle_inject_base 0x20000000 +",
+    "     * 0x2008 -- main.cpp checks both at boot). No global loads per access. */",
+    "    return __builtin_expect((uint32_t)(ea - 0x10000u) < 0xE0000000u - 8u - 0x10000u, 1) &&",
+    "           __builtin_expect(ea != 0x20002008u, 1);",
+    "#else"
+   ]
+  },
+  {
+   "at": 136,
+   "ctx": "           __builtin_expect(ea != vm_inl_poll, 1);",
+   "rm": [],
+   "add": [
+    "#endif"
+   ]
+  },
+  {
+   "at": 137,
+   "ctx": "}",
+   "rm": [],
+   "add": [
+    "#ifdef PPU_FIXED_BOUNDS",
+    "/* v163: the out-of-line accessors behind a preserve_most wrapper",
+    " * (ppu_loader.cpp): the rare slow path no longer clobbers the caller's",
+    " * registers, so the fast path keeps its values in registers. */",
+    "#ifdef __cplusplus",
+    "extern \"C\" {",
+    "#endif",
+    "__attribute__((preserve_most)) uint8_t  vm_read8_pm (uint64_t a);",
+    "__attribute__((preserve_most)) uint16_t vm_read16_pm(uint64_t a);",
+    "__attribute__((preserve_most)) uint32_t vm_read32_pm(uint64_t a);",
+    "__attribute__((preserve_most)) uint64_t vm_read64_pm(uint64_t a);",
+    "__attribute__((preserve_most)) void vm_write8_pm (uint64_t a, uint8_t v);",
+    "__attribute__((preserve_most)) void vm_write16_pm(uint64_t a, uint16_t v);",
+    "__attribute__((preserve_most)) void vm_write32_pm(uint64_t a, uint32_t v);",
+    "__attribute__((preserve_most)) void vm_write64_pm(uint64_t a, uint64_t v);",
+    "#ifdef __cplusplus",
+    "}",
+    "#endif",
+    "#define VM_SLOW_RD(w, a)    vm_read##w##_pm(a)",
+    "#define VM_SLOW_WR(w, a, v) vm_write##w##_pm((a), (v))",
+    "#else",
+    "#define VM_SLOW_RD(w, a)    vm_read##w(a)",
+    "#define VM_SLOW_WR(w, a, v) vm_write##w((a), (v))",
+    "#endif"
+   ]
+  },
+  {
+   "at": 141,
+   "ctx": "    if (vm_inl_ok(ea, 1)) return __atomic_load_n(vm_base + ea, __ATOMIC_RELAXED);",
+   "rm": [
+    "    return vm_read8(a);"
+   ],
+   "add": [
+    "    return VM_SLOW_RD(8, a);"
+   ]
+  },
+  {
+   "at": 151,
+   "ctx": "        return __builtin_bswap16(v); }",
+   "rm": [
+    "    return vm_read16(a);"
+   ],
+   "add": [
+    "    return VM_SLOW_RD(16, a);"
+   ]
+  },
+  {
+   "at": 161,
+   "ctx": "        return __builtin_bswap32(v); }",
+   "rm": [
+    "    return vm_read32(a);"
+   ],
+   "add": [
+    "    return VM_SLOW_RD(32, a);"
+   ]
+  },
+  {
+   "at": 171,
+   "ctx": "        return __builtin_bswap64(v); }",
+   "rm": [
+    "    return vm_read64(a);"
+   ],
+   "add": [
+    "    return VM_SLOW_RD(64, a);"
+   ]
+  },
+  {
+   "at": 191,
+   "ctx": "extern int vm_inline_st_ok;",
+   "rm": [],
+   "add": [
+    "#ifdef PPU_FIXED_BOUNDS",
+    "extern unsigned char* const g_spu_coh_bitmap_p;   /* v163: set statically, never changes */",
+    "extern volatile int g_spu_coh_stack;              /* v163: an SPU reserved a PPU-stack line */",
+    "#else"
+   ]
+  },
+  {
+   "at": 192,
+   "ctx": "extern unsigned char* g_spu_coh_bitmap_p;",
+   "rm": [],
+   "add": [
+    "#endif"
+   ]
+  },
+  {
+   "at": 198,
+   "ctx": "{",
+   "rm": [],
+   "add": [
+    "#ifdef PPU_FIXED_BOUNDS",
+    "    if (!vm_inl_ok(ea, n)) return 0;",
+    "#else"
+   ]
+  },
+  {
+   "at": 199,
+   "ctx": "    if (!__builtin_expect(vm_inline_st_ok, 1) || !vm_inl_ok(ea, n)) return 0;",
+   "rm": [],
+   "add": [
+    "#endif"
+   ]
+  },
+  {
+   "at": 210,
+   "ctx": "    if (vm_st_fast(ea, 1)) { __atomic_store_n(vm_base + ea, v, __ATOMIC_RELAXED); return; }",
+   "rm": [
+    "    vm_write8(a, v);"
+   ],
+   "add": [
+    "    VM_SLOW_WR(8, a, v);"
+   ]
+  },
+  {
+   "at": 219,
+   "ctx": "        return; }",
+   "rm": [
+    "    vm_write16(a, v);"
+   ],
+   "add": [
+    "    VM_SLOW_WR(16, a, v);"
+   ]
+  },
+  {
+   "at": 228,
+   "ctx": "        return; }",
+   "rm": [
+    "    vm_write32(a, v);"
+   ],
+   "add": [
+    "    VM_SLOW_WR(32, a, v);"
+   ]
+  },
+  {
+   "at": 237,
+   "ctx": "        return; }",
+   "rm": [
+    "    vm_write64(a, v);"
+   ],
+   "add": [
+    "    VM_SLOW_WR(64, a, v);"
+   ]
+  },
+  {
+   "at": 244,
+   "ctx": "#define vm_write64(a, v) vm_write64_inl((a), (v))",
+   "rm": [],
+   "add": [
+    "#endif",
+    "",
+    "/* v163 (Resistance port): unchecked accessors for accesses the lifter-output",
+    " * post-pass (tools/ppu_fastmem.py) proved ordinary: stack (R_1), TOC (R_2) and",
+    " * TOC-derived constant-pool (R_30) addresses. These can never be the null",
+    " * page, raw-SPU MMIO, the gcm ref-poll word or past the end of the VM, so the",
+    " * span / poll / store-ok tests and the out-of-line fallback -- whose call",
+    " * forced spills around every access -- are dropped. Stack stores skip the SPU",
+    " * reservation bitmap too (no SPU job reserves PPU stack lines; spu_coherency.c",
+    " * logs it if one ever does -- then build with -DPPU_STACK_COH). PPU_NO_FASTMEM",
+    " * builds the old checked path. */",
+    "#ifndef PPU_NO_FASTMEM",
+    "static inline uint8_t  vm_read8_fast (uint64_t a) { return vm_base[(uint32_t)a]; }",
+    "static inline uint16_t vm_read16_fast(uint64_t a) { uint16_t v; memcpy(&v, vm_base + (uint32_t)a, 2); return __builtin_bswap16(v); }",
+    "static inline uint32_t vm_read32_fast(uint64_t a) { uint32_t v; memcpy(&v, vm_base + (uint32_t)a, 4); return __builtin_bswap32(v); }",
+    "static inline uint64_t vm_read64_fast(uint64_t a) { uint64_t v; memcpy(&v, vm_base + (uint32_t)a, 8); return __builtin_bswap64(v); }",
+    "static inline int vm_stk_coh_hit(uint32_t ea, uint32_t n)",
+    "{",
+    "#if defined(PPU_FIXED_BOUNDS) && !defined(PPU_STACK_COH)",
+    "    /* v163: no check at all. An SPU reservation on a PPU stack line would need",
+    "     * one; spu_coherency.c logs \"[coh] SPU reservation on a PPU stack line\"",
+    "     * if that ever happens (build with -DPPU_STACK_COH then). */",
+    "    (void)ea; (void)n; return 0;",
+    "#elif defined(PPU_FIXED_BOUNDS)",
+    "    if (__builtin_expect(!g_spu_coh_stack, 1)) return 0;   /* no SPU has reserved a stack line */",
+    "#else",
+    "    if (__builtin_expect(!g_spu_coh_armed, 0)) return 0;",
+    "#endif",
+    "    const uint32_t l0 = ea >> 7, l1 = (ea + n - 1) >> 7;",
+    "    if ((g_spu_coh_bitmap_p[l0 >> 3] >> (l0 & 7)) & 1u) return 1;",
+    "    return l1 != l0 && ((g_spu_coh_bitmap_p[l1 >> 3] >> (l1 & 7)) & 1u);",
+    "}",
+    "static inline void vm_write8_stk(uint64_t a, uint8_t v)",
+    "{ const uint32_t ea = (uint32_t)a; if (__builtin_expect(vm_stk_coh_hit(ea, 1), 0)) { (vm_write8)(a, v); return; } vm_base[ea] = v; }",
+    "static inline void vm_write16_stk(uint64_t a, uint16_t v)",
+    "{ const uint32_t ea = (uint32_t)a; if (__builtin_expect(vm_stk_coh_hit(ea, 2), 0)) { (vm_write16)(a, v); return; }",
+    "  const uint16_t s = __builtin_bswap16(v); memcpy(vm_base + ea, &s, 2); }",
+    "static inline void vm_write32_stk(uint64_t a, uint32_t v)",
+    "{ const uint32_t ea = (uint32_t)a; if (__builtin_expect(vm_stk_coh_hit(ea, 4), 0)) { (vm_write32)(a, v); return; }",
+    "  const uint32_t s = __builtin_bswap32(v); memcpy(vm_base + ea, &s, 4); }",
+    "static inline void vm_write64_stk(uint64_t a, uint64_t v)",
+    "{ const uint32_t ea = (uint32_t)a; if (__builtin_expect(vm_stk_coh_hit(ea, 8), 0)) { (vm_write64)(a, v); return; }",
+    "  const uint64_t s = __builtin_bswap64(v); memcpy(vm_base + ea, &s, 8); }",
+    "#else",
+    "#define vm_read8_fast(a)  vm_read8(a)",
+    "#define vm_read16_fast(a) vm_read16(a)",
+    "#define vm_read32_fast(a) vm_read32(a)",
+    "#define vm_read64_fast(a) vm_read64(a)",
+    "#define vm_write8_stk(a, v)  vm_write8((a), (v))",
+    "#define vm_write16_stk(a, v) vm_write16((a), (v))",
+    "#define vm_write32_stk(a, v) vm_write32((a), (v))",
+    "#define vm_write64_stk(a, v) vm_write64((a), (v))"
+   ]
+  }
+ ]
+}

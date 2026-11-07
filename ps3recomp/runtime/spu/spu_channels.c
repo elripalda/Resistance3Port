@@ -1325,12 +1325,13 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
  * RdInMbox must PARK, not fabricate a zero -- there is no scheduler above it to
  * retry. Off unless a raw SPU is actually created, so no other port changes. */
 int g_spu_force_ch_block = 0;
-
+/* Per-thread: interpreted SPURS policy modules (spurs_pm_interp_entry). */
+SPU_THREAD_LOCAL int g_spu_tl_ch_block = 0;
 static int yz_ch_block(void)
 {
     static int v = -1;
     if (v < 0) v = getenv("SPU_CH_BLOCK") ? 1 : 0;
-    return v || g_spu_force_ch_block;
+    return v || g_spu_force_ch_block || g_spu_tl_ch_block;
 }
 
 /* Would rdch complete right now? Plain reads + the 10 ms re-poll cover cross-

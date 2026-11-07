@@ -472,6 +472,21 @@ static struct SpursInst {
     u8 hot[16];    /* Resistance port (v122c): the workload's last run executed a job */
     u32 cursor, pass_no;
 } s_inst[MAX_SPURS_INST];
+/* Port of undecuple's qwarks-awakening patch 7034 (MIT): synthetic SPU thread
+ * ids for an instance's SPUs (cellSpursGetInfo) and their SNR writes. */
+#define SPURS_SYNTH_TID_TAG 0x7E000000u
+static u32 spurs_synth_spu_tid(int inst, int spu) { return SPURS_SYNTH_TID_TAG | ((u32)inst << 8) | (u32)spu; }
+static int spurs_snr_hook(uint32_t tid, uint32_t num, uint32_t val)
+{
+    if ((tid & 0xFFFF0000u) != SPURS_SYNTH_TID_TAG) return -1;
+    const u32 j = (tid >> 8) & 0xFF, i = tid & 0xFF;
+    if (j >= MAX_SPURS_INST || !s_inst[j].ea || i >= s_inst[j].nspus) return -1;
+    extern int spurs_pm_snr_write(uint32_t spurs_ea, uint32_t spu, uint32_t num, uint32_t val, int or_mode);
+    const int rc = spurs_pm_snr_write(s_inst[j].ea, i, num, val, 0);
+    static volatile long s_n; if (__atomic_add_fetch(&s_n, 1, __ATOMIC_RELAXED) <= 16)
+        printf("[cellSpurs] write_snr \"%s\" spu %u snr%u <- 0x%08X%s\n", s_inst[j].prefix, i, num + 1, val, rc ? " (dropped)" : "");
+    return rc;
+}
 static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
 static SRWLOCK s_workload_registry_lock = SRWLOCK_INIT;
 
@@ -561,6 +576,8 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
       if (si->nlanes > 10) si->nlanes = 10; }
     memset(si->prefix, 0, sizeof(si->prefix));
     if (prefix) memcpy(si->prefix, prefix, 15);
+    { extern int (*g_spurs_snr_hook)(uint32_t, uint32_t, uint32_t);   /* patch 7034 port, lv2_register.c */
+      g_spurs_snr_hook = spurs_snr_hook; }
 
     /* Real BE instance: zero it, then the few live fields. (The global
      * workload table is NOT wiped here — the title may init several SPURS
@@ -1627,7 +1644,20 @@ s32 _cellSpursWorkloadAttributeInitialize(u64 attr_ea, u32 revision, u32 sdkVers
         *(vm_base + (u32)attr_ea + WKATTR_PRIORITY + i) =
             prio_ea ? *(vm_base + (u32)prio_ea + i) : 0;
     vm_write32((u32)attr_ea + WKATTR_MIN_CONT, minContention);
-    vm_write32((u32)attr_ea + WKATTR_MAX_CONT, 1);   /* 9th arg is beyond the 8-GPR adapter */
+    /* The 9th argument (maxContention) is passed in the caller's parameter save
+     * area at sp+0x70 (PPU64 ABI). R3's igPm needs 5 (one kernel per job queue).
+     * Adapted from Qwark's Awakening patch 1006 (undecuple, MIT).
+     * SPURS_MAXCONT_STACK=0 restores the old default of 1. */
+    { u32 mc = 1;
+      static int s_mc = -1;
+      if (s_mc < 0) { const char* e = getenv("SPURS_MAXCONT_STACK"); s_mc = !(e && e[0] == '0'); }
+      extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+      if (s_mc && g_active_ctx) {
+          u32 v = (u32)vm_read64((u32)g_active_ctx->gpr[1] + 0x70);
+          if (v >= 1 && v <= CELL_SPURS_MAX_SPU) mc = v;
+          printf("[cellSpurs] _WorkloadAttributeInitialize: maxContention from stack = %u -> %u\n", v, mc);
+      }
+      vm_write32((u32)attr_ea + WKATTR_MAX_CONT, mc); }
     vm_write32((u32)attr_ea + WKATTR_NAME_CLASS, 0);
     vm_write32((u32)attr_ea + WKATTR_NAME_INST,  0);
     vm_write32((u32)attr_ea + WKATTR_HOOK,     0);
@@ -1716,6 +1746,12 @@ typedef struct {
 } WklPm;
 static WklPm s_wkl_pm[SPURS_WKL_SLOTS];
 
+static int spurs_pm_interp_on(void)
+{
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("SPURS_PM_INTERP"); s = (e && *e == '0') ? 0 : 1; }
+    return s;
+}
 static WklPm* spurs_resolve_pm(u32 ea, u32 wid)
 {
     WklPm* r = &s_wkl_pm[spurs_wslot(ea, wid)];
@@ -1728,7 +1764,15 @@ static WklPm* spurs_resolve_pm(u32 ea, u32 wid)
     if (r->fn)
         printf("[cellSpurs] wid=%u PM resolved (fp=0x%016llX image=%d)\n",
                wid, (unsigned long long)fp, r->image_id);
-    else {
+    else if (spurs_pm_interp_on()) {
+        /* Port of undecuple's qwarks-awakening patch 7034 (MIT): an unlifted PM
+         * (R3: igPm, a 0x230-byte loader that DMAs Insomniac's job kernel to
+         * LS 0x3F580) runs in the SPU interpreter, image id -1. */
+        extern void spurs_pm_interp_entry(spu_context*);
+        r->fn = spurs_pm_interp_entry; r->image_id = -1; r->resolved = 1;
+        printf("[cellSpurs] wid=%u PM not lifted (fp=0x%016llX size=%u): interpreted (SPURS_PM_INTERP=0 = off)\n",
+               wid, (unsigned long long)fp, w->sizePm);
+    } else {
         printf("[cellSpurs] wid=%u PM NOT LIFTED (fp=0x%016llX size=%u) -- workload will not run\n",
                wid, (unsigned long long)fp, w->sizePm);
         /* SPU_DUMP_MISS=<dir>: write the PM exactly as fingerprinted, like the
@@ -3954,6 +3998,11 @@ s32 cellSpursGetInfo(u64 spurs_ea, u64 info_ea)
     if (info_ea) {
         vm_write32((u32)info_ea, si ? si->nspus : 1);   /* nSpus */
         for (int o = 4; o < 0x28; o += 4) vm_write32((u32)info_ea + o, 0);
+        /* patch 7034 port: CellSpursInfo.spuThreads[8] (+0x28) = synthetic SPU
+         * thread ids the title may pass to sys_spu_thread_write_snr. */
+        const int j = si ? (int)(si - s_inst) : -1;
+        for (int i = 0; i < 8; i++)
+            vm_write32((u32)info_ea + 0x28 + 4 * i, (si && i < (int)si->nspus) ? spurs_synth_spu_tid(j, i) : 0);
     }
     return CELL_OK;
 }

@@ -51,6 +51,114 @@ SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_jobs = 0, g_spurs_pm_jobs_seen = 0
 SPU_THREAD_LOCAL uint32_t g_spurs_pm_cur_wid = 0, g_spurs_pm_cur_ea = 0, g_spurs_pm_cur_spu = 0;
 SPU_THREAD_LOCAL volatile unsigned g_wws_batch_gets = 0;   /* loadCommands (LS 0xC00) fetch count, spu_dma.h */
 
+/* Port of undecuple's qwarks-awakening patch 7034 (MIT): the signal
+ * notification registers of a SPURS instance's SPUs. The PPU writes them via
+ * sys_spu_thread_write_snr on the synthetic ids cellSpursGetInfo hands out
+ * (Insomniac's igPm loader reads SNR1 as its SPU index). A write goes into the
+ * context running on that SPU (and wakes it), else it stays pending; a run takes
+ * the pending value on entry and gives back what it did not read on exit. */
+enum { SPURS_SNR_INST = 8, SPURS_SNR_SPU = 8 };
+static struct { uint32_t ea; uint32_t val[SPURS_SNR_SPU][2]; uint8_t pend[SPURS_SNR_SPU][2];
+                uint32_t last[SPURS_SNR_SPU][2]; uint8_t have[SPURS_SNR_SPU][2];
+                spu_context* cur[SPURS_SNR_SPU]; } s_snr[SPURS_SNR_INST];
+/* Sticky SNR (R3): the igPm loader reads SNR1 (its SPU index) on every run, and
+ * our early dispatches run it before the argument block is ready -- those runs
+ * stop and consume the value, leaving later runs with 0 (every lane then served
+ * queue 0). Each run re-receives the last value written for its SPU.
+ * SPURS_SNR_STICKY=0 = consume-once. */
+static int spurs_snr_sticky(void)
+{
+    static int s = -1;
+    if (s < 0) { const char* e = getenv("SPURS_SNR_STICKY"); s = !(e && e[0] == '0'); }
+    return s;
+}
+static volatile long s_snr_lock;
+#define SNR_LOCK()   while (__atomic_exchange_n(&s_snr_lock, 1, __ATOMIC_ACQUIRE)) {}
+#define SNR_UNLOCK() __atomic_store_n(&s_snr_lock, 0, __ATOMIC_RELEASE)
+static int spurs_snr_slot(uint32_t spurs_ea)   /* under the lock */
+{
+    for (int i = 0; i < SPURS_SNR_INST; i++) if (s_snr[i].ea == spurs_ea) return i;
+    for (int i = 0; i < SPURS_SNR_INST; i++) if (!s_snr[i].ea) { s_snr[i].ea = spurs_ea; return i; }
+    return -1;
+}
+static void spurs_snr_put(spu_channel* ch, uint32_t val, int or_mode)
+{
+    SPU_CH_LOCK(ch);
+    if (ch->count && or_mode) ch->value |= val; else ch->value = val;
+    ch->head = 0; ch->q[0] = ch->value; ch->count = 1;
+    SPU_CH_UNLOCK(ch);
+}
+int spurs_pm_snr_write(uint32_t spurs_ea, uint32_t spu, uint32_t num, uint32_t val, int or_mode)
+{
+    if (spu >= SPURS_SNR_SPU || num > 1) return -1;
+    SNR_LOCK();
+    const int s = spurs_snr_slot(spurs_ea);
+    if (s < 0) { SNR_UNLOCK(); return -1; }
+    spu_context* c = s_snr[s].cur[spu];
+    s_snr[s].last[spu][num] = (s_snr[s].have[spu][num] && or_mode) ? (s_snr[s].last[spu][num] | val) : val;
+    s_snr[s].have[spu][num] = 1;
+    if (c) spurs_snr_put(&c->ch_sig_notify[num], val, or_mode);
+    else {
+        s_snr[s].val[spu][num] = (s_snr[s].pend[spu][num] && or_mode) ? (s_snr[s].val[spu][num] | val) : val;
+        s_snr[s].pend[spu][num] = 1;
+    }
+    SNR_UNLOCK();
+    if (c) spu_ch_wake(c);
+    return 0;
+}
+static void spurs_snr_enter(uint32_t spurs_ea, uint32_t spu, spu_context* ctx)
+{
+    if (spu >= SPURS_SNR_SPU) return;
+    SNR_LOCK();
+    const int s = spurs_snr_slot(spurs_ea);
+    if (s >= 0) {
+        s_snr[s].cur[spu] = ctx;
+        for (int n = 0; n < 2; n++) {
+            spu_channel* ch = &ctx->ch_sig_notify[n];
+            SPU_CH_LOCK(ch); ch->count = 0; ch->head = 0; SPU_CH_UNLOCK(ch);
+            if (s_snr[s].pend[spu][n]) { spurs_snr_put(ch, s_snr[s].val[spu][n], 0); s_snr[s].pend[spu][n] = 0; }
+            else if (s_snr[s].have[spu][n] && spurs_snr_sticky()) spurs_snr_put(ch, s_snr[s].last[spu][n], 0);
+        }
+    }
+    SNR_UNLOCK();
+}
+static void spurs_snr_leave(uint32_t spurs_ea, uint32_t spu, spu_context* ctx)
+{
+    extern SPU_THREAD_LOCAL int g_spu_tl_ch_block;
+    g_spu_tl_ch_block = 0;
+    if (spu >= SPURS_SNR_SPU) return;
+    SNR_LOCK();
+    const int s = spurs_snr_slot(spurs_ea);
+    if (s >= 0 && s_snr[s].cur[spu] == ctx) {
+        s_snr[s].cur[spu] = NULL;
+        for (int n = 0; n < 2; n++) {
+            spu_channel* ch = &ctx->ch_sig_notify[n];
+            SPU_CH_LOCK(ch);
+            if (ch->count) { s_snr[s].val[spu][n] = ch->value; s_snr[s].pend[spu][n] = 1; }
+            ch->count = 0; ch->head = 0;
+            SPU_CH_UNLOCK(ch);
+        }
+    }
+    SNR_UNLOCK();
+}
+#undef SNR_LOCK
+#undef SNR_UNLOCK
+
+/* patch 7034 port: an unlifted policy module runs in the interpreter from its
+ * load base (cellSpurs.c spurs_resolve_pm, image id -1).
+ * Patch 7037 (undecuple, MIT): with blocking channel reads, as on the SPU --
+ * igPm reads its SPU index from SNR1 and its job kernel parks in
+ * rdch SPU_RdEventStat; non-blocking reads gave every lane index 0 and spun.
+ * Per-thread here (cleared in spurs_snr_leave). SPURS_PM_NOBLOCK=1 = off. */
+extern SPU_THREAD_LOCAL int g_spu_tl_ch_block;
+void spurs_pm_interp_entry(spu_context* ctx)
+{
+    extern uint32_t spu_interp_run(spu_context*, uint32_t);
+    if (!getenv("SPURS_PM_NOBLOCK")) g_spu_tl_ch_block = 1;
+    spu_interp_run(ctx, 0xA00);
+    g_spu_tl_ch_block = 0;
+}
+
 /* Contexts are resident per (instance, workload, physical SPU). Workload IDs
  * from different instances must never share local store or pipeline state.
  * Each slot lock also serializes direct callers of this existing API. */
@@ -406,7 +514,9 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
 
     { const uint8_t* L = ctx->ls; uint32_t eaWL = ((uint32_t)L[0x13F0] << 24) | ((uint32_t)L[0x13F1] << 16) | ((uint32_t)L[0x13F2] << 8) | L[0x13F3];
       spu_pmtrace(ctx, spu_num, 5, wid, eaWL, ((uint32_t)L[0x12A2] << 8) | L[0x12A3]); }
+    spurs_snr_enter(spurs_ea, spu_num, ctx);
     const int pm_halted = spu_run_with_halt(entry, ctx);
+    spurs_snr_leave(spurs_ea, spu_num, ctx);
     { const uint8_t* L = ctx->ls; spu_pmtrace(ctx, spu_num, 6, wid, (uint32_t)ctx->pc & SPU_LS_MASK,
                                               ((uint32_t)L[0x12A2] << 8) | L[0x12A3]); }
     /* A lane's run should only end through exitToKernel. Anything else strands

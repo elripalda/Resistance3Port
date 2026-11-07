@@ -506,8 +506,28 @@ void spu_taskset_start_pending(uint32_t taskset_ea)
     if (taskset_ea) spu_taskset_task_exited(taskset_ea, 0xFFFFFFFFu);
 }
 
+/* Interpreter fallback for task images with no lifted code: the ELF's own
+ * e_entry (ELF32, big-endian, offset 0x18), latched per host thread by
+ * spu_async_run before it hands the shim to spu_run_lifted_job_abi. */
+static uint32_t async_elf_entry(const uint8_t* image, uint32_t size)
+{
+    if (!image || size < 0x1C || image[0] != 0x7F || image[1] != 'E') return 0;
+    return ((uint32_t)image[0x18] << 24) | ((uint32_t)image[0x19] << 16) |
+           ((uint32_t)image[0x1A] << 8) | image[0x1B];
+}
+static SPU_THREAD_LOCAL uint32_t t_async_interp_entry;
+static void async_interp_set_entry(const uint8_t* image, uint32_t size)
+{
+    t_async_interp_entry = async_elf_entry(image, size);
+}
+static void async_interp_entry(spu_context* ctx)
+{
+    spu_interp_run(ctx, t_async_interp_entry & SPU_LS_MASK);
+}
+
 static void spu_async_run(spu_async_job* j)
 {
+    async_interp_set_entry(j->image, j->image_size);
     spu_taskset_mark(j->taskset_ea, j->taskid, 1);
     /* Persistent per-taskset LS: acquire (+serialize) the taskset's LS, or fall
      * back to a fresh per-dispatch LS when disabled / no taskset. */
@@ -1332,6 +1352,17 @@ int spu_workload_dispatch_async(const uint8_t* image, uint32_t image_size,
           } }
         fprintf(stderr, "[spu_workload] async dispatch MISS fp=0x%016llX size=%u\n",
                 (unsigned long long)fp, image_size);
+        /* No lifted image: run the task in the interpreter rather than drop it
+         * (a dropped task leaves its PPU waiter blocked forever).
+         * SPU_ASYNC_INTERP=0 restores the old drop. */
+        { const char* e = getenv("SPU_ASYNC_INTERP");
+          if (e && *e == '0') return 0; }
+        fn = async_interp_entry;
+        image_id = 0;
+        fprintf(stderr, "[spu_workload]   -> running fp=0x%016llX interpreted (entry 0x%05X)\n",
+                (unsigned long long)fp, async_elf_entry(image, image_size));
+    }
+    if (!fn) {
         return 0;
     }
 

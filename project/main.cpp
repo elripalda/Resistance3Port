@@ -491,6 +491,7 @@ static bool alloc_guest_vm(void)
         }
     }
     ppu_vm_size = 0;              /* the whole space is backed; no OOB guard needed */
+    fprintf(stderr, "[boot] vm_base=%p\n", (void*)vm_base);
 #else
     /* No vectored exception handlers off Windows, so the arena is mapped up
      * front and lazily backed by the OS: only pages the title touches cost

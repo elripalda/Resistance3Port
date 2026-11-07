@@ -104,7 +104,7 @@ static void hle_game_process_exitspawn(ppu_context* ctx)
     std::string target_exe, target_elf;
     /* Resistance 2: EBOOT.BIN and game.self are the same program */
     if (lower.find("game.self") != std::string::npos || lower.find("eboot.bin") != std::string::npos) {
-        target_exe = root + "\\build\\Resistance2.exe";
+        target_exe = root + "\\build\\Resistance3.exe";
         target_elf = root + "\\game\\EBOOT.elf";
     } else {
         fprintf(stderr, "[exitspawn] no executable for \"%s\" -- exiting\n", path.c_str());
@@ -2393,9 +2393,33 @@ extern "C" uint64_t port_movie_evwait_us(void)
     return (uint64_t)us;
 }
 
+/* Resistance 3 imports the shared libraries do not cover.
+ * sys_prx_load_module(_on_memcontainer): the game asks for firmware modules by
+ * path. Those under /dev_flash/ are HLE'd already, so hand back a module id
+ * (from 0x23000000, as the firmware does); anything else is genuinely absent. */
+static void hle_r3_prx_load(ppu_context* ctx)
+{
+    static uint32_t s_next = 0x23000000u;
+    const std::string path = guest_str((uint32_t)ctx->gpr[3]);
+    if (path.rfind("/dev_flash/", 0) == 0) ctx->gpr[3] = s_next++;
+    else ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x80010006u;   /* ENOENT */
+    fprintf(stderr, "[prx] load '%s' -> 0x%08X\n", path.c_str(), (uint32_t)ctx->gpr[3]);
+}
+/* cellKbRead(port, CellKbData*): no key events (keyboard goes through the
+ * port's own input layer); len = 0 so the game never reads stale codes. */
+static void hle_r3_kb_read(ppu_context* ctx)
+{
+    const uint32_t d = (uint32_t)ctx->gpr[4];
+    if (d) { vm_base[d + 8] = vm_base[d + 9] = vm_base[d + 10] = vm_base[d + 11] = 0; }
+    ctx->gpr[3] = 0;
+}
+
 extern "C" void ps3_load_prx_modules(void)
 {
     ps3_hle_register_ctx(0xFC52A7A9u, "sys_game_process_exitspawn", hle_game_process_exitspawn);
+    ps3_hle_register_ctx(0x26090058u, "sys_prx_load_module", hle_r3_prx_load);
+    ps3_hle_register_ctx(0xAA6D9BFFu, "sys_prx_load_module_on_memcontainer", hle_r3_prx_load);
+    ps3_hle_register_ctx(0xFF0A21B7u, "cellKbRead", hle_r3_kb_read);
     menu_probe_start();   /* v160b diag */
 #ifdef _WIN32
     { static char dbgpath[1024];

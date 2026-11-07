@@ -4,9 +4,9 @@ cd /d "%~dp0"
 if not exist logs mkdir logs
 if not exist recompiled\ppu_recomp.h (echo The game code has not been generated yet - run Setup.bat first. & goto fail)
 rem A game window left open locks the .exe and the link fails -- close any that are still running.
-taskkill /IM Resistance2.exe /F >nul 2>&1 && echo Closed a Resistance2.exe that was still running.
+taskkill /IM Resistance3.exe /F >nul 2>&1 && echo Closed a Resistance3.exe that was still running.
 echo ============================================================
-echo  Resistance 2 - native PC build
+echo  Resistance 3 - native PC build
 echo  Builds one program (EBOOT.BIN; game.self is the same file).
 echo  The first build takes a long time. Leave it running.
 echo ============================================================
@@ -29,7 +29,7 @@ if errorlevel 1 (echo RPCS3 RSX build FAILED - see logs\build_rpcs3.log & goto f
 
 (
   echo Configuring...
-  cmake -S project -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DPORT_NAME=Resistance2 -DPS3RECOMP_DIR="%~dp0ps3recomp" -DRECOMP_DIR="%~dp0recompiled" -DPORT_SPU_AVX2=ON %FFOPT% > logs\configure.log 2>&1
+  cmake -S project -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DPORT_NAME=Resistance3 -DPS3RECOMP_DIR="%~dp0ps3recomp" -DRECOMP_DIR="%~dp0recompiled" -DPORT_SPU_AVX2=ON %FFOPT% > logs\configure.log 2>&1
   if errorlevel 1 (echo Configure FAILED - see logs\configure.log & type logs\configure.log & goto fail)
 )
 echo Building the game...
@@ -57,7 +57,7 @@ if exist "tools\dlss\lib\nvsdk_ngx_s.lib" (
 rem FSR 3.1 for the Vulkan renderer (AMD FidelityFX SDK 1.1.x, MIT licence in tools\ffx_vk\LICENSE.txt)
 for %%D in (build) do if exist "tools\ffx_vk\amd_fidelityfx_vk.dll" copy /Y "tools\ffx_vk\amd_fidelityfx_vk.dll" %%D\ >nul
 echo.
-echo BUILD SUCCEEDED: build\Resistance2.exe
+echo BUILD SUCCEEDED: build\Resistance3.exe
 echo Start the game with Launcher.exe
 if /i not "%~1"=="nopause" pause
 exit /b 0
