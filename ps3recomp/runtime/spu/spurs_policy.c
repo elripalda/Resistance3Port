@@ -151,6 +151,12 @@ static void spurs_snr_leave(uint32_t spurs_ea, uint32_t spu, spu_context* ctx)
  * rdch SPU_RdEventStat; non-blocking reads gave every lane index 0 and spun.
  * Per-thread here (cleared in spurs_snr_leave). SPURS_PM_NOBLOCK=1 = off. */
 extern SPU_THREAD_LOCAL int g_spu_tl_ch_block;
+/* The same blocking reads for a LIFTED igPm loader (tools/r3_regen.py wraps
+ * its entry with this). */
+void spurs_pm_block_reads(int on)
+{
+    g_spu_tl_ch_block = on && !getenv("SPURS_PM_NOBLOCK");
+}
 void spurs_pm_interp_entry(spu_context* ctx)
 {
     extern uint32_t spu_interp_run(spu_context*, uint32_t);

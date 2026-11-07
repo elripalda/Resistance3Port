@@ -2095,9 +2095,16 @@ static void spu_resident_code_set(spu_context* ctx, uint32_t lsa, uint32_t span,
         if (!ctx->resident_code[slot].image_id && free_slot < 0) free_slot = (int)slot;
     }
     if (free_slot < 0 && pic) {
-        /* PIC loads come and go at heap addresses: reuse slots round-robin. */
+        /* PIC loads come and go at heap addresses: reuse PIC slots round-robin.
+         * Never a job's own span while a PIC slot can go: R3's DC0200 job runs
+         * a plugin at dozens of bases, and losing its span sent the job's own
+         * code to the interpreter. */
         static SPU_THREAD_LOCAL unsigned rr;
-        free_slot = (int)(rr++ % SPU_RESIDENT_CODE_SLOTS);
+        for (unsigned k = 0; k < SPU_RESIDENT_CODE_SLOTS && free_slot < 0; ++k) {
+            const unsigned s = rr++ % SPU_RESIDENT_CODE_SLOTS;
+            if (ctx->resident_code[s].pic) free_slot = (int)s;
+        }
+        if (free_slot < 0) free_slot = (int)(rr++ % SPU_RESIDENT_CODE_SLOTS);
     }
     if (free_slot < 0) {
         static int _n = 0; if (PS3_LOG_FIRST(_n, 8))
@@ -2192,16 +2199,22 @@ static int spu_placed_note_get(spu_context* ctx, uint32_t ea, uint32_t lsa, cons
  * pc - base against the module's functions, registered at offset|SPU_PIC_TAG,
  * and publishes the base in ctx->ls_bias. Sorted by src_ea for the search. */
 #define SPU_PIC_TAG 0x40000u
-typedef struct { uint32_t src_ea, span; int image_id; } spu_pic_mod;
+typedef struct { uint32_t src_ea, span; int image_id; uint32_t min_base; } spu_pic_mod;
 #define SPU_PIC_MAX 512
 static spu_pic_mod s_pic[SPU_PIC_MAX];
 static int s_pic_count;
-void spu_overlay_register_pic(uint32_t src_ea, uint32_t span, int image_id)
+/* min_base: lowest accepted load base (WWS plugins sit in the job heap above
+ * the job manager, 0x2000; Insomniac ig modules may load from LS 0x100). */
+void spu_overlay_register_pic_at(uint32_t src_ea, uint32_t span, int image_id, uint32_t min_base)
 {
     if (s_pic_count >= SPU_PIC_MAX || !span) return;
     int i = s_pic_count++;
     while (i > 0 && s_pic[i - 1].src_ea > src_ea) { s_pic[i] = s_pic[i - 1]; --i; }
-    s_pic[i].src_ea = src_ea; s_pic[i].span = span; s_pic[i].image_id = image_id;
+    s_pic[i].src_ea = src_ea; s_pic[i].span = span; s_pic[i].image_id = image_id; s_pic[i].min_base = min_base;
+}
+void spu_overlay_register_pic(uint32_t src_ea, uint32_t span, int image_id)
+{
+    spu_overlay_register_pic_at(src_ea, span, image_id, 0x2000u);
 }
 
 static int spu_pic_note_get(spu_context* ctx, uint32_t ea, uint32_t lsa, uint32_t size)
@@ -2218,7 +2231,7 @@ static int spu_pic_note_get(spu_context* ctx, uint32_t ea, uint32_t lsa, uint32_
     const uint32_t base = lsa - off;
     /* Header probes copy a few bytes into scratch; code arrives in big
      * chunks. Load bases sit in the job heap, above the job manager. */
-    if ((base & 15u) || base < 0x2000u || base + p->span > SPU_LS_SIZE) return 0;
+    if ((base & 15u) || base < p->min_base || base + p->span > SPU_LS_SIZE) return 0;
     for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
         if (ctx->resident_code[slot].image_id == p->image_id && ctx->resident_code[slot].lsa == base)
             return 1;
@@ -2259,6 +2272,16 @@ static inline spu_fn spu_lookup_resident(spu_context* ctx, unsigned slot, uint32
  * candidate is registered as a PIC resident span; later calls resolve through
  * that slot, and a GET over the span invalidates it like any placement (the
  * next miss re-matches through the index). SPU_PIC_CONTENT=0 disables. */
+/* pc lies in a registered resident code span (lifted overlay / job image). */
+static inline int spu_pc_resident(const spu_context* ctx, uint32_t pc)
+{
+    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot)
+        if (ctx->resident_code[slot].image_id && pc >= ctx->resident_code[slot].lsa &&
+            pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size)
+            return 1;
+    return 0;
+}
+
 #define SPU_PCI_BITS 19u
 static uint32_t* s_pci_head;            /* hash -> entry + 1 */
 static uint32_t* s_pci_next;            /* entry -> next entry + 1 */
@@ -2291,7 +2314,7 @@ static int spu_pci_build(void)
     if (st != 0) return st == 2;
     const int n = s_pic_count;
     uint32_t total = 0;
-    for (int i = 0; i < n; i++) if (s_pic[i].span > 0x50u) total += (s_pic[i].span - 0x30u) / 4u;
+    for (int i = 0; i < n; i++) if (s_pic[i].span >= 0x40u) total += (s_pic[i].span - 0x20u) / 4u;
     s_pci_head = (uint32_t*)calloc((size_t)1 << SPU_PCI_BITS, sizeof(uint32_t));
     s_pci_next = (uint32_t*)calloc(total + 1, sizeof(uint32_t));
     s_pci_ent  = (uint32_t*)calloc(total + 1, sizeof(uint32_t));
@@ -2301,7 +2324,8 @@ static int spu_pci_build(void)
     uint32_t e = 0;
     for (int i = 0; i < n; i++) {
         const uint8_t* img = vm_base + s_pic[i].src_ea;
-        for (uint32_t o = 0x30u; o + 32u <= s_pic[i].span && o < (1u << 22); o += 4u) {
+        /* from 0x20: R3's ig PIC modules start their code (and entry) there */
+        for (uint32_t o = 0x20u; o + 32u <= s_pic[i].span && o < (1u << 22); o += 4u) {
             if (spu_pci_pad(img + o)) continue;
             const uint32_t h = spu_pci_hash(img + o);
             s_pci_ent[e] = ((uint32_t)i << 20) | (o >> 2);
@@ -2591,13 +2615,44 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
 {
     uint32_t lsa = (uint32_t)(ls - ctx->ls);
     spu_ovl_dump(ctx, ea, lsa, ls, size);
+    /* SPU_GETLOG=1: each distinct (ea, lsa) GET that carries code -- a module
+     * header (4x ila $r2) or a chunk from the title image -- to
+     * logs/spu_getlog.txt, the work list for the static SPU lift. */
+    { static int on = -1; if (on < 0) { const char* e = getenv("SPU_GETLOG"); on = e && *e == '1'; }
+      if (on && size >= 16) {
+          const int head = spu_is_wws_module_head(ls);
+          if (head || (ea >= 0x10000u && ea < 0x1200000u && size >= 64)) {
+              static uint64_t seen[8192]; static int nseen; static volatile LONG lk;
+              const uint64_t key = ((uint64_t)ea << 20) | lsa;
+              while (InterlockedExchange(&lk, 1)) YieldProcessor();
+              int dup = 0;
+              for (int i = 0; i < nseen; i++) if (seen[i] == key) { dup = 1; break; }
+              if (!dup && nseen < 8192) seen[nseen++] = key;
+              if (!dup) {
+                  CreateDirectoryA("logs", NULL);
+                  FILE* f = fopen("logs\\spu_getlog.txt", "a");
+                  if (f) {
+                      fprintf(f, "img=%d pc=%05X ea=%08X lsa=%05X size=%X head=%d", ctx->image_id,
+                              (unsigned)(ctx->pc & SPU_LS_MASK), ea, lsa, size, head);
+                      if (head && size >= 32) { fputc(' ', f); for (int i = 0; i < 32; i++) fprintf(f, "%02X", ls[i]); }
+                      fputc('\n', f); fclose(f);
+                  }
+              }
+              InterlockedExchange(&lk, 0);
+          }
+      } }
     for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
         if (!ctx->resident_code[slot].image_id) continue;
         uint32_t base = ctx->resident_code[slot].lsa;
         uint32_t end = base + ctx->resident_code[slot].size;
         if (lsa < end && lsa + size > base &&
-            (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
-            ctx->resident_code[slot].image_id = 0;
+            (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base))) {
+            /* A GET into the tail of a span (an ig job streaming a module or
+             * data into its own buffer area past its code) leaves the code
+             * below it resident; one over the start replaces the image. */
+            if (lsa > base) ctx->resident_code[slot].size = lsa - base;
+            else ctx->resident_code[slot].image_id = 0;
+        }
     }
     if (spu_placed_note_get(ctx, ea, lsa, ls, size)) return;
     if (s_pic_count && spu_pic_note_get(ctx, ea, lsa, size)) return;
@@ -3540,8 +3595,9 @@ static void spu_indirect_branch_full(spu_context* ctx)
       } }
     /* SPURS kernel services (policy-module runs only): the HLE kernel plants
      * these two reserved addresses as exitToKernelAddr / selectWorkloadAddr in
-     * the SpursKernelContext (spurs_policy.c). */
-    if (ctx->policy_mode) {
+     * the SpursKernelContext (spurs_policy.c). A resident lifted job image
+     * (Insomniac ig jobs load at LS 0x100) may own those addresses. */
+    if (ctx->policy_mode && !spu_pc_resident(ctx, ctx->pc & SPU_LS_MASK)) {
         extern SPU_THREAD_LOCAL volatile unsigned g_spurs_pm_polls, g_spurs_pm_exited;
         if (ctx->pc == SPURS_PM_EXIT_TO_KERNEL_LS) {
             /* Module exit: the workload returned to the kernel (drained/yield).
@@ -3585,7 +3641,7 @@ static void spu_indirect_branch_full(spu_context* ctx)
      * evidence that this is an HLE context. LLE tasks must enter Sony's policy
      * to yield/select workloads instead of parking an entire SPU host thread.
      * Image 22 is the legacy standalone HLE CRI task runner. */
-    if (ctx->pc == SPURS_TASKSET_PM_SYSCALL_LS) {
+    if (ctx->pc == SPURS_TASKSET_PM_SYSCALL_LS && !spu_pc_resident(ctx, ctx->pc)) {
         uint32_t sc = ((uint32_t)ctx->ls[0x27C4] << 24) | ((uint32_t)ctx->ls[0x27C5] << 16)
                     | ((uint32_t)ctx->ls[0x27C6] << 8)  | ctx->ls[0x27C7];
         /* A task dispatched standalone (no policy module in this local store)

@@ -15,21 +15,21 @@
 extern "C" {
 #endif
 
-/* Error codes */
-#define CELL_GEM_ERROR_NOT_INITIALIZED     0x80121801
+/* Error codes (SDK libgem / RPCS3 cellGem.h) */
+#define CELL_GEM_ERROR_NOT_INITIALIZED     0x80121803   /* UNINITIALIZED */
 #define CELL_GEM_ERROR_ALREADY_INITIALIZED 0x80121802
-#define CELL_GEM_ERROR_INVALID_ARGUMENT    0x80121803
-#define CELL_GEM_ERROR_NOT_CONNECTED       0x80121804
-#define CELL_GEM_ERROR_NOT_CALIBRATED      0x80121805
-#define CELL_GEM_ERROR_NO_VIDEO            0x80121806
+#define CELL_GEM_ERROR_INVALID_ARGUMENT    0x80121804   /* INVALID_PARAMETER */
+
+/* Runtime statuses: positive return values, not errors */
+#define CELL_GEM_NOT_CONNECTED             1
+#define CELL_GEM_NO_EXTERNAL_PORT_DEVICE   9
 
 /* Constants */
 #define CELL_GEM_MAX_NUM   4
 
-/* Status flags */
+/* CellGemInfo status values */
 #define CELL_GEM_STATUS_DISCONNECTED   0
 #define CELL_GEM_STATUS_READY          1
-#define CELL_GEM_STATUS_CALIBRATING    2
 
 /* Types. Layouts verified against the DWARF in the Gears of War 3 / og-LBP debug
  * builds (dwarf_abi.py) -- the previous definitions were wrong on every one:
@@ -107,6 +107,19 @@ s32 cellGemReset(u32 gemNum);
 s32 cellGemEnableMagnetometer(u32 gemNum, s32 enable);
 s32 cellGemEnableCameraPitchAngleCorrection(s32 enable);
 
+/* Per-controller queries the game imports; with no Move connected they all
+ * answer CELL_GEM_NOT_CONNECTED (an unregistered import would return 0 = OK). */
+s32 cellGemGetImageState(u32 gemNum, void* state);
+s32 cellGemGetInertialState(u32 gemNum, u32 flag, u64 timestamp, void* state);
+s32 cellGemInvalidateCalibration(s32 gemNum);
+s32 cellGemReadExternalPortDeviceInfo(u32 gemNum, u32* extId, u8* data);
+s32 cellGemSetRumble(u32 gemNum, u8 rumble);
+s32 cellGemSetYaw(u32 gemNum, void* zDirection);
+s32 cellGemClearStatusFlags(u32 gemNum, u64 mask);
+s32 cellGemPrepareCamera(s32 maxExposure, u32 imageQuality);
+s32 cellGemPrepareVideoConvert(const void* attr);
+s32 cellGemConvertVideoStart(const void* videoFrame);
+s32 cellGemConvertVideoFinish(void);
 #ifdef __cplusplus
 }
 #endif

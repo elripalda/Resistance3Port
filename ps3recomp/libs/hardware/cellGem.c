@@ -52,10 +52,10 @@ s32 cellGemGetInfo(CellGemInfo* info)
 
 s32 cellGemGetState(u32 gemNum, u32 flag, u64 timestamp, CellGemState* state)
 {
-    (void)gemNum; (void)flag; (void)timestamp;
+    (void)flag; (void)timestamp;
     if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
-    if (!state) return (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
-    return (s32)CELL_GEM_ERROR_NOT_CONNECTED;
+    if (!state || gemNum >= CELL_GEM_MAX_NUM) return (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
+    return CELL_GEM_NOT_CONNECTED;
 }
 
 s32 cellGemIsTrackableHue(u32 hue)
@@ -70,7 +70,7 @@ s32 cellGemGetHue(u32 gemNum, u32* hue)
     (void)gemNum;
     if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
     if (!hue) return (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
-    return (s32)CELL_GEM_ERROR_NOT_CONNECTED;
+    return CELL_GEM_NOT_CONNECTED;
 }
 
 s32 cellGemTrackHues(const u32* reqHues, u32* resHues)
@@ -84,7 +84,7 @@ s32 cellGemCalibrate(u32 gemNum)
 {
     (void)gemNum;
     if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
-    return (s32)CELL_GEM_ERROR_NOT_CONNECTED;
+    return CELL_GEM_NOT_CONNECTED;
 }
 
 s32 cellGemGetStatusFlags(u32 gemNum, u64* flags)
@@ -93,7 +93,7 @@ s32 cellGemGetStatusFlags(u32 gemNum, u64* flags)
     if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
     if (!flags) return (s32)CELL_GEM_ERROR_INVALID_ARGUMENT;
     vm_write64((u32)(uintptr_t)flags, 0);
-    return CELL_OK;
+    return CELL_GEM_NOT_CONNECTED;
 }
 
 s32 cellGemUpdateStart(const void* cameraFrame, u64 timestamp)
@@ -126,6 +126,82 @@ s32 cellGemEnableMagnetometer(u32 gemNum, s32 enable)
 s32 cellGemEnableCameraPitchAngleCorrection(s32 enable)
 {
     (void)enable;
+    if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
+    return CELL_OK;
+}
+
+s32 cellGemGetImageState(u32 gemNum, void* state)
+{
+    (void)gemNum; (void)state;
+    if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
+    return CELL_GEM_NOT_CONNECTED;
+}
+
+s32 cellGemGetInertialState(u32 gemNum, u32 flag, u64 timestamp, void* state)
+{
+    (void)gemNum; (void)flag; (void)timestamp; (void)state;
+    if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
+    return CELL_GEM_NOT_CONNECTED;
+}
+
+s32 cellGemInvalidateCalibration(s32 gemNum)
+{
+    (void)gemNum;
+    if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
+    return CELL_OK;
+}
+
+s32 cellGemReadExternalPortDeviceInfo(u32 gemNum, u32* extId, u8* data)
+{
+    (void)gemNum; (void)extId; (void)data;
+    if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
+    return CELL_GEM_NOT_CONNECTED;
+}
+
+s32 cellGemSetRumble(u32 gemNum, u8 rumble)
+{
+    (void)gemNum; (void)rumble;
+    if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
+    return CELL_OK;
+}
+
+s32 cellGemSetYaw(u32 gemNum, void* zDirection)
+{
+    (void)gemNum; (void)zDirection;
+    if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
+    return CELL_OK;
+}
+
+s32 cellGemClearStatusFlags(u32 gemNum, u64 mask)
+{
+    (void)gemNum; (void)mask;
+    if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
+    return CELL_OK;
+}
+
+s32 cellGemPrepareCamera(s32 maxExposure, u32 imageQuality)
+{
+    (void)maxExposure; (void)imageQuality;
+    if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
+    return CELL_OK;
+}
+
+s32 cellGemPrepareVideoConvert(const void* attr)
+{
+    (void)attr;
+    if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
+    return CELL_OK;
+}
+
+s32 cellGemConvertVideoStart(const void* videoFrame)
+{
+    (void)videoFrame;
+    if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
+    return CELL_OK;
+}
+
+s32 cellGemConvertVideoFinish(void)
+{
     if (!s_initialized) return (s32)CELL_GEM_ERROR_NOT_INITIALIZED;
     return CELL_OK;
 }

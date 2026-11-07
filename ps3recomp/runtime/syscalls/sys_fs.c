@@ -407,6 +407,18 @@ int64_t sys_fs_open(ppu_context* ctx)
             mode = "rb";
     }
 
+    /* Port option SKIP_INTRO=1: the boot movies (Insomniac logo, opening
+     * loading movie) look missing, so the game goes straight on. */
+    {
+        const char* si = getenv("SKIP_INTRO");
+        if (si && si[0] == '1' && !(flags & (CELL_FS_O_CREAT | CELL_FS_O_WRONLY | CELL_FS_O_TRUNC)) &&
+            (strstr(host_path, "lby_insom_fmv") || strstr(host_path, "opn_loadingmovie_fmv"))) {
+            static int si_logged;
+            if (!si_logged++) fprintf(stderr, "[sys_fs] SKIP_INTRO: %s\n", host_path);
+            return (int64_t)(int32_t)CELL_ENOENT;
+        }
+    }
+
     FILE* fp = fopen(host_path, mode);
 
     /* Transient open failures: on Windows an existing, correctly-pathed file can

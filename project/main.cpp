@@ -466,12 +466,87 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
     }
     return EXCEPTION_CONTINUE_SEARCH;
 }
+
+#include <dbghelp.h>
+/* Resistance port: crash report. A host fault that nothing claims used to end
+ * the process with no message and no Windows dump. This logs the fault and
+ * writes logs\dumps\r3_<pid>.dmp (full memory with CRASH_DUMP_FULL=1). */
+static void crash_where(void* addr, char* out, size_t n)
+{
+    HMODULE m = NULL;
+    char path[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &m) && m) {
+        GetModuleFileNameA(m, path, sizeof path);
+        const char* b = strrchr(path, '\\');
+        snprintf(out, n, "%s+0x%llX", b ? b + 1 : path, (unsigned long long)((uintptr_t)addr - (uintptr_t)m));
+    } else {
+        snprintf(out, n, "%p", addr);
+    }
+}
+static void crash_report(EXCEPTION_POINTERS* ep, const char* how)
+{
+    static volatile LONG once = 0;
+    if (InterlockedExchange(&once, 1)) return;
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    char where[MAX_PATH + 32];
+    crash_where(er->ExceptionAddress, where, sizeof where);
+    fprintf(stderr, "\n[CRASH] %s: code=0x%08lX at %s thread=%lu", how, er->ExceptionCode, where,
+            GetCurrentThreadId());
+    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
+        const uintptr_t fa = er->ExceptionInformation[1];
+        fprintf(stderr, " %s 0x%llX", er->ExceptionInformation[0] == 1 ? "writing" : er->ExceptionInformation[0] == 8 ? "executing" : "reading",
+                (unsigned long long)fa);
+        if (vm_base && fa >= (uintptr_t)vm_base && fa < (uintptr_t)vm_base + VM_SIZE)
+            fprintf(stderr, " (guest 0x%08X)", (uint32_t)(fa - (uintptr_t)vm_base));
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr); fflush(stdout);
+    typedef BOOL (WINAPI *mdw_t)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
+    HMODULE dh = LoadLibraryA("dbghelp.dll");
+    mdw_t mdw = dh ? (mdw_t)GetProcAddress(dh, "MiniDumpWriteDump") : NULL;
+    if (!mdw) return;
+    char dir[MAX_PATH], file[MAX_PATH];
+    GetModuleFileNameA(NULL, dir, sizeof dir);
+    if (char* s = strrchr(dir, '\\')) *s = 0;
+    snprintf(file, sizeof file, "%s\\..\\logs\\dumps", dir);
+    CreateDirectoryA(file, NULL);
+    snprintf(file, sizeof file, "%s\\..\\logs\\dumps\\r3_%lu.dmp", dir, GetCurrentProcessId());
+    HANDLE f = CreateFileA(file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    MINIDUMP_EXCEPTION_INFORMATION mei = { GetCurrentThreadId(), ep, FALSE };
+    const char* full = getenv("CRASH_DUMP_FULL");
+    /* MiniDumpWithIndirectlyReferencedMemory | WithThreadInfo, or WithFullMemory */
+    const int type = (full && full[0] == '1') ? 0x2 : (0x40 | 0x1000);
+    const BOOL ok = mdw(GetCurrentProcess(), GetCurrentProcessId(), f, type, &mei, NULL, NULL);
+    CloseHandle(f);
+    fprintf(stderr, "[CRASH] minidump %s: %s\n", ok ? "written" : "FAILED", file);
+    fflush(stderr);
+}
+static LONG WINAPI crash_filter(EXCEPTION_POINTERS* ep)
+{
+    crash_report(ep, "unhandled exception");
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+/* Faults that never reach the unhandled filter (stack overflow, and host code
+ * that installs its own last-chance filter later) are caught here; only codes
+ * no handler can recover from, after the guest-memory handlers had their go. */
+static LONG WINAPI crash_veh(EXCEPTION_POINTERS* ep)
+{
+    const DWORD c = ep->ExceptionRecord->ExceptionCode;
+    if (c == EXCEPTION_STACK_OVERFLOW || c == EXCEPTION_ILLEGAL_INSTRUCTION ||
+        c == EXCEPTION_PRIV_INSTRUCTION || c == 0xC0000374 /* heap corruption */ || c == 0xC0000409 /* fast fail */)
+        crash_report(ep, "fatal exception");
+    return EXCEPTION_CONTINUE_SEARCH;
+}
 #endif
 
 extern "C" void vm_inline_refresh(void);
 static bool alloc_guest_vm(void)
 {
 #ifdef _WIN32
+    AddVectoredExceptionHandler(0, crash_veh);
+    SetUnhandledExceptionFilter(crash_filter);
     AddVectoredExceptionHandler(1, vm_commit_veh);
     {
         HANDLE sec = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_RESERVE,
@@ -546,6 +621,17 @@ int main(int argc, char** argv)
 #endif
 
     printf("=== ps3recomp game runner ===\n");
+
+    /* No PlayStation Eye on PC: with the runtime's virtual camera attached,
+     * Resistance 3 starts PlayStation Move calibration and waits on it.
+     * PS3_CAMERA=1 brings the virtual camera back. */
+    if (!getenv("PS3_CAMERA")) {
+#ifdef _WIN32
+        _putenv("PS3_CAMERA=0");
+#else
+        setenv("PS3_CAMERA", "0", 1);
+#endif
+    }
 
     if (!alloc_guest_vm()) {
         fprintf(stderr, "ERROR: could not allocate the guest address space\n");
