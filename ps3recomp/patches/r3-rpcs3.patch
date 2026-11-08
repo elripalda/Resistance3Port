@@ -1382,10 +1382,16 @@ index 107f5b2..39a9d7c 100644
  			{
  				const u32 reg = (command.reg & 0xfffc) >> 2;
 diff --git a/rpcs3/Emu/RSX/RSXOffload.cpp b/rpcs3/Emu/RSX/RSXOffload.cpp
-index 493fc8c..caac87e 100644
+index 493fc8c..0fc8c33 100644
 --- a/rpcs3/Emu/RSX/RSXOffload.cpp
 +++ b/rpcs3/Emu/RSX/RSXOffload.cpp
-@@ -79,7 +79,8 @@ namespace rsx
+@@ -1,4 +1,5 @@
+ #include "stdafx.h"
++#include "port_backoff.h"
+ 
+ #include "Emu/Memory/vm.h"
+ #include "Common/BufferUtils.h"
+@@ -79,7 +80,8 @@ namespace rsx
  				if (m_enqueued_count.load() == m_processed_count.load())
  				{
  					m_processed_count.notify_all();
@@ -1395,8 +1401,29 @@ index 493fc8c..caac87e 100644
  				}
  			}
  
+@@ -178,16 +180,18 @@ namespace rsx
+ 				return false;
+ 			}
+ 
++			rsx::port_backoff backoff;
+ 			while (_thr.m_enqueued_count.load() > _thr.m_processed_count.load())
+ 			{
+ 				rsxthr->renderer()->on_semaphore_acquire_wait();
+-				utils::pause();
++				backoff();
+ 			}
+ 		}
+ 		else
+ 		{
++			rsx::port_backoff backoff;
+ 			while (_thr.m_enqueued_count.load() > _thr.m_processed_count.load())
+-				utils::pause();
++				backoff();
+ 		}
+ 
+ 		return true;
 diff --git a/rpcs3/Emu/RSX/RSXThread.cpp b/rpcs3/Emu/RSX/RSXThread.cpp
-index a572df4..a4ba7bc 100644
+index a572df4..c0fb14b 100644
 --- a/rpcs3/Emu/RSX/RSXThread.cpp
 +++ b/rpcs3/Emu/RSX/RSXThread.cpp
 @@ -1,6 +1,9 @@
@@ -1409,7 +1436,26 @@ index a572df4..a4ba7bc 100644
  #include "Capture/rsx_capture.h"
  #include "Common/surface_store.h"
  #include "Core/RSXReservationLock.hpp"
-@@ -2168,6 +2171,25 @@ namespace rsx
+@@ -50,6 +53,8 @@ rsx::frame_capture_data frame_capture;
+ extern CellGcmOffsetTable offsetTable;
+ extern thread_local std::string(*g_tls_log_prefix)();
+ 
++extern "C" int ps3_host_prio_boost();
++
+ namespace rsx
+ {
+ 	std::function<bool(u32 addr, bool is_writing)> g_access_violation_handler;
+@@ -857,7 +862,8 @@ namespace rsx
+ 		} join_vblank_obj{ m_display };
+ 
+ 		// Raise priority above other threads
+-		thread_ctrl::scoped_priority high_prio(+1);
++		// Port: no boost on < 8 logical CPUs (see ps3_host_prio_boost)
++		thread_ctrl::scoped_priority high_prio(ps3_host_prio_boost() ? +1 : 0);
+ 
+ 		if (g_cfg.core.thread_scheduler != thread_scheduler_mode::os)
+ 		{
+@@ -2168,6 +2174,25 @@ namespace rsx
  
  	void thread::on_frame_end(context* ctx, u32 buffer, bool forced)
  	{
@@ -1574,6 +1620,28 @@ index 4afff84..d91eeb2 100644
  	if (!info.emu_flip)
  	{
  		// Native UI flips are requested from the local task. Submit outstanding work first.
+diff --git a/rpcs3/Emu/RSX/VK/VKQueryPool.cpp b/rpcs3/Emu/RSX/VK/VKQueryPool.cpp
+index 885e5ae..7e0968d 100644
+--- a/rpcs3/Emu/RSX/VK/VKQueryPool.cpp
++++ b/rpcs3/Emu/RSX/VK/VKQueryPool.cpp
+@@ -1,4 +1,5 @@
+ #include "stdafx.h"
++#include "../port_backoff.h"
+ #include "vkutils/query_pool.hpp"
+ #include "VKHelpers.h"
+ #include "VKQueryPool.h"
+@@ -180,9 +181,10 @@ namespace vk
+ 		{
+ 			poke_query(query_info, index, result_flags);
+ 
++			rsx::port_backoff backoff;
+ 			while (!query_info.ready)
+ 			{
+-				utils::pause();
++				backoff();
+ 				poke_query(query_info, index, result_flags);
+ 			}
+ 		}
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
 index 0000000..84d7f93
@@ -3859,6 +3927,109 @@ index e59c249..0902eff 100644
  #elif defined(__APPLE__)
  			extensions.push_back(VK_EXT_METAL_SURFACE_EXTENSION_NAME);
  #else
+diff --git a/rpcs3/Emu/RSX/VK/vkutils/sync.cpp b/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
+index 4041f4f..8e52bb2 100644
+--- a/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
++++ b/rpcs3/Emu/RSX/VK/vkutils/sync.cpp
+@@ -1,4 +1,5 @@
+ #include "barriers.h"
++#include "../../port_backoff.h"
+ #include "buffer_object.h"
+ #include "commands.h"
+ #include "device.h"
+@@ -178,9 +179,10 @@ namespace vk
+ 
+ 	void fence::wait_flush()
+ 	{
++		rsx::port_backoff backoff;
+ 		while (!flushed)
+ 		{
+-			utils::pause();
++			backoff();
+ 		}
+ 	}
+ 
+@@ -570,12 +572,13 @@ namespace vk
+ 		}
+ 		else
+ 		{
++			rsx::port_backoff backoff;
+ 			while (auto status = vkGetFenceStatus(*g_render_device, pFence->handle))
+ 			{
+ 				switch (status)
+ 				{
+ 				case VK_NOT_READY:
+-					utils::pause();
++					backoff();
+ 					continue;
+ 				default:
+ 					die_with_error(status);
+@@ -598,6 +601,7 @@ namespace vk
+ 		}
+ 
+ 		u64 start = 0;
++		rsx::port_backoff backoff;
+ 
+ 		while (true)
+ 		{
+@@ -630,7 +634,7 @@ namespace vk
+ 				}
+ 			}
+ 
+-			utils::pause();
++			backoff();
+ 		}
+ 	}
+ }
+diff --git a/rpcs3/Emu/RSX/port_backoff.h b/rpcs3/Emu/RSX/port_backoff.h
+new file mode 100644
+index 0000000..830d098
+--- /dev/null
++++ b/rpcs3/Emu/RSX/port_backoff.h
+@@ -0,0 +1,43 @@
++#pragma once
++
++// Port: bounded spin for RSX wait loops. Pure pause-spinning is fine with spare cores, but on a
++// 4-core CPU the spinner steals the core the producer (offloader, SPU, driver) needs, which made
++// frame rate collapse. Spin ~4 us for the low-latency case, then give the core away.
++#include "util/asm.hpp"
++#include <thread>
++
++#ifdef _WIN32
++extern "C" __declspec(dllimport) void __stdcall Sleep(unsigned long);
++#endif
++extern "C" int ps3_host_prio_boost(); // 1 = >= 8 logical CPUs: keep the original pure spin
++
++namespace rsx
++{
++	struct port_backoff
++	{
++		unsigned n = 0;
++
++		void operator()()
++		{
++			static const bool big = ps3_host_prio_boost() != 0;
++			if (big || n < 64)
++			{
++				utils::pause();
++			}
++			else if (n < 256)
++			{
++				std::this_thread::yield();
++			}
++			else
++			{
++#ifdef _WIN32
++				::Sleep(0);
++#else
++				std::this_thread::yield();
++#endif
++			}
++
++			if (n < 0xFFFF) n++;
++		}
++	};
++}
 diff --git a/rpcs3/Emu/RSX/rsx_cache.h b/rpcs3/Emu/RSX/rsx_cache.h
 index 18681e2..0fc57d0 100644
 --- a/rpcs3/Emu/RSX/rsx_cache.h

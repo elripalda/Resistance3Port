@@ -21,6 +21,7 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <dwmapi.h>
+#include <dxgi.h>
 #include <algorithm>
 namespace Gdiplus { using std::min; using std::max; }
 #include <gdiplus.h>
@@ -108,6 +109,64 @@ static std::vector<Setting> g_set = {
 };
 
 static char g_dir[MAX_PATH];
+static std::string g_hw_desc = "default settings";
+
+// Recommended defaults from the hardware: the strongest DXGI adapter (VRAM, vendor, RTX),
+// the primary screen and the physical core count. Sets each Setting's def.
+static void detect_hardware()
+{
+    size_t vram = 0; UINT vendor = 0; char gpu[128] = "unknown GPU";
+    if (HMODULE dx = LoadLibraryA("dxgi.dll")) {
+        typedef HRESULT (WINAPI *CF)(REFIID, void**);
+        if (CF cf = (CF)(void*)GetProcAddress(dx, "CreateDXGIFactory1")) {
+            IDXGIFactory1* f = nullptr;
+            if (SUCCEEDED(cf(__uuidof(IDXGIFactory1), (void**)&f))) {
+                IDXGIAdapter1* a = nullptr;
+                for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
+                    DXGI_ADAPTER_DESC1 d; a->GetDesc1(&d); a->Release();
+                    if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
+                    size_t mem = d.DedicatedVideoMemory;
+                    if (mem > vram || !vendor) {
+                        vram = mem; vendor = d.VendorId;
+                        WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, gpu, sizeof gpu, NULL, NULL);
+                    }
+                }
+                f->Release();
+            }
+        }
+    }
+    int cores = 0;
+    DWORD len = 0;
+    GetLogicalProcessorInformation(NULL, &len);
+    std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> lpi(len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) + 1);
+    if (len && GetLogicalProcessorInformation(lpi.data(), &len))
+        for (DWORD i = 0; i < len / sizeof lpi[0]; i++) cores += lpi[i].Relationship == RelationProcessorCore;
+    if (!cores) { SYSTEM_INFO si; GetSystemInfo(&si); cores = (int)si.dwNumberOfProcessors; }
+    const int sh = GetSystemMetrics(SM_CYSCREEN);
+    const double gb = vram / (1024.0 * 1024.0 * 1024.0);
+    const bool rtx = vendor == 0x10DE && strstr(gpu, "RTX");
+
+    auto pick = [](int s, const char* v) {
+        for (size_t i = 0; i < g_set[s].choices.size(); i++) if (!strcmp(g_set[s].choices[i].value, v)) g_set[s].def = (int)i;
+    };
+    // render resolution never above the screen, except RTX cards (DLSS Performance from 4K)
+    const char* screen_res = sh >= 2160 ? "3" : sh >= 1800 ? "2.5" : sh >= 1440 ? "2" : sh >= 1080 ? "1.5" : "1";
+    if (gb < 1.5) {              // integrated / very old: PS3 resolution, no extra AA cost, 30 fps
+        pick(S_RES, "1"); pick(S_FSR, "0"); pick(S_ANISO, "0"); pick(S_FPS, "30");
+    } else if (gb < 3.5) {       // GTX 750 Ti / 950 / 1050, RX 460 / 560 class
+        pick(S_RES, sh >= 1080 ? "1.5" : "1"); pick(S_FSR, "0"); pick(S_ANISO, "4");
+    } else if (rtx) {            // RTX: DLSS Performance from 4K (shipping default)
+        pick(S_RES, "3"); pick(S_FSR, "2"); pick(S_UPSCALE, "0.5"); pick(S_ANISO, "16");
+    } else if (gb < 7.0) {       // GTX 1060 / 1650 / RX 570-590 class
+        pick(S_RES, sh >= 1440 ? "2" : screen_res); pick(S_FSR, "1"); pick(S_UPSCALE, "0.667"); pick(S_ANISO, "8");
+    } else {
+        pick(S_RES, screen_res); pick(S_FSR, "1"); pick(S_UPSCALE, "1"); pick(S_ANISO, "16");
+    }
+    if (cores < 4) pick(S_FPS, "30");   // 60 fps doubles the game's CPU work
+    char b[256];
+    snprintf(b, sizeof b, "%s, %.0f GB video memory, %d CPU cores.", gpu, gb, cores);
+    g_hw_desc = b;
+}
 
 static std::string path_of(const char* name) { return std::string(g_dir) + "\\" + name; }
 
@@ -592,7 +651,8 @@ static void layout()
             layout_setting_row(x, y, w, S_ANISO);
             y += SF(26);
             Widget& b = add(W_BUTTON, RectF(x, y, SF(210), SF(38)), BT_RESET_GFX);
-            b.title = "Restore default settings"; b.help = "Puts every Display and Graphics setting back to its default.";
+            b.title = "Recommended for this PC"; b.help = "Picks Display and Graphics settings for your graphics card, "
+                "screen and processor (these are also the first-run defaults).";
             y += SF(38);
         }
     } else if (g_page == P_CONTROLS) {
@@ -1048,7 +1108,7 @@ static void restore_graphics()
 {
     for (auto& s : g_set) s.sel = s.def;
     save_settings();
-    toast("Display and Graphics settings restored to their defaults.");
+    toast("Recommended settings for this PC applied: " + g_hw_desc);
 }
 
 static void play()
@@ -1222,6 +1282,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int show)
 
     GetModuleFileNameA(NULL, g_dir, MAX_PATH);
     if (char* sl = strrchr(g_dir, '\\')) *sl = 0;
+    detect_hardware();
     load_settings();
     ctl_load();
 

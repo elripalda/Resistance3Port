@@ -2486,7 +2486,8 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
             /* the boost stays on between the synth's runs (one syscall per
              * priority change instead of two per run); a non-synth run on
              * this lane drops it again (below) */
-            if (s_ab && t_ab_prio != (s_ab >= 2 ? 2 : 1)) {
+            extern int ps3_host_prio_boost(void);
+            if (s_ab && ps3_host_prio_boost() && t_ab_prio != (s_ab >= 2 ? 2 : 1)) {
                 t_ab_prio = s_ab >= 2 ? 2 : 1;
                 SetThreadPriority(GetCurrentThread(), t_ab_prio == 2 ? THREAD_PRIORITY_TIME_CRITICAL : THREAD_PRIORITY_HIGHEST);
             }

@@ -13,6 +13,7 @@
  */
 
 #include "spu_dma.h"
+int ps3_host_prio_boost(void); /* sys_ppu_thread.c: 0 = low core count */
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
@@ -1025,6 +1026,19 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
         spu_lockline_unlock();
+        /* Low-core CPUs: GETLLAR polling detection (as RPCS3's). An SPU that
+         * re-reads an unchanged line is spin-waiting on another thread; after a
+         * few rounds offer the core to it (returns at once if nothing waits).
+         * On 4 cores R2's raw SPU program held ~80% of a core this way. */
+        { static int s_lowc = -1;
+          if (s_lowc < 0) s_lowc = !ps3_host_prio_boost();
+          if (s_lowc) {
+              static SPU_THREAD_LOCAL uint32_t t_pea; static SPU_THREAD_LOCAL unsigned t_same;
+              static SPU_THREAD_LOCAL uint8_t t_prev[MFC_ATOMIC_LINE];
+              if (ea == t_pea && !memcmp(t_prev, ls, MFC_ATOMIC_LINE)) {
+                  if (++t_same >= 16) SwitchToThread();
+              } else { t_pea = ea; t_same = 0; memcpy(t_prev, ls, MFC_ATOMIC_LINE); }
+          } }
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *
@@ -1485,13 +1499,14 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
      * up to SPU_WAIT_SPIN_US (default 100) first. Raw SPUs only by default;
      * SPU_WAIT_SPIN_ALL=1 spins every SPU context, SPU_WAIT_SPIN_US=0 = old. */
     {
-        static int s_spin_us = -1, s_spin_all = -1;
+        static int s_spin_us = -1, s_spin_all = -1, s_low = 0;
         static LARGE_INTEGER s_qf;
         if (s_spin_us < 0) {
             const char* e = getenv("SPU_WAIT_SPIN_US"); int v = e ? atoi(e) : 100;
             const char* a = getenv("SPU_WAIT_SPIN_ALL"); s_spin_all = a ? atoi(a) : 0;
             QueryPerformanceFrequency(&s_qf);
             s_spin_us = v < 0 ? 0 : v;
+            s_low = !ps3_host_prio_boost();
         }
         if (s_spin_us > 0 && (s_spin_all || ctx->spu_id < 8u)) {
             LARGE_INTEGER q0, q; QueryPerformanceCounter(&q0);
@@ -1500,6 +1515,9 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
                 MemoryBarrier();
                 if (spu_ch_ready(ctx, channel)) break;
                 for (int k = 0; k < 24; k++) YieldProcessor();
+                /* Low-core CPUs: the producer this SPU waits on may be queued
+                 * behind us; offer the core (returns at once if nothing waits). */
+                if (s_low) SwitchToThread();
                 QueryPerformanceCounter(&q);
                 if (q.QuadPart - q0.QuadPart >= lim) break;
             }

@@ -604,15 +604,30 @@ static DWORD WINAPI main_core_keeper(LPVOID)
     const int cpu = e ? atoi(e) : 2;   /* not CPU 0: Windows routes most interrupts there */
     DWORD_PTR proc = 0, sys = 0;
     if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) return 0;
+    /* Low-spec: with < 12 logical CPUs, reserving two whole cores leaves every
+     * other thread (SPU lanes, RSX render, driver, audio) on what is left --
+     * on a 4-core CPU that is two CPUs, and the main thread then sits waiting
+     * for SPU jobs (39 vs 50 fps on 4 cores). Let the scheduler place them. */
+    { int n = 0; for (DWORD_PTR m = proc; m; m &= m - 1) n++;
+      if (n < 12 && !e) { fprintf(stderr, "[affinity] %d logical CPUs: no core pinning%c", n, 10); return 0; } }
+    /* the core's sibling(s) from the real topology (cpu ^ 1 is wrong without SMT) */
+    auto core_of = [](int c) -> DWORD_PTR {
+        DWORD len = 0; GetLogicalProcessorInformation(NULL, &len);
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION buf[256];
+        if (len > sizeof buf || !GetLogicalProcessorInformation(buf, &len)) return ((DWORD_PTR)1 << c) | ((DWORD_PTR)1 << (c ^ 1));
+        for (DWORD i = 0; i < len / sizeof buf[0]; i++)
+            if (buf[i].Relationship == RelationProcessorCore && (buf[i].ProcessorMask >> c & 1)) return buf[i].ProcessorMask;
+        return (DWORD_PTR)1 << c;
+    };
     const DWORD_PTR mine = (DWORD_PTR)1 << cpu;
-    const DWORD_PTR pair = mine | ((DWORD_PTR)1 << (cpu ^ 1));
+    const DWORD_PTR pair = mine | core_of(cpu);
     /* v181: the RSX FIFO thread is the next limiter (F11: ~98% busy in York's
      * slow stretch) -- it gets the next core to itself. PORT_FIFO_CPU=-1 off. */
     const char* fe = getenv("PORT_FIFO_CPU");
     const int fcpu = fe ? atoi(fe) : 4;
     DWORD_PTR fmine = 0, fpair = 0;
     if (fcpu >= 0 && fcpu < 64 && (fcpu >> 1) != (cpu >> 1)) {
-        fmine = (DWORD_PTR)1 << fcpu; fpair = fmine | ((DWORD_PTR)1 << (fcpu ^ 1));
+        fmine = (DWORD_PTR)1 << fcpu; fpair = fmine | core_of(fcpu);
         if (!(proc & fmine)) fmine = fpair = 0;
     }
     const DWORD_PTR rest = proc & ~pair & ~fpair;

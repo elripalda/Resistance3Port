@@ -1096,7 +1096,17 @@ extern "C" double r2_frame_period(double f1)
         int k = 0; while (k < ns && seen[k] != f1) k++;
         if (k == ns && ns < 8) { seen[ns++] = f1; fprintf(stderr, "[fps] limiter period %.5f\n", f1); }
     }
-    if (fps == 30) return f1;
+    if (fps == 30) {
+        static uint64_t t0 = 0; static unsigned n = 0;
+        const uint64_t now = ppu_timebase_now();
+        if (!t0) t0 = now;
+        n++;
+        if (now - t0 >= 5ull * 79800000ull) {
+            fprintf(stderr, "[fps] 5 s: %.1f fps (target %d)\n", n * 79800000.0 / (double)(now - t0), fps);
+            t0 = now; n = 0;
+        }
+        return f1;
+    }
 
     /* host pacing: wait until 1/fps after the previous frame */
     static uint64_t next = 0;
@@ -2640,3 +2650,9 @@ extern "C" void ps3_load_prx_modules(void)
  *   // Replace a function call with a direct return
  *   ps3::patches::force_return(0x009A1000, 0);  // return 0
  */
+
+/* R3 perf: the guest's job-wait loop (func_0082C190) spins up to ~1 ms between usleeps via
+   func_007E9C30. With spare cores that is harmless; on a 4-core CPU it holds the core the SPU
+   worker it waits on needs. Offer the core to any ready thread first (returns at once if none). */
+extern "C" int ps3_host_prio_boost(void);
+extern "C" void r3_spin_relax(void) { static const bool low = !ps3_host_prio_boost(); if (low) SwitchToThread(); }
