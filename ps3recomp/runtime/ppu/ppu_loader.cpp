@@ -3277,6 +3277,20 @@ extern "C" void lv2_syscall(ppu_context* ctx)
      * Formatting the key each time is noise next to the profiler stamp below,
      * which resolves a host return address to a guest function. */
     ps3_msf("sys:%u", (unsigned)num);
+    /* PS3_SYSCALL_TID=<tid>: log that guest thread's first 64 syscalls. */
+    { static int s_st = -2; static volatile long s_sn;
+      if (s_st == -2) { const char* e = getenv("PS3_SYSCALL_TID"); s_st = e ? atoi(e) : -1; }
+      if (s_st >= 0 && (int)ctx->thread_id == s_st && s_sn < 64) { s_sn++;
+          fprintf(stderr, "[syscall] tid=%d num=%u r3..r6=%08X %08X %08X %08X lr=%08X\n", s_st,
+                  (unsigned)num, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
+                  (uint32_t)ctx->gpr[6], (uint32_t)ctx->lr);
+          if (num == 403) {
+              { static int s_bt; if (!s_bt++) { void* bt[40]; USHORT nb = RtlCaptureStackBackTrace(0, 40, bt, NULL);
+                  uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
+                  for (USHORT i = 0; i < nb; i++) fprintf(stderr, "[syscall]   bt Resistance3+0x%llX\n",
+                      (unsigned long long)((uintptr_t)bt[i] - base)); } }
+          }
+      } }
 
     /* Which lv2 syscall each guest thread is currently INSIDE, by thread_id.
      * A thread blocked in a syscall shows no in-flight HLE (syscalls do not go

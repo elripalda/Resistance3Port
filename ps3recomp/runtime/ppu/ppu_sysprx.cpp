@@ -558,7 +558,10 @@ static void hle_net_errno_loc(ppu_context* ctx)
 static void hle_net_wouldblock(ppu_context* ctx)
 {
     if (g_net_errno_ea) vm_write32(g_net_errno_ea, SYS_NET_EWOULDBLOCK_V);
-    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)-1;
+    /* Firmware returns the error in-band (0x80010200 | errno), still negative.
+     * Resistance 3's recvmsg poll compares against 0x80010223 and logged every
+     * plain -1 as "Error receiving incoming packets" (~1500 lines/s). */
+    ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)(0x80010200u | SYS_NET_EWOULDBLOCK_V);
 }
 static void hle_net_zero(ppu_context* ctx) { ctx->gpr[3] = 0; }
 /* select/poll: nothing is ever ready offline -- but a real select BLOCKS for
