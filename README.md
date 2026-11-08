@@ -63,9 +63,9 @@ If you hit a problem, let me know how to reproduce it, and if you can, send the 
 
 ## Known Bugs
 
-- White single-pixel "sparkles" on some surfaces. This is a long-standing RPCS3 bug with Insomniac's engine ([RPCS3 #11001](https://github.com/RPCS3/rpcs3/issues/11001) / [#7076](https://github.com/RPCS3/rpcs3/issues/7076)) and happens in every graphics mode.
 - 60 fps changes the game's timing; if something (physics, a scripted sequence) looks wrong, try 30 fps in the launcher.
 - Occasional freezes or crashes are possible, especially past the opening level.
+
 ## Credits and licences
 
 - The Resistance 2 PC port, the base of this one (same runtime, launcher, DLSS bridge and fixes).
