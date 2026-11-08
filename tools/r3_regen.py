@@ -18,7 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from regen_common import run, ppu, fix_includes
 
-# Resistance 3 (BCES01118 v1.00): the Wws_Job policy module the game passes to
+# Resistance 3 (BCUS98176 v1.00): the Wws_Job policy module the game passes to
 # cellSpursAddWorkload (VA 0xEB9E00, 0x3100 bytes, runs at LS 0xA00).
 PM = dict(off=0xEA9E00, size=0x3100, base=0xA00, entry=0xA00)
 

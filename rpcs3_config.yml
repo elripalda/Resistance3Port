@@ -209,7 +209,7 @@ Video:
   Force High Precision Z buffer: false
   Frame limit: Auto
   Framebuffer Aliasing Heuristic Bias: Auto
-  Handle RSX Memory Tiling: false
+  Handle RSX Memory Tiling: true
   Log shader programs: false
   MSAA: Auto
   Minimum Scalable Dimension: 16

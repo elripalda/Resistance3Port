@@ -1,11 +1,11 @@
-# Resistance 2 - native PC port: one-time setup.
+# Resistance 3 - native PC port: one-time setup.
 #
 # 1. installs the free build tools (Visual Studio Build Tools, LLVM, CMake,
 #    Ninja, Python) with winget, if they are missing
 # 2. asks for YOUR copy of the game (a PS3 disc dump folder) and copies it
 #    into this folder (gamefiles\)
 # 3. decrypts the game's program file (EBOOT.BIN; game.self is the same file)
-#    and regenerates the port's game code from it (tools\r2_regen.py)
+#    and regenerates the port's game code from it (tools\r3_regen.py)
 # 4. builds the game (build.bat)
 #
 # Nothing from the game is downloaded: everything game-specific comes from the
@@ -23,9 +23,9 @@ New-Item -ItemType Directory -Force -Path (Join-Path $Port 'logs') | Out-Null
 try { Start-Transcript -Path (Join-Path $Port 'logs\setup.log') -Force | Out-Null } catch {}
 trap { Write-Host ""; Write-Host "SETUP STOPPED with an unexpected error: $_" -ForegroundColor Red; Write-Host "The details are in logs\setup.log."; try { Stop-Transcript | Out-Null } catch {}; Read-Host "Press Enter to close"; exit 1 }
 
-# The supported version: Resistance 2, BCES00226 (EU disc), v1.00.
-$TitleId = 'BCES00226'
-$Sha1 = @{ 'EBOOT.elf' = '90521ca0eea7673903211a48aac001c091c171af' }
+# The supported version: Resistance 3, BCUS98176 (US disc), v1.00.
+$TitleId = 'BCUS98176'
+$Sha1 = @{ 'EBOOT.elf' = '733dc453543f8db28495cf1339f6e68533ad40a8' }
 
 function Step($t) { Write-Host ""; Write-Host "== $t" -ForegroundColor Cyan }
 function Info($t) { Write-Host "   $t" }
@@ -50,9 +50,9 @@ function Winget-Install($id, $label, $extra) {
 }
 function Sha1Of($p) { (Get-FileHash -Algorithm SHA1 -LiteralPath $p).Hash.ToLower() }
 
-Write-Host "Resistance 2 - PC port setup" -ForegroundColor Yellow
+Write-Host "Resistance 3 - PC port setup" -ForegroundColor Yellow
 Write-Host "Folder: $Port"
-if ($Port -match ' ') { Info "Note: this folder's path has spaces in it. That works, but a path without spaces (like C:\Games\Resistance2Port) is safer." }
+if ($Port -match ' ') { Info "Note: this folder's path has spaces in it. That works, but a path without spaces (like C:\Games\Resistance3Port) is safer." }
 
 # ---------------------------------------------------------------- 1. tools
 Step "1/5  Build tools"
@@ -93,22 +93,22 @@ Step "2/5  Your copy of the game"
 $gf = Join-Path $Port 'gamefiles'
 $usr = Join-Path $gf 'PS3_GAME\USRDIR'
 if (-not (Test-Path (Join-Path $usr 'EBOOT.BIN'))) {
-    Info "Pick the folder of your Resistance 2 (BCES00226) disc dump -"
+    Info "Pick the folder of your Resistance 3 (BCUS98176) disc dump -"
     Info "the folder that contains PS3_GAME (and usually PS3_DISC.SFB)."
     Add-Type -AssemblyName System.Windows.Forms
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg.Description = 'Select your Resistance 2 disc dump (the folder containing PS3_GAME)'
+    $dlg.Description = 'Select your Resistance 3 disc dump (the folder containing PS3_GAME)'
     if ($dlg.ShowDialog() -ne 'OK') { Fail "No game folder picked." }
     $src = $dlg.SelectedPath
     if (-not (Test-Path (Join-Path $src 'PS3_GAME')) -and (Split-Path -Leaf $src) -eq 'PS3_GAME') { $src = Split-Path -Parent $src }
     $sfo = Join-Path $src 'PS3_GAME\PARAM.SFO'
     if (-not (Test-Path (Join-Path $src 'PS3_GAME\USRDIR\EBOOT.BIN'))) { Fail "That folder has no PS3_GAME\USRDIR\EBOOT.BIN. Pick the disc dump folder (the one containing PS3_GAME)." }
     $sfoText = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($sfo))
-    if ($sfoText -notmatch $TitleId) { Fail "This is not $TitleId (the EU disc). Only that version is supported for now." }
+    if ($sfoText -notmatch $TitleId) { Fail "This is not $TitleId (the US disc). Only that version is supported for now." }
     $sameDrive = ([IO.Path]::GetPathRoot($src) -eq [IO.Path]::GetPathRoot($Port))
     $move = $false
     if ($sameDrive) {
-        $ans = Read-Host "   Move the game folder into the port folder (instant, but RPCS3 will no longer find it there) or Copy it (keeps the original, needs ~22 GB free)? [M/C]"
+        $ans = Read-Host "   Move the game folder into the port folder (instant, but RPCS3 will no longer find it there) or Copy it (keeps the original, needs ~36 GB free)? [M/C]"
         $move = ($ans -match '^[Mm]')
     }
     if ($move) {
@@ -116,7 +116,7 @@ if (-not (Test-Path (Join-Path $usr 'EBOOT.BIN'))) {
         if (Test-Path $gf) { Remove-Item $gf -Recurse -Force }
         Move-Item -LiteralPath $src -Destination $gf
     } else {
-        Info "Copying the game files (about 22 GB, this takes a while)..."
+        Info "Copying the game files (about 36 GB, this takes a while)..."
         & robocopy $src $gf /E /NFL /NDL /NJH /NJS /NP | Out-Null
         if ($LASTEXITCODE -ge 8) { Fail "Copying the game files failed (robocopy code $LASTEXITCODE). Is there enough free space?" }
     }
@@ -144,18 +144,18 @@ if ($need) {
     if ($LASTEXITCODE -ne 0) { Fail "Decrypting EBOOT.BIN failed." }
     foreach ($n in $Sha1.Keys) {
         if ((Sha1Of (Join-Path $Port "game\$n")) -ne $Sha1[$n]) {
-            Fail "game\$n is not the expected version. The port supports the unpatched EU disc (BCES00226 v1.00); a game update or another release won't match."
+            Fail "game\$n is not the expected version. The port supports the unpatched US disc (BCUS98176 v1.00); a game update or another release won't match."
         }
     }
 }
-Info "EBOOT.elf: OK (BCES00226 v1.00)"
+Info "EBOOT.elf: OK (BCUS98176 v1.00)"
 
 # ---------------------------------------------------------------- 4. game code
 Step "4/5  Generating the game code from your copy"
-if (-not (Test-Path (Join-Path $Port 'recompiled\ppu_recomp.h')) -or -not (Test-Path (Join-Path $Port 'project\spu\pm_wwsjob\spu_recomp.c')) -or $env:R2_REGEN) {
-    & $py tools\r2_regen.py --eboot game\EBOOT.elf | Out-Host
+if (-not (Test-Path (Join-Path $Port 'recompiled\ppu_recomp.h')) -or -not (Test-Path (Join-Path $Port 'project\spu\jobmods_register.c')) -or $env:R3_REGEN) {
+    & $py tools\r3_regen.py --eboot game\EBOOT.elf | Out-Host
     if ($LASTEXITCODE -ne 0) { Fail "Generating the game code failed (see the messages above)." }
-} else { Info "Already generated (set R2_REGEN=1 to force)." }
+} else { Info "Already generated (set R3_REGEN=1 to force)." }
 
 # ---------------------------------------------------------------- 5. build
 Step "5/5  Building (the first build takes 20-60 minutes)"
@@ -202,7 +202,7 @@ if ($LASTEXITCODE -ne 0) { Fail "Could not download or patch the RPCS3 source (n
 if ($LASTEXITCODE -ne 0) { Fail "The build failed - see logs\build.log and logs\build_game.log." }
 
 $desktop = [Environment]::GetFolderPath('Desktop')
-$lnk = Join-Path $desktop 'Resistance 2.lnk'
+$lnk = Join-Path $desktop 'Resistance 3.lnk'
 if ($desktop -and -not (Test-Path -LiteralPath $lnk)) {
     $ans = Read-Host "Create a desktop shortcut to the launcher? [Y/n]"
     if ($ans -notmatch '^\s*n') {
@@ -210,8 +210,8 @@ if ($desktop -and -not (Test-Path -LiteralPath $lnk)) {
             $sc = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk)
             $sc.TargetPath = Join-Path $Port 'Launcher.exe'
             $sc.WorkingDirectory = $Port
-            $sc.IconLocation = (Join-Path $Port 'Resistance2.ico') + ',0'
-            $sc.Description = 'Resistance 2 - PC port launcher'
+            $sc.IconLocation = (Join-Path $Port 'Launcher.exe') + ',0'
+            $sc.Description = 'Resistance 3 - PC port launcher'
             $sc.Save()
             Info "Desktop shortcut created: $lnk"
         } catch { Info "Could not create the desktop shortcut ($_)." }

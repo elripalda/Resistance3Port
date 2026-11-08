@@ -454,9 +454,10 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
             if (i == 0 && g_vm_access_violation_hook && mbi.State == MEM_COMMIT &&
                 !(mbi.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE))) {
                 static volatile LONG warned = 0;
-                if (InterlockedExchange(&warned, 1) == 0)
-                    fprintf(stderr, "[vm] unclaimed protection fault at guest 0x%08X; unprotecting\n",
-                            (uint32_t)(fault - base));
+                const LONG n = InterlockedIncrement(&warned);
+                if (n <= 64 || (n & (n - 1)) == 0)
+                    fprintf(stderr, "[vm] unclaimed protection fault #%ld at guest 0x%08X (%s); unprotecting\n",
+                            n, (uint32_t)(fault - base), is_write ? "write" : "read");
                 DWORD old;
                 if (VirtualProtect((void*)(fault & ~(uintptr_t)0xFFF), 0x1000, PAGE_READWRITE, &old))
                     return EXCEPTION_CONTINUE_EXECUTION;

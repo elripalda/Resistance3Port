@@ -1,11 +1,11 @@
 # Downloads RPCS3's source at the pinned commit (plus the third-party code the
 # RSX/Vulkan build needs) and applies this port's patch
-# (ps3recomp\patches\r2-rpcs3.patch). RPCS3 is GPL-2.0; see its LICENSE.
+# (ps3recomp\patches\r3-rpcs3.patch). RPCS3 is GPL-2.0; see its LICENSE.
 param([string]$Dest = (Join-Path $PSScriptRoot '..\ps3recomp\third_party\rpcs3'))
 $ErrorActionPreference = 'Stop'
 
 $Commit = 'eee3f0f7c285f2b8aa18fec278a2146c5cd874eb'
-$Patch  = (Resolve-Path (Join-Path $PSScriptRoot '..\ps3recomp\patches\r2-rpcs3.patch')).Path
+$Patch  = (Resolve-Path (Join-Path $PSScriptRoot '..\ps3recomp\patches\r3-rpcs3.patch')).Path
 $Submodules = '3rdparty/asmjit/asmjit', '3rdparty/glslang/glslang', '3rdparty/GPUOpen/VulkanMemoryAllocator',
               '3rdparty/stblib/stb', '3rdparty/yaml-cpp/yaml-cpp'
 

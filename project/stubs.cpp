@@ -1085,13 +1085,11 @@ extern "C" double r2_frame_period(double f1)
         fps = e ? atoi(e) : 30;
         if (fps < 30) fps = 30;
         if (fps > 240) fps = 240;
-        if (fps != 30) {
-            const float c = 0.0001f; uint32_t w; memcpy(&w, &c, 4);
-            if (vm_read32(0x00D529D8u) == 0x3D088889u) vm_write32(0x00D529D8u, w);
-            { const uint32_t o = vm_read32(0x00D69EB8u); float f; memcpy(&f, &o, 4);
-              if (f > 0.013f && f < 0.0135f) vm_write32(0x00D69EB8u, w); }
-        }
-        fprintf(stderr, "[fps] target %d (floors %08x %08x)\n", fps, vm_read32(0x00D529D8u), vm_read32(0x00D69EB8u));
+        /* R3 (BCUS98176 v1.00): the 0.001 s floor at 0xF02AD4 -> 0.0001, as
+         * RPCS3's "Unlock FPS" patch (Whatcookie, boma) does; its other two
+         * edits are r3_dt_floor and this function replacing the wait. */
+        if (fps != 30 && vm_read32(0x00F02AD4u) == 0x3A83126Fu) vm_write32(0x00F02AD4u, 0x38D1B717u);
+        fprintf(stderr, "[fps] target %d (floor %08x)\n", fps, vm_read32(0x00F02AD4u));
     }
     if (r2_diag()) {
         static double seen[8]; static int ns;
@@ -1127,6 +1125,30 @@ extern "C" double r2_frame_period(double f1)
     return 0.0001;   /* the game's own wait then never holds the frame */
 }
 
+/* R3: the game clock (func_007EEA44) clamps each step to [obj+4, obj+8];
+ * obj+4 is 1/75 s, which slows the game down above 75 fps. Above 30 fps the
+ * floor is the host frame time's lower bound instead. */
+extern "C" double r3_dt_floor(uint32_t bits)
+{
+    float v; memcpy(&v, &bits, 4);
+    static int fps = -1;
+    if (fps < 0) { const char* e = getenv("R2_FPS"); fps = e ? atoi(e) : 30; }
+    if (fps <= 30 || !(v > 0.0f)) return (double)v;
+    const float m = 0.5f / (float)(fps > 240 ? 240 : fps);
+    return (double)(m < v ? m : v);
+}
+/* ...and obj+8 is the ceiling. Cinematics set floor = ceiling (1/30 or 1/75:
+ * a fixed step per frame), which at 60 fps plays them 2x / 0.8x speed. Above
+ * 30 fps the ceiling is at least two host frames, so real time is used. */
+extern "C" double r3_dt_ceil(uint32_t bits)
+{
+    float v; memcpy(&v, &bits, 4);
+    static int fps = -1;
+    if (fps < 0) { const char* e = getenv("R2_FPS"); fps = e ? atoi(e) : 30; }
+    if (fps <= 30 || !(v > 0.0f)) return (double)v;
+    const float m = 2.0f / (float)(fps > 240 ? 240 : fps);
+    return (double)(m > v ? m : v);
+}
 /* the hero's controller is controller 0 (pad port 0 = keyboard & mouse)? */
 static int r2ml_is_pad0(uint32_t slot)
 {
@@ -1182,6 +1204,127 @@ extern "C" void r2_mouselook(ppu_context* ctx, uint32_t hero)
         if (n++ < 30) fprintf(stderr, "[mouselook] hero 0x%08X dx %ld dy %ld -> yaw %+.4f pitch %+.4f (pitch %.3f, limits %.3f..%.3f, zoom %.2f)%c",
                                       hero, dx, dy, ctx->fpr[1], ctx->fpr[29], ctx->fpr[22], (double)ml_rdf(hero + 0x484),
                               (double)ml_rdf(hero + 0x488), (double)s_r2ml_zoom, 10); }
+}
+/* R3 direct mouse look. The hero update func_0017BCE8 turns the right stick
+ * into turn rates at hero+0x52C / hero+0x530 (func_0017A458: sensitivity,
+ * zoom and acceleration applied), then at 0x0017C670 integrates them with the
+ * frame time (func_007EEC70) into this frame's deltas: f31 (hero+0x52C axis,
+ * then wrapped into f17) and f30 (hero+0x530 axis, then clamped).
+ *  r3_mouselook_pre (0x0017C670): learns which rate is yaw and the directions
+ *    from the stick the mouse emulation fed, then zeroes the rates.
+ *  r3_mouselook (after 0x0017C69C): adds the mouse counts since the last frame
+ *    to the two deltas (radians), scaled by the zoom the game applied.
+ * Outside this code (vehicles, turrets, menus) the mouse still drives the
+ * emulated right stick (cellPad.c). */
+extern "C" volatile unsigned long long g_dbg_ml_until;   /* debug console "mouse": mouse counts injected */
+volatile unsigned long long g_dbg_ml_until = 0;
+static int s_r3ml_sx = 0, s_r3ml_sy = 0, s_r3ml_swap = 0, s_r3ml_bad_x = 0, s_r3ml_bad_y = 0, s_r3ml_bad_s = 0, s_r3ml_saved = 0;
+static uint32_t s_r3ml_hero = 0;
+static float s_r3ml_zoom = 1.0f, s_r3ml_m = 0.0f, s_r3ml_m1 = 0.0f;
+static ULONGLONG s_r3ml_last = 0, s_r3ml_lock_until = 0;
+static int s_r3ml_lock_n = 0;
+static int r3ml_dbg(void) { return g_dbg_ml_until && GetTickCount64() < g_dbg_ml_until; }
+static void r3ml_save(void)
+{
+    FILE* f = fopen("mouselook_r3.cfg", "w");
+    if (f) { fprintf(f, "yaw_sign = %d\npitch_sign = %d\naxes_swapped = %d\n", s_r3ml_sx, s_r3ml_sy, s_r3ml_swap); fclose(f); }
+    s_r3ml_saved = 1;
+}
+static void r3ml_load(void)
+{
+    if (s_r3ml_sx) return;
+    s_r3ml_sx = -1; s_r3ml_sy = -1; s_r3ml_swap = 1;   /* measured: hero+0x530 = yaw, +0x52C = pitch */
+    FILE* f = fopen("mouselook_r3.cfg", "r");
+    if (f) { char l[128]; int v;
+        while (fgets(l, sizeof l, f)) {
+            if (sscanf(l, " yaw_sign = %d", &v) == 1 && (v == 1 || v == -1)) s_r3ml_sx = v;
+            if (sscanf(l, " pitch_sign = %d", &v) == 1 && (v == 1 || v == -1)) s_r3ml_sy = v;
+            if (sscanf(l, " axes_swapped = %d", &v) == 1 && (v == 0 || v == 1)) s_r3ml_swap = v;
+        }
+        fclose(f); s_r3ml_saved = 1; }
+    fprintf(stderr, "[mouselook] R3 direct mouse look: yaw %d, pitch %d, swapped %d%c", s_r3ml_sx, s_r3ml_sy, s_r3ml_swap, 10);
+}
+static void r3ml_check(int fed, float rate, int* sign, int* bad, const char* what)
+{
+    if (!(fed >= 16 || fed <= -16) || !(rate > 1e-5f || rate < -1e-5f)) return;
+    const int s = ((fed > 0) == (rate > 0)) ? 1 : -1;
+    if (s == *sign) { *bad = 0; return; }
+    if (++*bad >= (s_r3ml_saved ? 15 : 4)) {
+        *sign = s; *bad = 0; r3ml_save();
+        fprintf(stderr, "[mouselook] %s direction now %d (following the game's setting)%c", what, s, 10);
+    }
+}
+extern "C" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp)
+{
+    (void)ctx;
+    s_r3ml_hero = 0;
+    if (!g_ml_mode || !hero) return;
+    r3ml_load();
+    const int dbg = r3ml_dbg();
+    if (!dbg && !ml_stick_is_mouse()) return;   /* controller / look keys: the stick turns the view as on PS3 */
+    const float ra = ml_rdf(hero + 0x52C), rb = ml_rdf(hero + 0x530);
+    const int fx = g_ml_fed_rx, fy = g_ml_fed_ry;
+    const int ax = fx >= 0 ? fx : -fx, ay = fy >= 0 ? fy : -fy;
+    /* which rate follows the horizontal stick? (one axis clearly deflected) */
+    if (ax >= 40 && ay < 8) {
+        const int a_on = ra > 1e-5f || ra < -1e-5f, b_on = rb > 1e-5f || rb < -1e-5f;
+        if (a_on != b_on) {
+            const int sw = b_on;
+            if (sw == s_r3ml_swap) s_r3ml_bad_s = 0;
+            else if (++s_r3ml_bad_s >= 4) { s_r3ml_swap = sw; s_r3ml_bad_s = 0; r3ml_save();
+                fprintf(stderr, "[mouselook] yaw is hero+0x%X%c", sw ? 0x530 : 0x52C, 10); }
+        }
+    }
+    const float ry = s_r3ml_swap ? rb : ra, rp = s_r3ml_swap ? ra : rb;
+    if (ay < 8) r3ml_check(fx, ry, &s_r3ml_sx, &s_r3ml_bad_x, "yaw");
+    if (ax < 8) r3ml_check(fy, rp, &s_r3ml_sy, &s_r3ml_bad_y, "pitch");
+    if (dbg) { static int n = 0; static unsigned long long seen = 0;
+        if (seen != g_dbg_ml_until) { seen = g_dbg_ml_until; n = 0; }
+        if (n++ < 40) fprintf(stderr, "[mouselook] pre hero 0x%08X 52C %+.4f 530 %+.4f fed %d,%d AD0 %.3f 9F8 %.3f sp228 %.3f sp22C %.3f%c",
+                              hero, (double)ra, (double)rb, fx, fy, (double)ml_rdf(hero + 0xAD0), (double)ml_rdf(hero + 0x9F8),
+                              (double)ml_rdf(sp + 0x228), (double)ml_rdf(sp + 0x22C), 10); }
+    /* the game's aim multipliers (func_0017A458 -> sp+0x228 / sp+0x22C: the
+     * weapon's zoom sensitivity blended by the zoom amount); the largest
+     * value seen is unzoomed */
+    { const float m = ml_rdf(sp + 0x228);
+      if (m > 0.0f && m <= 10.0f) { if (m > s_r3ml_m1) s_r3ml_m1 = m;
+                                    s_r3ml_m = m; }
+      else s_r3ml_m = 0.0f; }
+    /* input locked (scripted sequence): a clearly deflected fed stick gives no rate */
+    { const int big = ax >= 40 || ay >= 40;
+      if (big && ra == 0.0f && rb == 0.0f) { if (++s_r3ml_lock_n >= 3) s_r3ml_lock_until = GetTickCount64() + 300; }
+      else if (big) s_r3ml_lock_n = 0; }
+    ml_wrf(hero + 0x52C, 0.0f);
+    ml_wrf(hero + 0x530, 0.0f);
+    s_r3ml_hero = hero;
+}
+extern "C" void r3_mouselook(ppu_context* ctx, uint32_t hero)
+{
+    if (!g_ml_mode || !hero) return;
+    const ULONGLONG now = GetTickCount64();
+    const int mine = hero == s_r3ml_hero; s_r3ml_hero = 0;
+    if (!mine) return;
+    long dx = InterlockedExchange(&g_kbm_ml_dx, 0), dy = InterlockedExchange(&g_kbm_ml_dy, 0);
+    if (now - s_r3ml_last > 150 || !g_kbm_capture || now < s_r3ml_lock_until) dx = dy = 0;
+    s_r3ml_last = now;
+    if (!dx && !dy) return;
+    /* zoom: this frame's aim multiplier against the unzoomed one */
+    s_r3ml_zoom = 1.0f;
+    if (s_r3ml_m > 0.0f && s_r3ml_m1 > 0.0f && s_r3ml_m < s_r3ml_m1) {
+      static double zs = -1.0; if (zs < 0.0) { const char* e = getenv("R2_ZOOM_SENS"); zs = e ? atof(e) : 1.0;
+                                               if (zs < 0.0) zs = 0.0; if (zs > 2.0) zs = 2.0; }
+      const double z = (double)s_r3ml_m / (double)s_r3ml_m1;
+      if (z > 0.01) s_r3ml_zoom = (float)pow(z, zs); }
+    const double k = g_ml_deg_per_count * (double)s_r3ml_zoom * (3.14159265358979323846 / 180.0);
+    if (g_ml_invert_y) dy = -dy;
+    const double yaw = (double)s_r3ml_sx * (double)dx * k, pitch = (double)s_r3ml_sy * (double)dy * k;
+    if (!s_r3ml_swap) { ctx->fpr[31] = (double)(float)(ctx->fpr[31] + yaw);   ctx->fpr[30] = (double)(float)(ctx->fpr[30] + pitch); }
+    else              { ctx->fpr[31] = (double)(float)(ctx->fpr[31] + pitch); ctx->fpr[30] = (double)(float)(ctx->fpr[30] + yaw); }
+    if (r2_diag() || r3ml_dbg()) { static int n = 0; static unsigned long long seen = 0;
+        if (seen != g_dbg_ml_until) { seen = g_dbg_ml_until; n = 0; }
+        if (n++ < 60) fprintf(stderr, "[mouselook] hero 0x%08X dx %ld dy %ld -> f31 %+.4f f30 %+.4f (zoom %.2f, m %.3f / %.3f)%c",
+                              hero, dx, dy, ctx->fpr[31], ctx->fpr[30], (double)s_r3ml_zoom,
+                              (double)s_r3ml_m, (double)s_r3ml_m1, 10); }
 }
 /* Resistance port (v152): on-screen button prompts for keyboard & mouse.
  * The game's text ("Press <glyph> to jump") marks buttons with private-use
@@ -1509,14 +1652,17 @@ static const R2Glyph s_r2_glyphs[] = {
     { 0xE00A, 0, 0, "Mov", "WASD" }, { 0xE00B, "R1", "" }, { 0xE00C, "R2", "" }, { 0xE00D, "R3", "" },
     { 0xE00E, 0, 0, "Mse", "Mouse" },
     { 0xE00F, "DPAD_UP", "" }, { 0xE010, "DPAD_DOWN", "" }, { 0xE011, "DPAD_LEFT", "" }, { 0xE012, "DPAD_RIGHT", "" },
-    /* actions (the default layout's button) */
-    { 0xE101, "INTERACT", "" }, { 0xE102, "R1", "fire" }, { 0xE103, "R2", "alternate" },
-    { 0xE104, "TRIANGLE", "switch weapon" }, { 0xE105, "CIRCLE", "grenade" }, { 0xE106, "CROSS", "jump" },
-    { 0xE107, "L1", "aim" }, { 0xE108, "L2", "crouch" }, { 0xE109, "SQUARE", "reload" },
-    { 0xE10A, "DPAD_RIGHT", "flashlight" }, { 0xE10B, "DPAD_UP", "grenade" }, { 0xE10C, "DPAD_DOWN", "" },
-    { 0xE10D, "DPAD_RIGHT", "" }, { 0xE10E, "CROSS", "confirm" }, { 0xE10F, "CIRCLE", "back" },
-    { 0xE111, "DPAD_LEFT", "map" }, { 0xE114, "L2", "sprint" }, { 0xE115, "R3", "melee" },
-    { 0xE116, "DPAD_DOWN", "" },
+    /* actions (Resistance 3's default layout; the core_text_tags strings use
+     * E101 hold-to-use, E102 fire, E103 secondary, E104 weapon select, E105
+     * grenade, E106 jump, E107 zoom, E108 crouch, E109 reload, E10B/E10C
+     * grenade type, E114 sprint, E115 melee). E10A, E10D, E110..E113, E116
+     * only appear alone (legends) and keep the PS3 icon. */
+    { 0xE101, "INTERACT", "" }, { 0xE102, "R1", "fire" }, { 0xE103, "R2", "secondary" },
+    { 0xE104, "TRIANGLE", "switch weapon" }, { 0xE105, "L2", "grenade" }, { 0xE106, "CROSS", "jump" },
+    { 0xE107, "L1", "aim" }, { 0xE108, "CIRCLE", "crouch" }, { 0xE109, "SQUARE", "reload" },
+    { 0xE10B, "DPAD_LEFT", "grenade" }, { 0xE10C, "DPAD_RIGHT", "grenade" },
+    { 0xE10E, "CROSS", "confirm" }, { 0xE10F, "CIRCLE", "back" },
+    { 0xE114, "L3", "sprint" }, { 0xE115, "R3", "melee" },
 };
 static char s_r2_rep3[128][4], s_r2_repf[128][24]; static int s_r2_have[128];
 static int r2_glyph_at(const uint8_t* q)          /* slot of a mapped glyph at q, or -1 */
@@ -1605,8 +1751,8 @@ extern "C" void r2_text_patch(uint32_t file_obj)
             if (g.fixed) { memcpy(s_r2_rep3[i], g.fixed, 4); snprintf(s_r2_repf[i], 24, "%s", g.full); s_r2_have[i] = 1; }
             else {
                 s_r2_have[i] = r2_key_for(g.pad, g.hint, s_r2_rep3[i], s_r2_repf[i]);
-                if (!s_r2_have[i] && !strcmp(g.pad, "INTERACT"))      /* no use key: the Triangle key */
-                    s_r2_have[i] = r2_key_for("TRIANGLE", "", s_r2_rep3[i], s_r2_repf[i]);
+                if (!s_r2_have[i] && !strcmp(g.pad, "INTERACT"))      /* no use key: the Square key */
+                    s_r2_have[i] = r2_key_for("SQUARE", "", s_r2_rep3[i], s_r2_repf[i]);
             } }
         g_r2_input_mode_cb = r2_input_mode;
     }

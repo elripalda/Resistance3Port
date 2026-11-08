@@ -36,7 +36,7 @@ logs_build_*.txt
 /tools/shader_audit/*.exe
 /tools/shader_audit/*.txt
 
-# RPCS3 source: downloaded and patched by tools\fetch_rpcs3.ps1 (ps3recomp\patches\r2-rpcs3.patch)
+# RPCS3 source: downloaded and patched by tools\fetch_rpcs3.ps1 (ps3recomp\patches\r3-rpcs3.patch)
 /ps3recomp/third_party/rpcs3/
 /build_rpcs3/
 # PS3 firmware modules and local dev work: never committed

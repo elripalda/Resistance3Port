@@ -1,4 +1,4 @@
-// Resistance 2 -- PC port launcher.
+// Resistance 3 -- PC port launcher.
 //
 // One window: a sidebar (Display / Graphics / Controls / About + Play) and a
 // page of settings drawn by hand with GDI+ (no stock controls, so it looks the
@@ -158,10 +158,10 @@ static bool save_settings()
 // ===========================================================================
 // Keyboard & mouse controls (controls.txt, read by libs/input/cellPad.c)
 // ===========================================================================
-// Resistance 2's default PS3 layout (game func_002AC9EC): L1 aim, R1 fire, R2 alt fire,
-// L2 crouch (tap) / sprint (hold), R3 melee, Cross jump, Circle grenade, Square reload /
-// pick up, Triangle use / switch weapon, d-pad grenade type / flashlight / map / co-op.
-// Several rows may press the same button (Crouch and Sprint are both L2); controls.txt
+// Resistance 3's default PS3 layout: L1 aim, R1 fire, R2 secondary fire, L2 grenade,
+// L3 sprint, R3 melee, Cross jump, Circle crouch, Square reload / use (hold),
+// Triangle switch weapon (hold for the weapon wheel), d-pad left/right grenade type,
+// d-pad up/down scope zoom. Several rows may press the same button; controls.txt
 // keeps which row a key belongs to in its comment.
 struct Act { const char* name; const char* pad; const char* group; const char* help; bool hidden; };
 static const Act g_acts[] = {
@@ -170,31 +170,28 @@ static const Act g_acts[] = {
     { "Move left",           "LS_LEFT",    "Movement", "", false },
     { "Move right",          "LS_RIGHT",   "Movement", "", false },
     { "Jump",                "CROSS",      "Movement", "", false },
-    { "Crouch",              "L2",         "Movement", "Tap to crouch or stand up. Same PS3 button as Sprint (L2): "
-                                                        "a tap crouches, holding sprints.", false },
-    { "Sprint",              "L2",         "Movement", "Hold while moving. Same PS3 button as Crouch (L2): "
-                                                        "a tap crouches, holding sprints.", false },
+    { "Crouch",              "CIRCLE",     "Movement", "Tap to crouch or stand up.", false },
+    { "Sprint",              "L3",         "Movement", "Press while moving (the left stick click).", false },
     { "Fire",                "R1",         "Combat", "", false },
     { "Aim / zoom",          "L1",         "Combat", "Aims down the sights or through the scope.", false },
-    { "Alternate fire",      "R2",         "Combat", "Each weapon's secondary mode (Bullseye tag, Magnum detonate, "
+    { "Secondary fire",      "R2",         "Combat", "Each weapon's secondary mode (Bullseye tag, Magnum detonate, "
                                                       "Auger shield...).", false },
-    { "Reload / pick up weapon", "SQUARE", "Combat", "Tap to reload. Hold near a dropped weapon to pick it up.", false },
+    { "Reload",              "SQUARE",     "Combat", "Same PS3 button as Use (Square): a tap reloads.", false },
     { "Melee",               "R3",         "Combat", "", false },
-    { "Switch weapon",       "TRIANGLE",   "Combat",     "Tap to switch weapon, hold for the weapon wheel. Same PS3 button "
-                                                      "as Use (Triangle).", false },
-    { "Next weapon (wheel)", "TRIANGLE",   "Combat", "Each notch of the mouse wheel switches weapon (a tap of Triangle).", false },
-    { "Throw grenade",       "CIRCLE",     "Combat", "", false },
-    { "Switch grenade type", "DPAD_UP",    "Combat", "Also zooms a sniper scope in.", false },
-    { "Use / interact",      "INTERACT",   "Actions", "Doors, switches, vehicles, reviving a team-mate. The game's Triangle "
-                                                       "button: with nothing to use it switches weapon.", false },
-    { "Flashlight",          "DPAD_RIGHT", "Actions", "", false },
-    { "Map",                 "DPAD_LEFT",  "Actions", "", false },
-    { "Co-op: Grappler / Berserk", "DPAD_DOWN", "Actions", "Co-op abilities. Also zooms a sniper scope out.", false },
-    { "Left stick click (L3)", "L3",       "Actions", "", false },
+    { "Switch weapon",       "TRIANGLE",   "Combat", "Tap to swap to the previous weapon, hold for the weapon wheel.", false },
+    { "Next weapon (wheel)", "TRIANGLE",   "Combat", "Each notch of the mouse wheel swaps weapon (a tap of Triangle).", false },
+    { "Throw grenade",       "L2",         "Combat", "", false },
+    { "Previous grenade type", "DPAD_LEFT", "Combat", "", false },
+    { "Next grenade type",   "DPAD_RIGHT", "Combat", "", false },
+    { "Use / interact",      "INTERACT",   "Actions", "Doors, switches, ammo boxes, reviving a team-mate (hold). The game's "
+                                                       "Square button: a tap also reloads.", false },
+    { "D-pad up (scope zoom in)", "DPAD_UP", "Actions", "Changes the Deadeye scope's magnification.", false },
+    { "D-pad down (scope zoom out / co-op partner)", "DPAD_DOWN", "Actions", "Scope magnification; calls your "
+                                                       "partner in co-op.", false },
     { "Pause menu",          "START",      "Menus", "", false },
     { "Scoreboard / objectives", "SELECT", "Menus", "", false },
     { "Menu confirm",        "CROSS",      "Menus", "The Cross button: selects in menus (Jump does the same).", false },
-    { "Menu back",           "CIRCLE",     "Menus", "The Circle button: goes back in menus (Throw grenade does the same).", false },
+    { "Menu back",           "CIRCLE",     "Menus", "The Circle button: goes back in menus (Crouch does the same).", false },
     { "Look up",             "RS_UP",      "Look with keys", "Optional: turn the camera with keys as well as the mouse.", false },
     { "Look down",           "RS_DOWN",    "Look with keys", "Optional: turn the camera with keys as well as the mouse.", false },
     { "Look left",           "RS_LEFT",    "Look with keys", "Optional: turn the camera with keys as well as the mouse.", false },
@@ -208,7 +205,7 @@ static double g_msens = 1.0; static int g_minv = 0, g_mdirect = 1;
 static std::string g_mrelease = "F8";
 static double g_mdeg = 0.05, g_mdz = 0.28, g_msmooth = 0.03;
 static const char* g_padint_opts[][2] = {
-    {"NONE","Same as Melee  (as on PS3)"},{"SQUARE","Square"},{"CIRCLE","Circle"},{"CROSS","Cross"},
+    {"NONE","Same as Reload  (as on PS3)"},{"SQUARE","Square"},{"CIRCLE","Circle"},{"CROSS","Cross"},
     {"TRIANGLE","Triangle"},{"L1","L1"},{"R1","R1"},{"L2","L2"},{"R2","R2"},{"L3","L3  (left stick click)"},
     {"R3","R3  (right stick click)"},{"DPAD_UP","D-pad up"},{"DPAD_DOWN","D-pad down"},{"DPAD_LEFT","D-pad left"},
     {"DPAD_RIGHT","D-pad right"},
@@ -220,12 +217,11 @@ static int g_padint = 0;
 static const char* g_default_binds[][2] = {
     {"W","Move forward"},{"S","Move back"},{"A","Move left"},{"D","Move right"},
     {"SPACE","Jump"},{"C","Crouch"},{"CTRL","Crouch"},{"SHIFT","Sprint"},
-    {"MOUSE1","Fire"},{"MOUSE2","Aim / zoom"},{"MOUSE3","Alternate fire"},{"F","Alternate fire"},
-    {"R","Reload / pick up weapon"},{"V","Melee"},{"MOUSE4","Melee"},
+    {"MOUSE1","Fire"},{"MOUSE2","Aim / zoom"},{"MOUSE3","Secondary fire"},{"F","Secondary fire"},
+    {"R","Reload"},{"V","Melee"},{"MOUSE4","Melee"},
     {"Q","Switch weapon"},{"WHEELUP","Next weapon (wheel)"},{"WHEELDOWN","Next weapon (wheel)"},
-    {"G","Throw grenade"},{"MOUSE5","Throw grenade"},{"1","Switch grenade type"},
-    {"E","Use / interact"},{"T","Flashlight"},{"M","Map"},{"B","Co-op: Grappler / Berserk"},
-    {"Z","Left stick click (L3)"},
+    {"G","Throw grenade"},{"MOUSE5","Throw grenade"},{"1","Previous grenade type"},{"2","Next grenade type"},
+    {"E","Use / interact"},{"T","D-pad up (scope zoom in)"},{"B","D-pad down (scope zoom out / co-op partner)"},
     {"ESC","Pause menu"},{"TAB","Scoreboard / objectives"},{"ENTER","Pause menu"},{"BACKSPACE","Menu back"},
     {"UP","Look up"},{"DOWN","Look down"},{"LEFT","Look left"},{"RIGHT","Look right"},
 };
@@ -312,7 +308,7 @@ static bool ctl_save()
     ctl_compact();
     FILE* f = fopen(path_of("controls.txt").c_str(), "w");
     if (!f) return false;
-    fprintf(f, "# Resistance 2 PC port -- keyboard & mouse controls.\n"
+    fprintf(f, "# Resistance 3 PC port -- keyboard & mouse controls.\n"
                "# Edit these in Launcher.exe -> Controls, or by hand: KEY = ACTION, one per line.\n"
                "# KEYS:    A-Z 0-9 F1-F12 SPACE SHIFT CTRL ALT TAB ENTER ESC BACKSPACE UP DOWN LEFT RIGHT\n"
                "#          CAPSLOCK INSERT DELETE HOME END PGUP PGDN NUM0-NUM9\n"
@@ -321,7 +317,7 @@ static bool ctl_save()
                "# ACTIONS: LS_UP LS_DOWN LS_LEFT LS_RIGHT (move)  RS_UP RS_DOWN RS_LEFT RS_RIGHT (look)\n"
                "#          CROSS CIRCLE SQUARE TRIANGLE L1 R1 L2 R2 L3 R3 START SELECT\n"
                "#          DPAD_UP DPAD_DOWN DPAD_LEFT DPAD_RIGHT\n"
-               "#          INTERACT (presses Triangle; on-screen prompts to use something show this key)\n"
+               "#          INTERACT (presses Square; on-screen prompts to use something show this key)\n"
                "# A key may be listed more than once to press several things. The comment after a\n"
                "# binding is the launcher row it belongs to (and picks the key shown in prompts).\n\n");
     for (int a = 0; a < NACT; a++)
@@ -681,7 +677,7 @@ static void layout()
         y += SF(38);
     } else {
         deco(D_H1, RectF(x, y, w, SF(34)), "About"); y += SF(44);
-        deco(D_ABOUT_TITLE, RectF(x, y, w, SF(24)), "Resistance 2 \xE2\x80\x94 native PC port"); y += SF(30);
+        deco(D_ABOUT_TITLE, RectF(x, y, w, SF(24)), "Resistance 3 \xE2\x80\x94 native PC port"); y += SF(30);
         deco(D_ABOUT_TEXT, RectF(x, y, w, SF(48)),
              "A static recompilation of the PS3 game: its code was translated to run natively on Windows, with a "
              "Vulkan renderer (RPCS3's RSX core) and keyboard & mouse controls.");
@@ -1247,7 +1243,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int show)
     AdjustWindowRect(&r, style, FALSE);
     int ww = r.right - r.left, wh = r.bottom - r.top;
     ww = std::min(ww, (int)(wa.right - wa.left)); wh = std::min(wh, (int)(wa.bottom - wa.top));
-    g_hw = CreateWindowExA(0, wc.lpszClassName, "Resistance 2", style,
+    g_hw = CreateWindowExA(0, wc.lpszClassName, "Resistance 3", style,
                            wa.left + (wa.right - wa.left - ww) / 2, wa.top + (wa.bottom - wa.top - wh) / 2,
                            ww, wh, NULL, NULL, inst, NULL);
     make_scale(g_hw);

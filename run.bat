@@ -13,7 +13,7 @@ set "SKIP_INTRO=1"
 rem your copy of the game (Setup.bat put it here)
 set "PS3_VFS_ROOT=%~dp0gamefiles"
 rem Launcher.exe writes settings.bat (display mode, frame limit, vsync, filtering, keys)
-if exist settings.bat call settings.bat
+if exist "%~dp0settings.bat" call "%~dp0settings.bat"
 rem crash dumps are opt-in: set R2_DUMPS=1 to have Windows write minidumps to logs\dumps (newest 3 kept)
 set "R2_WER=HKCU\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\Resistance3.exe"
 if "%R2_DUMPS%"=="1" (

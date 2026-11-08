@@ -1,5 +1,172 @@
 {
- "funcs": {},
+ "funcs": {
+  "func_00736BAC": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_00736BAC(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" double r2_frame_period(double f1);   /* R3: frame-rate target (stubs.cpp) */",
+     "void func_00736BAC(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 19,
+    "ctx": "        vm_write64_stk(R_1 + 0x80, R_31);",
+    "rm": [
+     "        ctx->fpr[31] = ctx->fpr[1];"
+    ],
+    "add": [
+     "        ctx->fpr[1] = r2_frame_period(ctx->fpr[1]);",
+     "        ctx->fpr[31] = ctx->fpr[1];"
+    ]
+   }
+  ],
+  "func_00736BB0": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_00736BB0(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" double r2_frame_period(double f1);",
+     "void func_00736BB0(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 18,
+    "ctx": "        vm_write64_stk(R_1 + 0x80, R_31);",
+    "rm": [
+     "        ctx->fpr[31] = ctx->fpr[1];"
+    ],
+    "add": [
+     "        ctx->fpr[1] = r2_frame_period(ctx->fpr[1]);",
+     "        ctx->fpr[31] = ctx->fpr[1];"
+    ]
+   }
+  ],
+  "func_0017BCE8": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_0017BCE8(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp);   /* R3: direct mouse look (stubs.cpp) */",
+     "extern \"C\" void r3_mouselook(ppu_context* ctx, uint32_t hero);",
+     "void func_0017BCE8(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 663,
+    "ctx": "loc_0017C670:",
+    "rm": [
+     "        ctx->gpr[3] = R_3 = (int64_t)(int32_t)(0);"
+    ],
+    "add": [
+     "        r3_mouselook_pre(ctx, (uint32_t)R_31, (uint32_t)R_1);   /* R3: direct mouse look replaces the stick rates */",
+     "        ctx->gpr[3] = R_3 = (int64_t)(int32_t)(0);"
+    ]
+   },
+   {
+    "at": 674,
+    "ctx": "        ctx->lr = R_lr = 0x0017C69C; func_007EEC70(ctx); DRAIN_TRAMPOLINE(ctx); _RCX_RL;",
+    "rm": [
+     "        ctx->fpr[31] = ppu_fp_single(ppu_fadd(ctx->fpr[1], ctx->fpr[31]));"
+    ],
+    "add": [
+     "        ctx->fpr[31] = ppu_fp_single(ppu_fadd(ctx->fpr[1], ctx->fpr[31]));",
+     "        r3_mouselook(ctx, (uint32_t)R_31);   /* R3: mouse counts -> yaw / pitch deltas (stubs.cpp) */"
+    ]
+   }
+  ],
+  "func_007EEA44": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_007EEA44(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" double r3_dt_floor(uint32_t bits);   /* R3: game-clock minimum step (stubs.cpp) */",
+     "extern \"C\" double r3_dt_ceil(uint32_t bits);",
+     "void func_007EEA44(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 45,
+    "ctx": "        ctx->gpr[3] = R_3 = (int64_t)(int32_t)((uint32_t)0x7F << 16);",
+    "rm": [
+     "        { uint32_t tmp = vm_read32(R_31 + 0x8); float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[1] = ftmp; }"
+    ],
+    "add": [
+     "        { uint32_t tmp = vm_read32(R_31 + 0x8); ctx->fpr[1] = r3_dt_ceil(tmp); }   /* R3: clock ceiling >= 2 frames above 30 fps */"
+    ]
+   },
+   {
+    "at": 53,
+    "ctx": "        ctx->fpr[4] = ppu_fmul(ctx->fpr[1], ctx->fpr[2]);",
+    "rm": [
+     "        { uint32_t tmp = vm_read32(R_31 + 0x4); float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[1] = ftmp; }"
+    ],
+    "add": [
+     "        ctx->fpr[1] = r3_dt_floor(vm_read32(R_31 + 0x4));   /* RPCS3 R3 Unlock FPS patch @0x7EEAC8 */"
+    ]
+   }
+  ],
+  "func_007EEA50": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_007EEA50(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" double r3_dt_floor(uint32_t bits);",
+     "extern \"C\" double r3_dt_ceil(uint32_t bits);",
+     "void func_007EEA50(ppu_context* ctx) {"
+    ]
+   },
+   {
+    "at": 41,
+    "ctx": "        ctx->gpr[3] = R_3 = (int64_t)(int32_t)((uint32_t)0x7F << 16);",
+    "rm": [
+     "        { uint32_t tmp = vm_read32(R_31 + 0x8); float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[1] = ftmp; }"
+    ],
+    "add": [
+     "        { uint32_t tmp = vm_read32(R_31 + 0x8); ctx->fpr[1] = r3_dt_ceil(tmp); }   /* R3: clock ceiling >= 2 frames above 30 fps */"
+    ]
+   },
+   {
+    "at": 50,
+    "ctx": "        ctx->fpr[4] = ppu_fmul(ctx->fpr[1], ctx->fpr[2]);",
+    "rm": [
+     "        { uint32_t tmp = vm_read32(R_31 + 0x4); float ftmp; memcpy(&ftmp, &tmp, 4); ctx->fpr[1] = ftmp; }"
+    ],
+    "add": [
+     "        ctx->fpr[1] = r3_dt_floor(vm_read32(R_31 + 0x4));   /* RPCS3 R3 Unlock FPS patch @0x7EEAC8 (main entry) */"
+    ]
+   }
+  ],
+  "func_007B6208": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_007B6208(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r2_text_patch(uint32_t file_obj);   /* R3: button glyphs -> key names (stubs.cpp) */",
+     "void func_007B6208(ppu_context* ctx) {",
+     "        r2_text_patch((uint32_t)ctx->gpr[3]);"
+    ]
+   }
+  ]
+ },
  "preamble": [],
  "header": [
   {

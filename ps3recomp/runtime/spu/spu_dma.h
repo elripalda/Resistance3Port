@@ -216,6 +216,9 @@ void spu_phys_trace_dump(const char* path);
 extern int g_spu_jobtrace_id;
 void spu_jobtrace(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd, int unused);
 int spu_ls_window_transfer(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd);
+extern volatile uint32_t g_dmaw_lo, g_dmaw_hi, g_dmaw_img;
+extern volatile long g_dmaw_left;
+void spu_dmawatch_log(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd);
 #ifdef __cplusplus
 }
 #endif
@@ -223,6 +226,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                                    uint32_t size, uint32_t cmd)
 {
     if (g_spu_jobtrace_id) spu_jobtrace(spu, lsa, ea, size, cmd, 0);
+    if (g_dmaw_left > 0 && (((uint32_t)ea < g_dmaw_hi && (uint32_t)ea + size > g_dmaw_lo) ||
+                            (g_dmaw_img && (uint32_t)spu->image_id == g_dmaw_img)))
+        spu_dmawatch_log(spu, lsa, ea, size, cmd);
     /* Records the issuing context as resident on its SPU lane, and serves the
      * SPU-thread LS window (EA 0xF0000000 + n*0x100000 + off) from the
      * context resident on lane n. */

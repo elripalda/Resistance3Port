@@ -253,7 +253,7 @@ static int kbm_action(const char* a, u16* btn)
 }
 
 static const char* s_kbm_default =
-    "# Resistance 2 PC port -- keyboard & mouse controls.\n"
+    "# Resistance 3 PC port -- keyboard & mouse controls.\n"
     "# Edit these in Launcher.exe -> Controls, or by hand: KEY = ACTION, one per line.\n"
     "# KEYS:    A-Z 0-9 F1-F12 SPACE SHIFT CTRL ALT TAB ENTER ESC BACKSPACE UP DOWN LEFT RIGHT\n"
     "#          CAPSLOCK INSERT DELETE HOME END PGUP PGDN NUM0-NUM9\n"
@@ -262,7 +262,7 @@ static const char* s_kbm_default =
     "# ACTIONS: LS_UP LS_DOWN LS_LEFT LS_RIGHT (move)  RS_UP RS_DOWN RS_LEFT RS_RIGHT (look)\n"
     "#          CROSS CIRCLE SQUARE TRIANGLE L1 R1 L2 R2 L3 R3 START SELECT\n"
     "#          DPAD_UP DPAD_DOWN DPAD_LEFT DPAD_RIGHT\n"
-    "#          INTERACT (presses Triangle; on-screen prompts to use something show this key)\n"
+    "#          INTERACT (presses Square; on-screen prompts to use something show this key)\n"
     "# A key may be listed more than once to press several things. The comment after a\n"
     "# binding is the launcher row it belongs to (and picks the key shown in prompts).\n"
     "\n"
@@ -271,27 +271,26 @@ static const char* s_kbm_default =
     "A          = LS_LEFT    # Move left\n"
     "D          = LS_RIGHT   # Move right\n"
     "SPACE      = CROSS      # Jump\n"
-    "C          = L2         # Crouch\n"
-    "CTRL       = L2         # Crouch\n"
-    "SHIFT      = L2         # Sprint\n"
+    "C          = CIRCLE     # Crouch\n"
+    "CTRL       = CIRCLE     # Crouch\n"
+    "SHIFT      = L3         # Sprint\n"
     "MOUSE1     = R1         # Fire\n"
     "MOUSE2     = L1         # Aim / zoom\n"
-    "MOUSE3     = R2         # Alternate fire\n"
-    "F          = R2         # Alternate fire\n"
-    "R          = SQUARE     # Reload / pick up weapon\n"
+    "MOUSE3     = R2         # Secondary fire\n"
+    "F          = R2         # Secondary fire\n"
+    "R          = SQUARE     # Reload\n"
     "V          = R3         # Melee\n"
     "MOUSE4     = R3         # Melee\n"
     "Q          = TRIANGLE   # Switch weapon\n"
     "WHEELUP    = TRIANGLE   # Next weapon (wheel)\n"
     "WHEELDOWN  = TRIANGLE   # Next weapon (wheel)\n"
-    "G          = CIRCLE     # Throw grenade\n"
-    "MOUSE5     = CIRCLE     # Throw grenade\n"
-    "1          = DPAD_UP    # Switch grenade type\n"
+    "G          = L2         # Throw grenade\n"
+    "MOUSE5     = L2         # Throw grenade\n"
+    "1          = DPAD_LEFT  # Previous grenade type\n"
+    "2          = DPAD_RIGHT # Next grenade type\n"
     "E          = INTERACT   # Use / interact\n"
-    "T          = DPAD_RIGHT # Flashlight\n"
-    "M          = DPAD_LEFT  # Map\n"
-    "B          = DPAD_DOWN  # Co-op: Grappler / Berserk\n"
-    "Z          = L3         # Left stick click (L3)\n"
+    "T          = DPAD_UP    # D-pad up (scope zoom in)\n"
+    "B          = DPAD_DOWN  # D-pad down (scope zoom out / co-op partner)\n"
     "ESC        = START      # Pause menu\n"
     "TAB        = SELECT     # Scoreboard / objectives\n"
     "ENTER      = START      # Start / pause menu\n"
@@ -557,7 +556,7 @@ static void pad_poll_keyboard(void)
         case KA_LS_LEFT: lx -= 1; break;  case KA_LS_RIGHT: lx += 1; break;
         case KA_RS_UP: kry -= 1; break;   case KA_RS_DOWN: kry += 1; break;
         case KA_RS_LEFT: krx -= 1; break; case KA_RS_RIGHT: krx += 1; break;
-        case KA_INTERACT: interact = 1; btns |= CELL_PAD_CTRL_TRIANGLE; break;   /* R2: use = Triangle (no separate use hook) */
+        case KA_INTERACT: interact = 1; btns |= CELL_PAD_CTRL_SQUARE; break;   /* R3: use = Square (hold) */
         }
     }
     if (wheel_up_frames > 0) wheel_up_frames--;

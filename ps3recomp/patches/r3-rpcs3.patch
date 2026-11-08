@@ -737,7 +737,7 @@ index 28d765f..24084a1 100644
  
  		cpu_range = address_range32(memory_range);
 diff --git a/rpcs3/Emu/RSX/Common/texture_cache.h b/rpcs3/Emu/RSX/Common/texture_cache.h
-index 2a88085..6ad809c 100644
+index 2a88085..d20ceb2 100644
 --- a/rpcs3/Emu/RSX/Common/texture_cache.h
 +++ b/rpcs3/Emu/RSX/Common/texture_cache.h
 @@ -15,6 +15,7 @@
@@ -828,7 +828,26 @@ index 2a88085..6ad809c 100644
  			lock_memory_region_impl(cmd, image, rsx_range, is_active_surface, width, height, pitch, std::forward<Args>(extras)...);
  		}
  
-@@ -3382,6 +3426,14 @@ namespace rsx
+@@ -3330,6 +3374,18 @@ namespace rsx
+ 			const address_range32 tex_range = address_range32::start_length(attributes.address, tex_size);
+ 			invalidate_range_impl_base(cmd, tex_range, invalidation_cause::read, {}, std::forward<Args>(extras)...);
+ 
++			// Resistance port: R3_TEXLOG=<w>x<h> logs CPU uploads of that size (first 64).
++			{
++				static int s_w = -1, s_h = 0, s_n = 0;
++				if (s_w < 0) { s_w = 0; if (const char* e = std::getenv("R3_TEXLOG")) std::sscanf(e, "%dx%d", &s_w, &s_h); }
++				if (s_w && attributes.width == s_w && attributes.height == s_h && s_n < 64)
++				{
++					s_n++;
++					std::fprintf(stderr, "[texlog] cpu upload addr=0x%08X %ux%u pitch=%u fmt=0x%X swz=%d size=0x%X\n",
++						attributes.address, attributes.width, attributes.height, attributes.pitch, attributes.gcm_format, attributes.swizzled ? 1 : 0, tex_size);
++				}
++			}
++
+ 			// Upload from CPU. Note that sRGB conversion is handled in the FS
+ 			auto uploaded = upload_image_from_cpu(cmd, tex_range, attributes.width, attributes.height, attributes.depth, tex.get_exact_mipmap_count(), attributes.pitch, attributes.gcm_format,
+ 				texture_upload_context::shader_read, subresources_layout, extended_dimension, attributes.swizzled);
+@@ -3382,6 +3438,14 @@ namespace rsx
  			u16 dst_w = dst.clip_width;
  			u16 dst_h = dst.clip_height;
  
@@ -843,7 +862,7 @@ index 2a88085..6ad809c 100644
  			blit_engine_helpers::apply_pixel_transforms(src, dst, typeless_info, src_address, src_w, src_h, src_bpp);
  
  			const auto get_tiled_region = [&](const utils::address_range32& range)
-@@ -3409,6 +3461,21 @@ namespace rsx
+@@ -3409,6 +3473,21 @@ namespace rsx
  			dst_subres = blit_engine_internals::rtt_lookup(m_rtts, cmd, dst_address, dst_w, dst_h, dst.pitch, dst_bpp, surface_access::transfer_write, false, scale_x, scale_y);
  			dst_is_render_target = dst_subres.surface != nullptr;
  
@@ -896,6 +915,138 @@ index 797ca56..3cdbfde 100644
  
  			// Destroy if necessary
  			destroy();
+diff --git a/rpcs3/Emu/RSX/Core/RSXCoreRenderer.cpp b/rpcs3/Emu/RSX/Core/RSXCoreRenderer.cpp
+index de335fa..6a13a05 100644
+--- a/rpcs3/Emu/RSX/Core/RSXCoreRenderer.cpp
++++ b/rpcs3/Emu/RSX/Core/RSXCoreRenderer.cpp
+@@ -10,6 +10,106 @@
+ 
+ #include "Emu/RSX/NV47/HW/context_accessors.define.h"
+ 
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++
++// R2_DRAWLOG=<seconds>[:frames]: from the first frame <seconds> after the first
++// draw, write one line per draw and clear to logs\drawlog.txt for <frames>
++// frames (default 2) -- render targets, depth/stencil/blend state, clip and
++// viewport Z, and the program addresses.
++std::atomic<u32> g_r2_drawlog_frame{0};
++
++namespace
++{
++	struct r2_drawlog_t
++	{
++		int state = -1; // -1 unread, 0 off, 1 waiting, 2 logging, 3 done
++		double after_s = 0;
++		u32 frames = 2, first = 0, n = 0;
++		std::chrono::steady_clock::time_point t0;
++		std::FILE* f = nullptr;
++	} s_dl;
++
++	bool r2_drawlog_active()
++	{
++		if (s_dl.state < 0)
++		{
++			const char* e = std::getenv("R2_DRAWLOG");
++			s_dl.state = (e && *e) ? 1 : 0;
++			if (s_dl.state)
++			{
++				s_dl.after_s = std::atof(e);
++				if (const char* c = std::strchr(e, ':')) s_dl.frames = std::max(1, std::atoi(c + 1));
++				s_dl.t0 = std::chrono::steady_clock::now();
++			}
++		}
++		if (s_dl.state == 1 && std::chrono::duration<double>(std::chrono::steady_clock::now() - s_dl.t0).count() >= s_dl.after_s)
++		{
++			s_dl.state = 2;
++			s_dl.first = g_r2_drawlog_frame.load() + 1;
++			s_dl.f = std::fopen("logs\\drawlog.txt", "w");
++			if (!s_dl.f) s_dl.state = 0;
++		}
++		if (s_dl.state != 2) return false;
++		const u32 fr = g_r2_drawlog_frame.load();
++		if (fr < s_dl.first) return false;
++		if (fr >= s_dl.first + s_dl.frames)
++		{
++			std::fclose(s_dl.f);
++			s_dl.f = nullptr;
++			s_dl.state = 3;
++			return false;
++		}
++		return true;
++	}
++
++	void r2_drawlog_line(const rsx::rsx_state& r, const char* what, u32 extra)
++	{
++		const u32 fr = g_r2_drawlog_frame.load() - s_dl.first;
++		std::fprintf(s_dl.f,
++			"f%u #%u %s %u | rt tgt=%u fmt=%u a=%08X/%u b=%08X c=%08X d=%08X | z=%08X fmt=%u %ux%u"
++			" | ztest=%d func=%u zwrite=%d bounds=%d st=%d | blend=%d cmask=%d%d%d%d | clip=%g..%g vpz=%g+%g"
++			" | vp=%u fp=%08X | zclear=%08X\n",
++			fr, s_dl.n++, what, extra,
++			static_cast<u32>(r.surface_color_target()), static_cast<u32>(r.surface_color()),
++			r.surface_offset(0), r.surface_pitch(0), r.surface_offset(1), r.surface_offset(2), r.surface_offset(3),
++			r.surface_z_offset(), static_cast<u32>(r.surface_depth_fmt()), r.surface_clip_width(), r.surface_clip_height(),
++			r.depth_test_enabled(), static_cast<u32>(r.depth_func()), r.depth_write_enabled(), r.depth_bounds_test_enabled(), r.stencil_test_enabled(),
++			r.blend_enabled(), r.color_mask_r(0), r.color_mask_g(0), r.color_mask_b(0), r.color_mask_a(0),
++			r.clip_min(), r.clip_max(), r.viewport_offset_z(), r.viewport_scale_z(),
++			r.transform_program_start(), r.registers[NV4097_SET_SHADER_PROGRAM],
++			r.registers[NV4097_SET_ZSTENCIL_CLEAR_VALUE]);
++	}
++}
++
++u32 g_r2_fifo_methods = 0;
++
++// FIFO flow events into the same log, with the methods executed since the last one.
++void r2_drawlog_flow(const char* what, u32 from, u32 to)
++{
++	if (s_dl.state != 2 || !s_dl.f) return;
++	const u32 fr = g_r2_drawlog_frame.load();
++	if (fr < s_dl.first || fr >= s_dl.first + s_dl.frames) return;
++	std::fprintf(s_dl.f, "f%u -- %s %08X -> %08X (%u methods)\n", fr - s_dl.first, what, from, to, g_r2_fifo_methods);
++	g_r2_fifo_methods = 0;
++}
++
++// R2_DRAWLOG_M=1: every method of the first logged frame, run-length folded.
++void r2_drawlog_method(u32 reg, u32 value)
++{
++	if (s_dl.state != 2 || !s_dl.f) return;
++	static int on = -1;
++	if (on < 0) on = std::getenv("R2_DRAWLOG_M") ? 1 : 0;
++	if (!on || g_r2_drawlog_frame.load() != s_dl.first) return;
++	static u32 last_reg = ~0u, run = 0;
++	if (reg == last_reg && reg == 0) { run++; return; }
++	if (run) { std::fprintf(s_dl.f, "     m %04X x%u\n", last_reg, run); run = 0; }
++	last_reg = reg;
++	std::fprintf(s_dl.f, "     m %04X = %08X\n", reg, value);
++}
++
+ namespace rsx
+ {
+ 	static void decode_raster_state(const rsx_state& regs, raster_state& state)
+@@ -677,6 +777,8 @@ namespace rsx
+ 			return;
+ 		}
+ 
++		if (r2_drawlog_active()) r2_drawlog_line(regs, "CLEAR", arg);
++
+ 		// Binding the framebuffer for the clear reads the viewport.
+ 		// Groups decoded here stay dirty until the next executed draw.
+ 		decode_draw_state();
+@@ -706,6 +808,11 @@ namespace rsx
+ 
+ 	void core_renderer::post_draw_hook()
+ 	{
++		if (r2_drawlog_active())
++		{
++			r2_drawlog_line(*REGS(m_ctx), "DRAW", REGS(m_ctx)->current_draw_clause.get_elements_count());
++		}
++
+ 		if (RSX(m_ctx)->capture_current_frame)
+ 		{
+ 			capture::capture_draw_memory(RSX(m_ctx));
 diff --git a/rpcs3/Emu/RSX/Core/RSXDisplayEngine.cpp b/rpcs3/Emu/RSX/Core/RSXDisplayEngine.cpp
 index 4176076..397d172 100644
 --- a/rpcs3/Emu/RSX/Core/RSXDisplayEngine.cpp
@@ -944,6 +1095,165 @@ index 4176076..397d172 100644
  			}
  		}
  		else
+diff --git a/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp b/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp
+index af17bac..86f7cd6 100644
+--- a/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp
++++ b/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp
+@@ -485,6 +485,18 @@ namespace rsx
+ 
+ 			ensure(layout.color_addresses[index]);
+ 
++			// Resistance port: R3_WATCH=<lo>-<hi> logs render targets bound in that range (first 64).
++			{
++				static u32 s_lo = 1, s_hi = 0; static int s_n = 0;
++				if (s_lo == 1) { s_lo = 0; if (const char* e = std::getenv("R3_WATCH")) { char* d; s_lo = static_cast<u32>(std::strtoul(e, &d, 16)); if (*d == '-') s_hi = static_cast<u32>(std::strtoul(d + 1, nullptr, 16)); } }
++				const u32 a = layout.color_addresses[index];
++				if (s_hi && a < s_hi && a + layout.color_pitch[index] * layout.height > s_lo && s_n < 64)
++				{
++					s_n++;
++					std::fprintf(stderr, "[r3watch] RT%d addr=0x%08X %ux%u pitch=%u fmt=%d\n", static_cast<int>(index), a, layout.width, layout.height, layout.color_pitch[index], static_cast<int>(layout.color_format));
++				}
++			}
++
+ 			const auto packed_pitch = (layout.width * color_texel_size);
+ 			if (packed_render)
+ 			{
+diff --git a/rpcs3/Emu/RSX/NV47/HW/nv0039.cpp b/rpcs3/Emu/RSX/NV47/HW/nv0039.cpp
+index 96c2c12..c8c40aa 100644
+--- a/rpcs3/Emu/RSX/NV47/HW/nv0039.cpp
++++ b/rpcs3/Emu/RSX/NV47/HW/nv0039.cpp
+@@ -101,6 +101,17 @@ namespace rsx
+ 			const auto read_length = in_pitch * (line_count - 1) + in_width_in_bytes;
+ 			const auto write_length = out_pitch * (line_count - 1) + out_width_in_bytes;
+ 
++			// Resistance port: R3_WATCH=<lo>-<hi> logs memory copies writing that range (first 64).
++			{
++				static u32 s_lo = 1, s_hi = 0; static int s_n = 0;
++				if (s_lo == 1) { s_lo = 0; if (const char* e = std::getenv("R3_WATCH")) { char* d; s_lo = static_cast<u32>(std::strtoul(e, &d, 16)); if (*d == '-') s_hi = static_cast<u32>(std::strtoul(d + 1, nullptr, 16)); } }
++				if (s_hi && write_address < s_hi && write_address + write_length > s_lo && s_n < 64)
++				{
++					s_n++;
++					std::fprintf(stderr, "[r3watch] nv0039 src=0x%08X dst=0x%08X inpitch=%d outpitch=%d linelen=%u lines=%u\n", read_address, write_address, in_pitch, out_pitch, line_length, line_count);
++				}
++			}
++
+ 			RSX(ctx)->invalidate_fragment_program(dst_dma, dst_offset, write_length);
+ 
+ 			if (const auto result = RSX(ctx)->read_barrier(read_address, read_length, !is_block_transfer);
+diff --git a/rpcs3/Emu/RSX/NV47/HW/nv3089.cpp b/rpcs3/Emu/RSX/NV47/HW/nv3089.cpp
+index 311a8ec..3f94669 100644
+--- a/rpcs3/Emu/RSX/NV47/HW/nv3089.cpp
++++ b/rpcs3/Emu/RSX/NV47/HW/nv3089.cpp
+@@ -585,6 +585,20 @@ namespace rsx
+ 			// Lock here. RSX cannot execute any locking operations from this point, including ZCULL read barriers
+ 			const u32 read_length = src.pitch * src.height;
+ 			const u32 write_length = dst.pitch * dst.clip_height;
++
++			// Resistance port: R3_WATCH=<lo>-<hi> logs blits writing that range (first 64).
++			{
++				static u32 s_lo = 1, s_hi = 0; static int s_n = 0;
++				if (s_lo == 1) { s_lo = 0; if (const char* e = std::getenv("R3_WATCH")) { char* d; s_lo = static_cast<u32>(std::strtoul(e, &d, 16)); if (*d == '-') s_hi = static_cast<u32>(std::strtoul(d + 1, nullptr, 16)); } }
++				if (s_hi && dst.rsx_address < s_hi && dst.rsx_address + write_length > s_lo && s_n < 64)
++				{
++					s_n++;
++					std::fprintf(stderr, "[r3watch] nv3089 src=0x%08X %ux%u pitch=%u dma=0x%X -> dst=0x%08X clip=%ux%u pitch=%u dma=0x%X swz=%d\n",
++						src.rsx_address, src.width, src.height, src.pitch, src.dma, dst.rsx_address, dst.clip_width, dst.clip_height, dst.pitch, dst.dma,
++						REGS(ctx)->blit_engine_context_surface() == blit_engine::context_surface::swizzle2d ? 1 : 0);
++				}
++			}
++
+ 			auto res = ::rsx::reservation_lock<true>(
+ 				dst.rsx_address, write_length,
+ 				src.rsx_address, read_length);
+diff --git a/rpcs3/Emu/RSX/RSXFIFO.cpp b/rpcs3/Emu/RSX/RSXFIFO.cpp
+index 107f5b2..39a9d7c 100644
+--- a/rpcs3/Emu/RSX/RSXFIFO.cpp
++++ b/rpcs3/Emu/RSX/RSXFIFO.cpp
+@@ -15,6 +15,11 @@
+ 
+ using spu_rdata_t = std::byte[128];
+ 
++// R2_DRAWLOG (Core/RSXCoreRenderer.cpp)
++extern u32 g_r2_fifo_methods;
++void r2_drawlog_flow(const char* what, u32 from, u32 to);
++void r2_drawlog_method(u32 reg, u32 value);
++
+ extern void mov_rdata(spu_rdata_t& _dst, const spu_rdata_t& _src);
+ extern bool cmp_rdata(const spu_rdata_t& _lhs, const spu_rdata_t& _rhs);
+ 
+@@ -803,6 +808,7 @@ namespace rsx
+ 				else
+ 				{
+ 					last_known_code_start = offs;
++					r2_drawlog_flow("JUMP", fifo_ctrl->get_pos(), offs);
+ 				}
+ 
+ 				//rsx_log.warning("rsx jump(0x%x) #addr=0x%x, cmd=0x%x, get=0x%x, put=0x%x", offs, m_ioAddress + get, cmd, get, put);
+@@ -820,6 +826,7 @@ namespace rsx
+ 				}
+ 
+ 				const u32 offs = cmd & RSX_METHOD_CALL_OFFSET_MASK;
++				r2_drawlog_flow("CALL", fifo_ctrl->get_pos(), offs);
+ 				fifo_ret_addr = fifo_ctrl->get_pos() + 4;
+ 				fifo_ctrl->set_get(offs);
+ 				last_known_code_start = offs;
+@@ -834,6 +841,7 @@ namespace rsx
+ 					return;
+ 				}
+ 
++				r2_drawlog_flow("RET", fifo_ctrl->get_pos(), fifo_ret_addr);
+ 				// Optimize returning to another CALL
+ 				if ((ctrl->put & ~3) != fifo_ret_addr)
+ 				{
+@@ -880,6 +888,8 @@ namespace rsx
+ 
+ 		do
+ 		{
++			g_r2_fifo_methods++;
++			r2_drawlog_method(command.reg, command.value);
+ 			if (capture_current_frame) [[unlikely]]
+ 			{
+ 				const u32 reg = (command.reg & 0xfffc) >> 2;
+diff --git a/rpcs3/Emu/RSX/RSXThread.cpp b/rpcs3/Emu/RSX/RSXThread.cpp
+index a572df4..a4ba7bc 100644
+--- a/rpcs3/Emu/RSX/RSXThread.cpp
++++ b/rpcs3/Emu/RSX/RSXThread.cpp
+@@ -1,6 +1,9 @@
+ #include "stdafx.h"
+ #include "RSXThread.h"
+ 
++#include <atomic>
++extern std::atomic<u32> g_r2_drawlog_frame; // Core/RSXCoreRenderer.cpp (R2_DRAWLOG)
++
+ #include "Capture/rsx_capture.h"
+ #include "Common/surface_store.h"
+ #include "Core/RSXReservationLock.hpp"
+@@ -2168,6 +2171,25 @@ namespace rsx
+ 
+ 	void thread::on_frame_end(context* ctx, u32 buffer, bool forced)
+ 	{
++		g_r2_drawlog_frame.fetch_add(1);
++		{
++			// R2_DRAWSTATS=1: draws per frame every 30 frames to logs\drawstats.txt
++			static int on = -1;
++			static std::FILE* f = nullptr;
++			static u64 sum = 0, mx = 0, t0 = 0;
++			if (on < 0) { on = std::getenv("R2_DRAWSTATS") ? 1 : 0; if (on) f = std::fopen("logs\\drawstats.txt", "w"); t0 = get_system_time(); }
++			if (f)
++			{
++				const u64 d = m_ctx->stats.draw_calls;
++				sum += d; mx = std::max<u64>(mx, d);
++				if ((g_r2_drawlog_frame.load() % 30) == 0)
++				{
++					std::fprintf(f, "t=%6.1fs frame=%u draws/frame avg=%.1f max=%llu\n", (get_system_time() - t0) / 1e6, g_r2_drawlog_frame.load(), sum / 30.0, static_cast<unsigned long long>(mx));
++					std::fflush(f);
++					sum = mx = 0;
++				}
++			}
++		}
+ 		bool pause_emulator = false;
+ 
+ 		// MM sync. This is a pre-emptive operation, so we can use a deferred request.
 diff --git a/rpcs3/Emu/RSX/VK/VKDraw.cpp b/rpcs3/Emu/RSX/VK/VKDraw.cpp
 index 2c736de..8bfa6a0 100644
 --- a/rpcs3/Emu/RSX/VK/VKDraw.cpp
@@ -1036,10 +1346,10 @@ index 4afff84..d91eeb2 100644
  		// Native UI flips are requested from the local task. Submit outstanding work first.
 diff --git a/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
 new file mode 100644
-index 0000000..bac031e
+index 0000000..84d7f93
 --- /dev/null
 +++ b/rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp
-@@ -0,0 +1,1848 @@
+@@ -0,0 +1,1915 @@
 +// R2PORT: Resistance 2 port addition (not upstream RPCS3). See VKR2Upscaler.h.
 +//
 +// How it works (all inert unless RSX_FSR=1/2):
@@ -1113,6 +1423,9 @@ index 0000000..bac031e
 +		int trace = 0;         // RSX_AA_TRACE=N: dump every draw of every N-th frame (pass structure analysis)
 +		int view = 0;          // RSX_AA_DEBUG_VIEW=1: show |AA - input| x8; 2: left half input, right half AA
 +		bool mask = true;      // RSX_DLSS_MASK=0: no moving-object mask (DLSS bias-current-colour)
++		// RSX_AA_SPLIT=0: frame boundary at the flip (R2). Default: R3 renders the next frame's geometry pre-pass
++		// before the flip, so the logical frame ends after the material pass (scene-pair run without depth writes).
++		bool split = true;
 +	};
 +
 +	const r2aa_settings& r2cfg()
@@ -1134,6 +1447,7 @@ index 0000000..bac031e
 +			if (const char* e = std::getenv("RSX_AA_TRACE")) r.trace = std::max(0, std::atoi(e));
 +			if (const char* e = std::getenv("RSX_AA_DEBUG_VIEW")) r.view = std::atoi(e);
 +			if (const char* e = std::getenv("RSX_DLSS_MASK")) r.mask = std::atoi(e) != 0;
++			if (const char* e = std::getenv("RSX_AA_SPLIT")) r.split = std::atoi(e) != 0;
 +			if (r.mode)
 +			{
 +				if (r.upscale < 1.f) r.phases = std::max(r.phases, static_cast<int>(std::ceil(8.f / (r.upscale * r.upscale))));
@@ -1938,7 +2252,24 @@ index 0000000..bac031e
 +		u32 out_w = 0, out_h = 0;
 +		u32 stat_wb_direct = 0;        // results written into a new full-resolution scene surface
 +		u32 jitter_cooldown = 0;       // frames without jitter after the result could not be shown
++
++		// Split frames (r2aa_settings::split)
++		bool run_scene = false;        // the current run of draws goes into the scene pair
++		u32 run_draws = 0, run_dw = 0; // its draws / draws with depth writes
++		bool mat_done = false;         // a material pass (scene-pair run without depth writes) has finished
++		bool boundary_pending = false; // the upscaler ran: start the next logical frame at the next scene bind
++		u32 flips_since = 0;           // flips since the last logical frame boundary
 +	} g_r2;
++
++	void frame_boundary();
++
++	// All scene passes of the logical frame are done: the upscaler may run at the next non-scene target
++	bool scene_passes_done()
++	{
++		const auto& st = g_r2;
++		if (!r2cfg().split) return st.seg_count >= st.seg_target;
++		return st.mat_done || (st.run_scene && st.run_draws >= 8 && !st.run_dw);
++	}
 +
 +	void skip_once(const std::string& why)
 +	{
@@ -2047,6 +2378,17 @@ index 0000000..bac031e
 +	}
 +	const bool scene_pair = st.scene_valid && rt_addr == st.scene_rt && ds_addr == st.scene_ds;
 +	if (scene_pair && new_run) st.seg_count++;
++	if (new_run)
++	{
++		if (st.run_scene && st.run_draws >= 8 && !st.run_dw) st.mat_done = true;
++		st.run_scene = scene_pair;
++		st.run_draws = st.run_dw = 0;
++	}
++	if (scene_pair && (dtest || dwrite))
++	{
++		st.run_draws++;
++		if (dwrite) st.run_dw++;
++	}
 +	st.draw_index++;
 +
 +	if (r2cfg().trace && (st.frame % static_cast<u32>(r2cfg().trace)) == 0 && st.frame)
@@ -2079,7 +2421,7 @@ index 0000000..bac031e
 +			regs->scissor_width(), regs->scissor_height(), dtest, dwrite,
 +			m_ctx->program.vertex_program.base_address, regs->shader_program_address(), tex.c_str());
 +	}
-+	if (st.scene_valid && !st.aa_done && st.scene_draws && !scene_pair && st.seg_count >= st.seg_target && !st.resolve_wait)
++	if (st.scene_valid && !st.aa_done && st.scene_draws && !scene_pair && scene_passes_done() && !st.resolve_wait)
 +	{
 +		// The last run of draws into the scene pair is over (R2 draws it twice: geometry pre-pass, then the
 +		// material pass after the light passes). Anything else now (transparents, post, HUD): AA first.
@@ -2159,7 +2501,7 @@ index 0000000..bac031e
 +void VKGSRender::r2aa_check_texture_reads()
 +{
 +	auto& st = g_r2;
-+	if (!r2cfg().mode || st.disabled || !st.scene_draws || st.aa_done || !st.rt_ptr || st.seg_count < st.seg_target) return; // reads between the scene passes are the light passes
++	if (!r2cfg().mode || st.disabled || !st.scene_draws || st.aa_done || !st.rt_ptr || !scene_passes_done()) return; // reads between the scene passes are the light passes
 +	if (st.resolve_wait) return; // the resolve pass reads the scene; upscale its output once it is done
 +
 +	auto& sc = res()->surface_cache;
@@ -2185,7 +2527,8 @@ index 0000000..bac031e
 +	auto& st = g_r2;
 +	if (!r2cfg().mode || st.disabled) return;
 +	const bool scene_bind = color0 == st.scene_rt && zeta == st.scene_ds;
-+	if (st.scene_valid && st.scene_draws && !st.aa_done && st.rt_ptr && st.seg_count >= st.seg_target && !scene_bind)
++	if (st.boundary_pending && scene_bind && !st.window) frame_boundary();
++	if (st.scene_valid && st.scene_draws && !st.aa_done && st.rt_ptr && scene_passes_done() && !scene_bind)
 +	{
 +		auto& sc = res()->surface_cache;
 +		if (st.resolve_wait)
@@ -2312,11 +2655,110 @@ index 0000000..bac031e
 +{
 +	auto& st = g_r2;
 +	if (r2cfg().trace && (st.frame % static_cast<u32>(r2cfg().trace)) == 0 && st.frame) r2log("T f%u blit-read %08x", st.frame, address);
-+	if (!r2cfg().mode || st.disabled || !st.scene_draws || st.aa_done || !st.rt_ptr || st.seg_count < st.seg_target) return; // reads between the scene passes are the light passes
++	if (!r2cfg().mode || st.disabled || !st.scene_draws || st.aa_done || !st.rt_ptr || !scene_passes_done()) return; // reads between the scene passes are the light passes
 +	if (st.resolve_wait) return; // the resolve pass reads the scene; upscale its output once it is done
 +	if (address >= st.rt_range.start && address <= st.rt_range.end)
 +	{
 +		r2aa_run();
++	}
++}
++
++namespace
++{
++	// Next logical frame: pick its scene from this frame's draws, set its jitter
++	void frame_boundary()
++	{
++		auto& st = g_r2;
++		st.boundary_pending = false;
++		st.flips_since = 0;
++		st.mat_done = false;
++		st.run_scene = false;
++		st.run_draws = st.run_dw = 0;
++		// Pick next frame's scene: the depth buffer with most depth-tested draws, then its busiest colour target
++		u64 best_ds = 0;
++		{
++			std::unordered_map<u32, u32> per_ds;
++			u32 best = 0;
++			for (const auto& [key, t] : st.tally)
++			{
++				if (!(key >> 32)) continue; // depth-only (shadow maps) can't be the scene
++				const u32 ds = static_cast<u32>(key);
++				const u32 n = (per_ds[ds] += t.count);
++				if (n > best) { best = n; best_ds = ds; }
++			}
++		}
++
++		u32 max_count = 0;
++		for (const auto& [key, t] : st.tally)
++			if (static_cast<u32>(key) == best_ds && (key >> 32)) max_count = std::max(max_count, t.count);
++
++		bool found = false;
++		u32 new_rt = 0, latest_first = 0;
++		for (const auto& [key, t] : st.tally)
++		{
++			if (static_cast<u32>(key) != best_ds || !(key >> 32)) continue;
++			if (t.count < std::max(30u, max_count / 4)) continue;
++			if (!found || t.first_draw > latest_first)
++			{
++				found = true;
++				latest_first = t.first_draw;
++				new_rt = static_cast<u32>(key >> 32);
++			}
++		}
++
++		const bool was_valid = st.scene_valid;
++		const u32 old_rt = st.scene_rt, old_ds = st.scene_ds;
++		st.scene_valid = found;
++		if (found)
++		{
++			st.scene_rt = new_rt;
++			st.scene_ds = static_cast<u32>(best_ds);
++		}
++		st.scene_changed = !was_valid || !found || old_rt != st.scene_rt || old_ds != st.scene_ds;
++		if (found)
++		{
++			const auto it = st.tally.find((static_cast<u64>(st.scene_rt) << 32) | st.scene_ds);
++			st.seg_target = it != st.tally.end() ? std::max(1u, it->second.segments) : 1u;
++		}
++		if (st.scene_changed && found)
++		{
++			r2log("scene: colour 0x%08x, depth 0x%08x (%u draws, %u passes)", st.scene_rt, st.scene_ds, max_count, st.seg_target);
++			st.need_reset = true;
++		}
++
++		if (r2cfg().debug && (st.frame % 300) == 0)
++		{
++			r2log("frame %u: %u scene draws, %u matrix evals (%u failed), vote %u/%u", st.frame, st.scene_draws, st.evals, st.eval_fail, st.vote_hits, st.vote_total);
++		}
++
++		// Next frame
++		st.prev_M.swap(st.cur_M);
++		st.cur_M.clear();
++		st.occurrences.clear();
++		st.tally.clear();
++		st.last_pair = ~0ull;
++		st.seg_count = 0;
++		st.prev_S = st.frame_S;
++		st.prev_valid = st.frame_S.valid && st.ran_ok;
++		// Jitter only while the upscaler is known to run on this scene: it ran last frame and the scene is unchanged.
++		// Otherwise (menus, loading screens, the first frame of a new scene, a failed pass) draw without jitter.
++		if (st.jitter_cooldown) st.jitter_cooldown--;
++		const bool jitter_on = st.ran_ok && st.scene_valid && !st.scene_changed && !st.jitter_cooldown;
++		st.ran_ok = false;
++		st.scene_draws_last = st.scene_draws;
++		st.scene_draws = 0;
++		st.draw_index = 0;
++		st.evals = st.eval_fail = 0;
++		st.aa_done = false;
++		st.rt_ptr = nullptr;
++		st.ds_ptr = nullptr;
++		st.frame_S.valid = false;
++		st.frame++;
++		g_r2_trace_now = r2cfg().trace && (st.frame % static_cast<u32>(r2cfg().trace)) < 2 && st.frame > 1;
++		const u32 phase = (st.frame % static_cast<u32>(r2cfg().phases)) + 1;
++		st.jx = jitter_on ? halton(phase, 2) - 0.5f : 0.f;
++		st.jy = jitter_on ? halton(phase, 3) - 0.5f : 0.f;
++		if (jitter_on) st.stat_jitter++;
 +	}
 +}
 +
@@ -2342,6 +2784,24 @@ index 0000000..bac031e
 +	if (!r2cfg().mode || st.disabled) return;
 +	if (!st.draw_index) st.stat_flips_noscene++;
 +
++	if (r2cfg().split && st.scene_valid && st.flips_since < 3)
++	{
++		// The next frame's pre-pass straddles the flip: the logical frame ends after the upscaler (frame_boundary)
++		st.flips_since++;
++		if (st.section)
++		{
++			r2aa_set_section(false); // re-enabled at the next bind inside the window
++			if (m_draw_fbo)
++			{
++				if (vk::is_renderpass_open(*m_current_command_buffer)) vk::end_renderpass(*m_current_command_buffer);
++				m_draw_fbo->release();
++				m_draw_fbo = nullptr;
++			}
++			m_ctx->graphics_state.set(rsx::rtt_config_dirty);
++		}
++		return;
++	}
++
 +	if (st.scene_draws && !st.aa_done)
 +	{
 +		r2aa_run();
@@ -2366,91 +2826,7 @@ index 0000000..bac031e
 +	st.wb_pending = st.wb_armed = false;
 +	st.resolve_wait = false;
 +
-+	// Pick next frame's scene: the depth buffer with most depth-tested draws, then its busiest colour target
-+	u64 best_ds = 0;
-+	{
-+		std::unordered_map<u32, u32> per_ds;
-+		u32 best = 0;
-+		for (const auto& [key, t] : st.tally)
-+		{
-+			if (!(key >> 32)) continue; // depth-only (shadow maps) can't be the scene
-+			const u32 ds = static_cast<u32>(key);
-+			const u32 n = (per_ds[ds] += t.count);
-+			if (n > best) { best = n; best_ds = ds; }
-+		}
-+	}
-+
-+	u32 max_count = 0;
-+	for (const auto& [key, t] : st.tally)
-+		if (static_cast<u32>(key) == best_ds && (key >> 32)) max_count = std::max(max_count, t.count);
-+
-+	bool found = false;
-+	u32 new_rt = 0, latest_first = 0;
-+	for (const auto& [key, t] : st.tally)
-+	{
-+		if (static_cast<u32>(key) != best_ds || !(key >> 32)) continue;
-+		if (t.count < std::max(30u, max_count / 4)) continue;
-+		if (!found || t.first_draw > latest_first)
-+		{
-+			found = true;
-+			latest_first = t.first_draw;
-+			new_rt = static_cast<u32>(key >> 32);
-+		}
-+	}
-+
-+	const bool was_valid = st.scene_valid;
-+	const u32 old_rt = st.scene_rt, old_ds = st.scene_ds;
-+	st.scene_valid = found;
-+	if (found)
-+	{
-+		st.scene_rt = new_rt;
-+		st.scene_ds = static_cast<u32>(best_ds);
-+	}
-+	st.scene_changed = !was_valid || !found || old_rt != st.scene_rt || old_ds != st.scene_ds;
-+	if (found)
-+	{
-+		const auto it = st.tally.find((static_cast<u64>(st.scene_rt) << 32) | st.scene_ds);
-+		st.seg_target = it != st.tally.end() ? std::max(1u, it->second.segments) : 1u;
-+	}
-+	if (st.scene_changed && found)
-+	{
-+		r2log("scene: colour 0x%08x, depth 0x%08x (%u draws, %u passes)", st.scene_rt, st.scene_ds, max_count, st.seg_target);
-+		st.need_reset = true;
-+	}
-+
-+	if (r2cfg().debug && (st.frame % 300) == 0)
-+	{
-+		r2log("frame %u: %u scene draws, %u matrix evals (%u failed), vote %u/%u", st.frame, st.scene_draws, st.evals, st.eval_fail, st.vote_hits, st.vote_total);
-+	}
-+
-+	// Next frame
-+	st.prev_M.swap(st.cur_M);
-+	st.cur_M.clear();
-+	st.occurrences.clear();
-+	st.tally.clear();
-+	st.last_pair = ~0ull;
-+	st.seg_count = 0;
-+	st.prev_S = st.frame_S;
-+	st.prev_valid = st.frame_S.valid && st.ran_ok;
-+	// Jitter only while the upscaler is known to run on this scene: it ran last frame and the scene is unchanged.
-+	// Otherwise (menus, loading screens, the first frame of a new scene, a failed pass) draw without jitter.
-+	if (st.jitter_cooldown) st.jitter_cooldown--;
-+	const bool jitter_on = st.ran_ok && st.scene_valid && !st.scene_changed && !st.jitter_cooldown;
-+	st.ran_ok = false;
-+	st.scene_draws_last = st.scene_draws;
-+	st.scene_draws = 0;
-+	st.draw_index = 0;
-+	st.evals = st.eval_fail = 0;
-+	st.aa_done = false;
-+	st.rt_ptr = nullptr;
-+	st.ds_ptr = nullptr;
-+	st.frame_S.valid = false;
-+	st.frame++;
-+	g_r2_trace_now = r2cfg().trace && (st.frame % static_cast<u32>(r2cfg().trace)) < 2 && st.frame > 1;
-+	const u32 phase = (st.frame % static_cast<u32>(r2cfg().phases)) + 1;
-+	st.jx = jitter_on ? halton(phase, 2) - 0.5f : 0.f;
-+	st.jy = jitter_on ? halton(phase, 3) - 0.5f : 0.f;
-+	if (jitter_on) st.stat_jitter++;
++	frame_boundary();
 +}
 +namespace
 +{
@@ -2492,6 +2868,7 @@ index 0000000..bac031e
 +{
 +	auto& st = g_r2;
 +	st.aa_done = true;
++	st.boundary_pending = r2cfg().split;
 +	if (r2cfg().trace && (st.frame % static_cast<u32>(r2cfg().trace)) == 0 && st.frame) r2log("T f%u AA RUN before draw %u", st.frame, st.draw_index);
 +	if (st.disabled) return;
 +
@@ -3058,7 +3435,7 @@ index ac91c2e..17308eb 100644
  
  		if (xfer_info.flip_horizontal)
 diff --git a/rpcs3/Emu/RSX/VK/VKTextureCache.cpp b/rpcs3/Emu/RSX/VK/VKTextureCache.cpp
-index 0ecf55d..bea913c 100644
+index 0ecf55d..aa74fbe 100644
 --- a/rpcs3/Emu/RSX/VK/VKTextureCache.cpp
 +++ b/rpcs3/Emu/RSX/VK/VKTextureCache.cpp
 @@ -1050,7 +1050,12 @@ namespace vk
@@ -3089,6 +3466,52 @@ index 0ecf55d..bea913c 100644
  
  		// Prepare section
  		region.reset(rsx_range);
+@@ -1282,8 +1292,13 @@ namespace vk
+ 		auto p_subresource_layout = &subresource_layout;
+ 		u32 heap_align = upload_heap_align_default;
+ 
+-		if (auto tiled_region = rsx::get_current_renderer()->get_tiled_memory_region(rsx_range);
+-			context == rsx::texture_upload_context::blit_engine_src && tiled_region)
++		// Detile blit sources and single-level 2D shader reads that live in a tiled main memory region
++		// (RPCS3 PR #19785: R3's SPU depth-of-field output is sampled straight from tiled memory)
++		const bool detile_context =
++			context == rsx::texture_upload_context::blit_engine_src ||
++			(context == rsx::texture_upload_context::shader_read && mipmaps == 1 && depth == 1 && type != rsx::texture_dimension_extended::texture_dimension_cubemap);
++
++		if (const auto tiled_region = detile_context ? rsx::get_current_renderer()->get_tiled_memory_region(rsx_range) : rsx::GCM_tile_reference{})
+ 		{
+ 			if (mipmaps > 1)
+ 			{
+@@ -1302,6 +1317,9 @@ namespace vk
+ 				upload_command_flags |= source_is_gpu_resident;
+ 				heap_align = width * bpp;
+ 
++				// The detiled data lives in a scratch buffer written on this command buffer
++				upload_command_flags &= ~upload_contents_async;
++
+ 				tmp.push_back(std::move(subres));
+ 				p_subresource_layout = &tmp;
+ 			}
+diff --git a/rpcs3/Emu/RSX/VK/VKTextureCache.h b/rpcs3/Emu/RSX/VK/VKTextureCache.h
+index 597de75..df40c88 100644
+--- a/rpcs3/Emu/RSX/VK/VKTextureCache.h
++++ b/rpcs3/Emu/RSX/VK/VKTextureCache.h
+@@ -249,8 +249,13 @@ namespace vk
+ 				target = vk::get_typeless_helper(vram_texture->format(), vram_texture->format_class(), transfer_width, transfer_height);
+ 				target->change_layout(cmd, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+ 
+-				// Allow bilinear filtering on color textures where compatibility is likely
+-				const auto filter = (target->aspect() == VK_IMAGE_ASPECT_COLOR_BIT) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
++				// Allow bilinear filtering on color textures where compatibility is likely.
++				// Float targets are excluded: filtering them as floats scrambles data written through typeless transfers (RPCS3 PR #19785).
++				const bool is_float_format =
++					target->format() == VK_FORMAT_R16G16B16A16_SFLOAT ||
++					target->format() == VK_FORMAT_R32G32B32A32_SFLOAT ||
++					target->format() == VK_FORMAT_R32_SFLOAT;
++				const auto filter = (target->aspect() == VK_IMAGE_ASPECT_COLOR_BIT && !is_float_format) ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+ 
+ 				vk::copy_scaled_image(cmd, locked_resource, target,
+ 					areai{ 0, 0, static_cast<s32>(locked_resource->width()), static_cast<s32>(locked_resource->height()) },
 diff --git a/rpcs3/Emu/RSX/VK/vkutils/commands.h b/rpcs3/Emu/RSX/VK/vkutils/commands.h
 index 81f65b3..494acdf 100644
 --- a/rpcs3/Emu/RSX/VK/vkutils/commands.h

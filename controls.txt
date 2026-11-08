@@ -1,4 +1,4 @@
-# Resistance 2 PC port -- keyboard & mouse controls.
+# Resistance 3 PC port -- keyboard & mouse controls.
 # Edit these in Launcher.exe -> Controls, or by hand: KEY = ACTION, one per line.
 # KEYS:    A-Z 0-9 F1-F12 SPACE SHIFT CTRL ALT TAB ENTER ESC BACKSPACE UP DOWN LEFT RIGHT
 #          CAPSLOCK INSERT DELETE HOME END PGUP PGDN NUM0-NUM9
@@ -7,7 +7,7 @@
 # ACTIONS: LS_UP LS_DOWN LS_LEFT LS_RIGHT (move)  RS_UP RS_DOWN RS_LEFT RS_RIGHT (look)
 #          CROSS CIRCLE SQUARE TRIANGLE L1 R1 L2 R2 L3 R3 START SELECT
 #          DPAD_UP DPAD_DOWN DPAD_LEFT DPAD_RIGHT
-#          INTERACT (presses Triangle; on-screen prompts to use something show this key)
+#          INTERACT (presses Square; on-screen prompts to use something show this key)
 # A key may be listed more than once to press several things. The comment after a
 # binding is the launcher row it belongs to (and picks the key shown in prompts).
 
@@ -16,30 +16,29 @@ S          = LS_DOWN    # Move back
 A          = LS_LEFT    # Move left
 D          = LS_RIGHT   # Move right
 SPACE      = CROSS      # Jump
-C          = L2         # Crouch
-CTRL       = L2         # Crouch
-SHIFT      = L2         # Sprint
+C          = CIRCLE     # Crouch
+CTRL       = CIRCLE     # Crouch
+SHIFT      = L3         # Sprint
 MOUSE1     = R1         # Fire
 MOUSE2     = L1         # Aim / zoom
-MOUSE3     = R2         # Alternate fire
-F          = R2         # Alternate fire
-R          = SQUARE     # Reload / pick up weapon
+MOUSE3     = R2         # Secondary fire
+F          = R2         # Secondary fire
+R          = SQUARE     # Reload
 V          = R3         # Melee
 MOUSE4     = R3         # Melee
 Q          = TRIANGLE   # Switch weapon
 WHEELUP    = TRIANGLE   # Next weapon (wheel)
 WHEELDOWN  = TRIANGLE   # Next weapon (wheel)
-G          = CIRCLE     # Throw grenade
-MOUSE5     = CIRCLE     # Throw grenade
-1          = DPAD_UP    # Switch grenade type
+G          = L2         # Throw grenade
+MOUSE5     = L2         # Throw grenade
+1          = DPAD_LEFT  # Previous grenade type
+2          = DPAD_RIGHT # Next grenade type
 E          = INTERACT   # Use / interact
-T          = DPAD_RIGHT # Flashlight
-M          = DPAD_LEFT  # Map
-B          = DPAD_DOWN  # Co-op: Grappler / Berserk
-Z          = L3         # Left stick click (L3)
+T          = DPAD_UP    # D-pad up (scope zoom in)
+B          = DPAD_DOWN  # D-pad down (scope zoom out / co-op partner)
 ESC        = START      # Pause menu
-ENTER      = START      # Pause menu
 TAB        = SELECT     # Scoreboard / objectives
+ENTER      = START      # Start / pause menu
 BACKSPACE  = CIRCLE     # Menu back
 UP         = RS_UP      # Look up
 DOWN       = RS_DOWN    # Look down
@@ -47,7 +46,7 @@ LEFT       = RS_LEFT    # Look left
 RIGHT      = RS_RIGHT   # Look right
 
 # Mouse
-mouse_sensitivity = 2.00
+mouse_sensitivity = 1.00
 mouse_invert_y = 0
 mouse_look = direct        # direct: the mouse turns the camera 1:1 on foot; stick: old stick emulation
 mouse_degrees_per_count = 0.050   # direct look speed (x mouse_sensitivity, x the game's Look Sensitivity)

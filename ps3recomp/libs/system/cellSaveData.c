@@ -447,6 +447,20 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
 }
 
 /* Enumerate save directories matching a prefix. Returns count, fills dirList up to max. */
+static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* param);
+
+/* The dir list carries each save's SAVEDATA_LIST_PARAM (as RPCS3 fills it):
+ * titles that rotate between save slots pick the newest by it, and a zeroed
+ * one makes Resistance 3's Continue reject every slot or load an older one. */
+static void fill_dir_list_param(CellSaveDataDirList* e)
+{
+    char path[1024];
+    CellSaveDataSystemFileParam sfo;
+    snprintf(path, sizeof(path), "%s/%s", s_save_root, e->dirName);
+    read_param_sfo(path, &sfo);
+    memcpy(e->listParam, sfo.listParam, sizeof(e->listParam));
+}
+
 static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList, u32 max)
 {
     u32 count = 0;
@@ -478,6 +492,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
                 memset(&dirList[count], 0, sizeof(CellSaveDataDirList));
                 strncpy(dirList[count].dirName, fd.cFileName,
                         CELL_SAVEDATA_DIRNAME_SIZE - 1);
+                fill_dir_list_param(&dirList[count]);
             }
             count++;
         } while (FindNextFileA(hFind, &fd));
@@ -505,6 +520,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
                 memset(&dirList[count], 0, sizeof(CellSaveDataDirList));
                 strncpy(dirList[count].dirName, de->d_name,
                         CELL_SAVEDATA_DIRNAME_SIZE - 1);
+                fill_dir_list_param(&dirList[count]);
             }
             count++;
         }

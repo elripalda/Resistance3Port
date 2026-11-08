@@ -559,6 +559,32 @@ void spu_pmtrace_dump(const char* why)
 }
 SPU_THREAD_LOCAL spu_dma_trace_ent g_spu_dma_ring[512];
 SPU_THREAD_LOCAL uint32_t g_spu_dma_ring_n;
+/* Debug-console "dmawatch <lo> <hi> <n> [img]": log the next n SPU DMAs that
+ * touch [lo,hi) -- plus every DMA of image img when given -- to
+ * logs/dmawatch.txt, with the first source/destination bytes. */
+volatile uint32_t g_dmaw_lo, g_dmaw_hi, g_dmaw_img;
+volatile LONG g_dmaw_left;
+void spu_dmawatch_log(spu_context* spu, uint32_t lsa, uint64_t ea, uint32_t size, uint32_t cmd)
+{
+    static FILE* f;
+    static SRWLOCK lk = SRWLOCK_INIT;
+    if (InterlockedDecrement(&g_dmaw_left) < 0) { g_dmaw_left = 0; return; }
+    AcquireSRWLockExclusive(&lk);
+    if (!f) f = fopen("logs/dmawatch.txt", "a");
+    if (f) {
+        extern unsigned long long ps3_ms_now(void);
+        uint8_t b[16] = {0};
+        if ((cmd & 0xF0) == 0x20) memcpy(b, spu->ls + (lsa & SPU_LS_MASK & ~15u), 16);
+        else if (vm_base) memcpy(b, vm_base + (uint32_t)ea, size < 16 ? size : 16);
+        fprintf(f, "%llu tid=%lu img=%d spu=%u pc=0x%05X cmd=0x%02X lsa=0x%05X ea=0x%08X size=0x%X tag=%u |",
+                ps3_ms_now(), GetCurrentThreadId(), spu->image_id, spu->spu_id,
+                (uint32_t)spu->pc & SPU_LS_MASK, cmd, lsa, (uint32_t)ea, size, spu->mfc_tag);
+        for (int i = 0; i < 16; i++) fprintf(f, "%s%02X", (i & 3) ? "" : " ", b[i]);
+        fprintf(f, "\n");
+        if (g_dmaw_left == 0) { fprintf(f, "-- end --\n"); fflush(f); }
+    }
+    ReleaseSRWLockExclusive(&lk);
+}
 typedef struct { uint64_t t; uint32_t spu, tid, cmd, lsa, ea, size; uint32_t ls1320, d[8]; } spu_phys_ent;
 #define SPU_PHYS_RING (1u << 20)   /* ~25 s of traffic; 64 MB */
 static spu_phys_ent* s_phys_ring;
@@ -2004,8 +2030,26 @@ static inline int spu_forced_interp(int image_id)
 {
     return spu_force_interp_any() && image_id > 0 && image_id < 4096 && s_force_interp[image_id];
 }
+/* Live toggle (debug console "finterp"): bumping the epoch flushes every
+ * thread's lookup cache, which otherwise keeps resolved hits forever. */
+static volatile LONG s_force_epoch;
+static SPU_THREAD_LOCAL LONG t_force_epoch;
+void spu_force_interp_set(int lo, int hi, int on)
+{
+    spu_force_interp_any();
+    if (lo < 0) { memset(s_force_interp, 0, sizeof s_force_interp); }
+    else for (int i = lo; i <= hi && i < 4096; i++) s_force_interp[i] = (uint8_t)(on != 0);
+    int any = 0;
+    for (int i = 0; i < 4096; i++) if (s_force_interp[i]) { any = 1; break; }
+    s_force_interp_on = any;
+    InterlockedIncrement(&s_force_epoch);
+}
 spu_fn spu_lookup(uint32_t addr, int image_id)   /* exported: clang-built fast-path dispatch (spu_dispatch_mt.c) needs it */
 {
+    if (t_force_epoch != s_force_epoch) {
+        t_force_epoch = s_force_epoch;
+        memset(t_spu_lk_cache, 0, sizeof t_spu_lk_cache);
+    }
     spu_lk_cache_ent* c = &t_spu_lk_cache[((addr >> 2) ^ ((uint32_t)image_id * 0x9E5u)) & 1023u];
     const uint32_t gen = s_registry_count;
     if (c->addr == addr && c->image_id == image_id && (c->fn || (c->gen == gen && gen)))

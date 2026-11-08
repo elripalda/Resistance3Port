@@ -30,12 +30,17 @@ extern "C" const char* g_last_hle_name;
  * console is servicing a command, also to its response file. */
 static void dbg_printf(const char* fmt, ...);
 extern "C" void spu_dbg_dump_all(void (*out)(const char*));
+extern "C" volatile uint32_t g_dmaw_lo, g_dmaw_hi, g_dmaw_img;
+extern "C" void spu_force_interp_set(int lo, int hi, int on);
+extern "C" volatile long g_dmaw_left;
 extern "C" void spu_dbg_dump_ls(unsigned which, unsigned lsa, unsigned len, void (*out)(const char*));
 static void dbg_out_str(const char* s) { dbg_printf("%s", s); }
 extern "C" volatile int g_port_trace_left;
 extern "C" volatile unsigned long long g_pad_inj_until;
 extern "C" volatile unsigned int g_pad_inj_btn, g_pad_inj_sticks;
 extern "C" unsigned long long ps3_ms_now(void);
+extern "C" volatile unsigned long long g_dbg_ml_until;
+extern "C" volatile long g_kbm_ml_dx, g_kbm_ml_dy;
 /* While dump_threads holds a thread suspended, dbg_printf formats into this
  * buffer instead of a stream: the suspended thread may own stderr's CRT lock,
  * and writing then deadlocks the watchdog -- and with it every thread that
@@ -284,6 +289,11 @@ static void dbg_fkeep(const char* op)
         else if (!strcmp(op, "gt")) keep = f > c.second + 1e-6f * fabsf(c.second);
         else if (!strcmp(op, "eq")) keep = f == c.second;
         else if (!strcmp(op, "ne")) keep = f != c.second;
+        /* tolerant variants: values recomputed every frame jitter in the last bits */
+        else if (!strcmp(op, "near")) keep = fabsf(f - c.second) <= 2e-3f * (fabsf(c.second) > 1.0f ? fabsf(c.second) : 1.0f);
+        else if (!strcmp(op, "far")) keep = fabsf(f - c.second) > 0.03f;
+        else if (!strcmp(op, "gtf")) keep = f > c.second + 0.03f;
+        else if (!strcmp(op, "ltf")) keep = f < c.second - 0.03f;
         if (keep) s_fscan[k++] = {c.first, f};
     }
     s_fscan.resize(k);
@@ -803,7 +813,7 @@ static DWORD WINAPI pad_watch_thread(LPVOID) { pad_watch_run(); return 0; }
  * with a host stack (module RVAs) to logs\hwwatch_N.txt. Catches lifted PPU
  * stores and SPU DMA (memcpy under the MFC) alike. */
 static volatile LONG s_hw_busy = 0;
-static uint32_t s_hw_ea[4]; static unsigned s_hw_secs;
+static uint32_t s_hw_ea[4]; static unsigned s_hw_secs; static DWORD64 s_hw_rw = 1;
 static DWORD WINAPI hw_watch_thread(LPVOID)
 {
     static PVOID h = NULL;
@@ -812,7 +822,7 @@ static DWORD WINAPI hw_watch_thread(LPVOID)
     for (int k = 0; k < 4; k++) if (s_hw_ea[k]) a[k] = (DWORD64)(vm_base + (s_hw_ea[k] & ~3u));
     for (int k = 0; k < 4; k++) s_hw_watch_ea[k] = s_hw_ea[k] & ~3u;
     s_hw_nl = 0;
-    s_pw_n = 0; s_pw_rw = 1; s_pw_stack = 1; s_pw_on = 1;
+    s_pw_n = 0; s_pw_rw = s_hw_rw; s_pw_stack = 1; s_pw_on = 1;
     static DWORD tids[512]; int nt = 0;
     { HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
       THREADENTRY32 te; te.dwSize = sizeof te;
@@ -1097,6 +1107,17 @@ static DWORD WINAPI debug_console(LPVOID param)
         } else if (!strcmp(verb, "mtrace") && sscanf(cmd, "%*s %u", &a) == 1) {
             g_port_trace_left = (int)a;
             dbg_printf("  tracing the next %u FIFO methods into the run log%c", a, 10);
+        } else if (!strcmp(verb, "mouse")) {
+            /* mouse <dx> <dy> <ms>: inject mouse-look counts per 10 ms on the direct look (stubs.cpp r3_mouselook) */
+            int mdx = 0, mdy = 0; unsigned ms = 500;
+            sscanf(cmd, "%*s %d %d %u", &mdx, &mdy, &ms);
+            g_dbg_ml_until = GetTickCount64() + ms + 200;
+            static volatile LONG s_mdx, s_mdy; static volatile ULONGLONG s_mend;
+            s_mdx = mdx; s_mdy = mdy; s_mend = GetTickCount64() + ms;
+            CloseHandle(CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+                while (GetTickCount64() < s_mend) { InterlockedAdd(&g_kbm_ml_dx, s_mdx); InterlockedAdd(&g_kbm_ml_dy, s_mdy); Sleep(10); }
+                return 0; }, NULL, 0, NULL));
+            dbg_printf("  mouse %d,%d per 10 ms for %u ms%c", mdx, mdy, ms, 10);
         } else if (!strcmp(verb, "pad")) {
             /* pad <hexbuttons> <lx> <ly> <rx> <ry> <ms>: hold on port 0 (sticks 0..255, 128 = centre) */
             unsigned bt = 0, lx = 128, ly = 128, rx = 128, ry = 128, ms = 500;
@@ -1104,7 +1125,8 @@ static DWORD WINAPI debug_console(LPVOID param)
             g_pad_inj_btn = bt; g_pad_inj_sticks = ((lx & 255) << 24) | ((ly & 255) << 16) | ((rx & 255) << 8) | (ry & 255);
             g_pad_inj_until = ps3_ms_now() + ms;
             dbg_printf("  pad btn=0x%04X l=(%u,%u) r=(%u,%u) for %u ms%c", bt, lx, ly, rx, ry, ms, 10);
-        } else if (!strcmp(verb, "hwwatch") && sscanf(cmd, "%*s %x", &a) == 1) {
+        } else if ((!strcmp(verb, "hwwatch") || !strcmp(verb, "rwwatch")) && sscanf(cmd, "%*s %x", &a) == 1) {
+            s_hw_rw = verb[0] == 'r' ? 3 : 1;   /* rwwatch: reads too */
             uint32_t e2 = 0, e3 = 0, e4 = 0; unsigned secs = 3;
             sscanf(cmd, "%*s %*x %u %x %x %x", &secs, &e2, &e3, &e4);
             if (!vm_base) dbg_printf("  vm_base not live yet%c", 10);
@@ -1114,6 +1136,17 @@ static DWORD WINAPI debug_console(LPVOID param)
                 CloseHandle(CreateThread(NULL, 0, hw_watch_thread, NULL, 0, NULL));
                 dbg_printf("  hwwatch armed on 0x%08X for %u s -> logs\\hwwatch_N.txt%c", a, s_hw_secs, 10);
             }
+        } else if (!strcmp(verb, "dmawatch") && sscanf(cmd, "%*s %x %x %u", &a, &b, &c) == 3) {
+            unsigned img = 0; sscanf(cmd, "%*s %*x %*x %*u %u", &img);
+            g_dmaw_lo = a; g_dmaw_hi = b; g_dmaw_img = img; g_dmaw_left = (long)c;
+            dbg_printf("  dmawatch [0x%08X,0x%08X) img=%u next %u -> logs\\dmawatch.txt%c", a, b, img, c, 10);
+        } else if (!strcmp(verb, "finterp")) {
+            /* finterp <lo>[-<hi>] [0|1] | finterp off : run SPU images interpreted, live */
+            char spec[32] = {0}; int on = 1, lo = -1, hi = -1;
+            sscanf(cmd, "%*s %31s %d", spec, &on);
+            if (!strcmp(spec, "off")) spu_force_interp_set(-1, -1, 0);
+            else if (sscanf(spec, "%d-%d", &lo, &hi) >= 1) { if (hi < lo) hi = lo; spu_force_interp_set(lo, hi, on); }
+            dbg_printf("  finterp %s %d%c", spec, on, 10);
         } else if (!strcmp(verb, "spu")) {
             spu_dbg_dump_all(dbg_out_str);
         } else if (!strcmp(verb, "spuls") && sscanf(cmd, "%*s %u %x %u", &a, &b, &c) >= 2) {
