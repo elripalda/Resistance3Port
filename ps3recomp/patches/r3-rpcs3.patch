@@ -737,7 +737,7 @@ index 28d765f..24084a1 100644
  
  		cpu_range = address_range32(memory_range);
 diff --git a/rpcs3/Emu/RSX/Common/texture_cache.h b/rpcs3/Emu/RSX/Common/texture_cache.h
-index 2a88085..d20ceb2 100644
+index 2a88085..6ad809c 100644
 --- a/rpcs3/Emu/RSX/Common/texture_cache.h
 +++ b/rpcs3/Emu/RSX/Common/texture_cache.h
 @@ -15,6 +15,7 @@
@@ -828,26 +828,7 @@ index 2a88085..d20ceb2 100644
  			lock_memory_region_impl(cmd, image, rsx_range, is_active_surface, width, height, pitch, std::forward<Args>(extras)...);
  		}
  
-@@ -3330,6 +3374,18 @@ namespace rsx
- 			const address_range32 tex_range = address_range32::start_length(attributes.address, tex_size);
- 			invalidate_range_impl_base(cmd, tex_range, invalidation_cause::read, {}, std::forward<Args>(extras)...);
- 
-+			// Resistance port: R3_TEXLOG=<w>x<h> logs CPU uploads of that size (first 64).
-+			{
-+				static int s_w = -1, s_h = 0, s_n = 0;
-+				if (s_w < 0) { s_w = 0; if (const char* e = std::getenv("R3_TEXLOG")) std::sscanf(e, "%dx%d", &s_w, &s_h); }
-+				if (s_w && attributes.width == s_w && attributes.height == s_h && s_n < 64)
-+				{
-+					s_n++;
-+					std::fprintf(stderr, "[texlog] cpu upload addr=0x%08X %ux%u pitch=%u fmt=0x%X swz=%d size=0x%X\n",
-+						attributes.address, attributes.width, attributes.height, attributes.pitch, attributes.gcm_format, attributes.swizzled ? 1 : 0, tex_size);
-+				}
-+			}
-+
- 			// Upload from CPU. Note that sRGB conversion is handled in the FS
- 			auto uploaded = upload_image_from_cpu(cmd, tex_range, attributes.width, attributes.height, attributes.depth, tex.get_exact_mipmap_count(), attributes.pitch, attributes.gcm_format,
- 				texture_upload_context::shader_read, subresources_layout, extended_dimension, attributes.swizzled);
-@@ -3382,6 +3438,14 @@ namespace rsx
+@@ -3382,6 +3426,14 @@ namespace rsx
  			u16 dst_w = dst.clip_width;
  			u16 dst_h = dst.clip_height;
  
@@ -862,7 +843,7 @@ index 2a88085..d20ceb2 100644
  			blit_engine_helpers::apply_pixel_transforms(src, dst, typeless_info, src_address, src_w, src_h, src_bpp);
  
  			const auto get_tiled_region = [&](const utils::address_range32& range)
-@@ -3409,6 +3473,21 @@ namespace rsx
+@@ -3409,6 +3461,21 @@ namespace rsx
  			dst_subres = blit_engine_internals::rtt_lookup(m_rtts, cmd, dst_address, dst_w, dst_h, dst.pitch, dst_bpp, surface_access::transfer_write, false, scale_x, scale_y);
  			dst_is_render_target = dst_subres.surface != nullptr;
  
@@ -1096,29 +1077,10 @@ index 4176076..397d172 100644
  		}
  		else
 diff --git a/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp b/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp
-index af17bac..6a9b5e6 100644
+index af17bac..fa01cfc 100644
 --- a/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp
 +++ b/rpcs3/Emu/RSX/Core/RSXGraphEngine.cpp
-@@ -485,6 +485,18 @@ namespace rsx
- 
- 			ensure(layout.color_addresses[index]);
- 
-+			// Resistance port: R3_WATCH=<lo>-<hi> logs render targets bound in that range (first 64).
-+			{
-+				static u32 s_lo = 1, s_hi = 0; static int s_n = 0;
-+				if (s_lo == 1) { s_lo = 0; if (const char* e = std::getenv("R3_WATCH")) { char* d; s_lo = static_cast<u32>(std::strtoul(e, &d, 16)); if (*d == '-') s_hi = static_cast<u32>(std::strtoul(d + 1, nullptr, 16)); } }
-+				const u32 a = layout.color_addresses[index];
-+				if (s_hi && a < s_hi && a + layout.color_pitch[index] * layout.height > s_lo && s_n < 64)
-+				{
-+					s_n++;
-+					std::fprintf(stderr, "[r3watch] RT%d addr=0x%08X %ux%u pitch=%u fmt=%d\n", static_cast<int>(index), a, layout.width, layout.height, layout.color_pitch[index], static_cast<int>(layout.color_format));
-+				}
-+			}
-+
- 			const auto packed_pitch = (layout.width * color_texel_size);
- 			if (packed_render)
- 			{
-@@ -1148,6 +1160,10 @@ namespace rsx
+@@ -1148,6 +1148,10 @@ namespace rsx
  		m_ctx->program.fragment_program.ctrl &= fs_export_config_mask;
  		m_ctx->program.fragment_program.ctrl |= REGS(m_ctx)->shader_control() & (CELL_GCM_SHADER_CONTROL_32_BITS_EXPORTS | CELL_GCM_SHADER_CONTROL_DEPTH_EXPORT | RSX_SHADER_CONTROL_USES_KIL);
  		m_ctx->program.fragment_program.texcoord_control_mask = REGS(m_ctx)->texcoord_control_mask();
@@ -1129,53 +1091,6 @@ index af17bac..6a9b5e6 100644
  		m_ctx->program.fragment_program.two_sided_lighting = REGS(m_ctx)->two_side_light_en();
  		m_ctx->program.fragment_program.mrt_buffers_count = rsx::utility::get_mrt_buffers_count(REGS(m_ctx)->surface_color_target());
  
-diff --git a/rpcs3/Emu/RSX/NV47/HW/nv0039.cpp b/rpcs3/Emu/RSX/NV47/HW/nv0039.cpp
-index 96c2c12..c8c40aa 100644
---- a/rpcs3/Emu/RSX/NV47/HW/nv0039.cpp
-+++ b/rpcs3/Emu/RSX/NV47/HW/nv0039.cpp
-@@ -101,6 +101,17 @@ namespace rsx
- 			const auto read_length = in_pitch * (line_count - 1) + in_width_in_bytes;
- 			const auto write_length = out_pitch * (line_count - 1) + out_width_in_bytes;
- 
-+			// Resistance port: R3_WATCH=<lo>-<hi> logs memory copies writing that range (first 64).
-+			{
-+				static u32 s_lo = 1, s_hi = 0; static int s_n = 0;
-+				if (s_lo == 1) { s_lo = 0; if (const char* e = std::getenv("R3_WATCH")) { char* d; s_lo = static_cast<u32>(std::strtoul(e, &d, 16)); if (*d == '-') s_hi = static_cast<u32>(std::strtoul(d + 1, nullptr, 16)); } }
-+				if (s_hi && write_address < s_hi && write_address + write_length > s_lo && s_n < 64)
-+				{
-+					s_n++;
-+					std::fprintf(stderr, "[r3watch] nv0039 src=0x%08X dst=0x%08X inpitch=%d outpitch=%d linelen=%u lines=%u\n", read_address, write_address, in_pitch, out_pitch, line_length, line_count);
-+				}
-+			}
-+
- 			RSX(ctx)->invalidate_fragment_program(dst_dma, dst_offset, write_length);
- 
- 			if (const auto result = RSX(ctx)->read_barrier(read_address, read_length, !is_block_transfer);
-diff --git a/rpcs3/Emu/RSX/NV47/HW/nv3089.cpp b/rpcs3/Emu/RSX/NV47/HW/nv3089.cpp
-index 311a8ec..3f94669 100644
---- a/rpcs3/Emu/RSX/NV47/HW/nv3089.cpp
-+++ b/rpcs3/Emu/RSX/NV47/HW/nv3089.cpp
-@@ -585,6 +585,20 @@ namespace rsx
- 			// Lock here. RSX cannot execute any locking operations from this point, including ZCULL read barriers
- 			const u32 read_length = src.pitch * src.height;
- 			const u32 write_length = dst.pitch * dst.clip_height;
-+
-+			// Resistance port: R3_WATCH=<lo>-<hi> logs blits writing that range (first 64).
-+			{
-+				static u32 s_lo = 1, s_hi = 0; static int s_n = 0;
-+				if (s_lo == 1) { s_lo = 0; if (const char* e = std::getenv("R3_WATCH")) { char* d; s_lo = static_cast<u32>(std::strtoul(e, &d, 16)); if (*d == '-') s_hi = static_cast<u32>(std::strtoul(d + 1, nullptr, 16)); } }
-+				if (s_hi && dst.rsx_address < s_hi && dst.rsx_address + write_length > s_lo && s_n < 64)
-+				{
-+					s_n++;
-+					std::fprintf(stderr, "[r3watch] nv3089 src=0x%08X %ux%u pitch=%u dma=0x%X -> dst=0x%08X clip=%ux%u pitch=%u dma=0x%X swz=%d\n",
-+						src.rsx_address, src.width, src.height, src.pitch, src.dma, dst.rsx_address, dst.clip_width, dst.clip_height, dst.pitch, dst.dma,
-+						REGS(ctx)->blit_engine_context_surface() == blit_engine::context_surface::swizzle2d ? 1 : 0);
-+				}
-+			}
-+
- 			auto res = ::rsx::reservation_lock<true>(
- 				dst.rsx_address, write_length,
- 				src.rsx_address, read_length);
 diff --git a/rpcs3/Emu/RSX/Program/GLSLCommon.cpp b/rpcs3/Emu/RSX/Program/GLSLCommon.cpp
 index 37bbff0..91bb67a 100644
 --- a/rpcs3/Emu/RSX/Program/GLSLCommon.cpp
