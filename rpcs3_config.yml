@@ -201,7 +201,7 @@ Video:
   Disable ZCull Occlusion Queries: false
   Driver Recovery Timeout: 1000000
   Driver Wake-Up Delay: 1
-  Emulate Special Depth Comparison: false
+  Emulate Special Depth Comparison: true
   Enable Frame Skip: false
   FidelityFX CAS Sharpening Intensity: 50
   Force CPU Blit: false
