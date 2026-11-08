@@ -1381,6 +1381,20 @@ index 107f5b2..39a9d7c 100644
  			if (capture_current_frame) [[unlikely]]
  			{
  				const u32 reg = (command.reg & 0xfffc) >> 2;
+diff --git a/rpcs3/Emu/RSX/RSXOffload.cpp b/rpcs3/Emu/RSX/RSXOffload.cpp
+index 493fc8c..caac87e 100644
+--- a/rpcs3/Emu/RSX/RSXOffload.cpp
++++ b/rpcs3/Emu/RSX/RSXOffload.cpp
+@@ -79,7 +79,8 @@ namespace rsx
+ 				if (m_enqueued_count.load() == m_processed_count.load())
+ 				{
+ 					m_processed_count.notify_all();
+-					std::this_thread::yield();
++					// Port: sleep until push() signals instead of spinning on yield (was ~1 core of idle spin)
++					thread_ctrl::wait_on(m_work_queue.get_wait_atomic(), 0u, 1000);
+ 				}
+ 			}
+ 
 diff --git a/rpcs3/Emu/RSX/RSXThread.cpp b/rpcs3/Emu/RSX/RSXThread.cpp
 index a572df4..a4ba7bc 100644
 --- a/rpcs3/Emu/RSX/RSXThread.cpp
