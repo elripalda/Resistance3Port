@@ -809,6 +809,11 @@ static void spu_putllc_fail_note(spu_context* ctx, uint32_t ea)
     InterlockedExchange(&s_lock, 0);
 }
 
+static int s_llpoll_low = -1;
+static SPU_THREAD_LOCAL uint32_t t_llpoll_ea;
+static SPU_THREAD_LOCAL unsigned t_llpoll_same;
+static SPU_THREAD_LOCAL uint8_t t_llpoll_prev[MFC_ATOMIC_LINE];
+
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
     /* Classify FIRST. Every MFC_Cmd write lands here, and only the switch at
@@ -972,6 +977,13 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * peer that must WRITE the line waits for it (canersaka ticks the
          * GETLLAR fast+slow paths for exactly this reason). */
         yz_lockstep_tick(ctx);
+        /* Low-core CPUs: GETLLAR polling detection (as RPCS3's). An SPU that
+         * keeps re-reading an unchanged line is spin-waiting on another thread;
+         * offer it the core BEFORE the read, so the line and the reservation
+         * stay fresh (yielding between GETLLAR and PUTLLC widened the window
+         * for a stale-data race and crashed R2's job kernel). */
+        if (s_llpoll_low < 0) s_llpoll_low = !ps3_host_prio_boost();
+        if (s_llpoll_low && ea == t_llpoll_ea && t_llpoll_same >= 16) SwitchToThread();
         spu_lockline_lock();
         /* Tell the PPU store paths this line is live, so a store into it goes
          * through the lock and raises SPU_EVENT_LR here instead of landing
@@ -1026,19 +1038,11 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
         spu_lockline_unlock();
-        /* Low-core CPUs: GETLLAR polling detection (as RPCS3's). An SPU that
-         * re-reads an unchanged line is spin-waiting on another thread; after a
-         * few rounds offer the core to it (returns at once if nothing waits).
-         * On 4 cores R2's raw SPU program held ~80% of a core this way. */
-        { static int s_lowc = -1;
-          if (s_lowc < 0) s_lowc = !ps3_host_prio_boost();
-          if (s_lowc) {
-              static SPU_THREAD_LOCAL uint32_t t_pea; static SPU_THREAD_LOCAL unsigned t_same;
-              static SPU_THREAD_LOCAL uint8_t t_prev[MFC_ATOMIC_LINE];
-              if (ea == t_pea && !memcmp(t_prev, ls, MFC_ATOMIC_LINE)) {
-                  if (++t_same >= 16) SwitchToThread();
-              } else { t_pea = ea; t_same = 0; memcpy(t_prev, ls, MFC_ATOMIC_LINE); }
-          } }
+        /* Polling detection, part 2: count re-reads of an unchanged line. */
+        if (s_llpoll_low) {
+            if (ea == t_llpoll_ea && !memcmp(t_llpoll_prev, ls, MFC_ATOMIC_LINE)) t_llpoll_same++;
+            else { t_llpoll_ea = ea; t_llpoll_same = 0; memcpy(t_llpoll_prev, ls, MFC_ATOMIC_LINE); }
+        }
         /* SPU_LLARWATCH=<hex EA>: every GETLLAR of that line, with the LSA it
          * used and the first word as it lands in BOTH places.
          *

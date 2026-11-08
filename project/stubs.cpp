@@ -420,18 +420,35 @@ extern "C" int port_frame_wait(uint64_t target, uint32_t last_ea)
 {
     port_fps_init();
     if (s_rf_mode < 0) return 0;
-    const uint64_t last = vm_read64(last_ea);
+    /* A fixed schedule, not "target after the previous flip": in heavy scenes
+     * frames alternate between waiting on the RSX and running straight
+     * through, and timing each from the previous (late) flip slept after every
+     * quick frame, throwing away the time the slow one had already lost. The
+     * debt is capped at one frame, so a stall never turns into a burst.
+     * PORT_PACE_FLIP=1 restores the old flip-relative wait. */
+    static int s_flip = -1;
+    if (s_flip < 0) { const char* e = getenv("PORT_PACE_FLIP"); s_flip = e && atoi(e) > 0; }
+    static uint64_t s_next = 0;
+    const uint64_t last = s_flip ? vm_read64(last_ea) : 0;
     for (;;) {
         const uint64_t now = ppu_timebase_now();
-        const uint64_t el = now - last;
-        if (el >= target) break;
-        const double rem_us = (double)(target - el) / 79.8;
+        uint64_t rem;
+        if (s_flip) { const uint64_t el = now - last; if (el >= target) break; rem = target - el; }
+        else { if (!s_next || now >= s_next) break; rem = s_next - now; }
+        const double rem_us = (double)rem / 79.8;
         ppu_gcm_pump();                       /* the usleep loop pumped vblank/flip work */
 #ifdef _WIN32
         if (rem_us > 2600.0) Sleep((DWORD)(rem_us / 1000.0) - 1u);
         else if (rem_us > 150.0) SwitchToThread();
         else YieldProcessor();
 #endif
+    }
+    if (!s_flip) {
+        const uint64_t now = ppu_timebase_now();
+        if (!s_next) s_next = now;
+        s_next += target;
+        if (s_next + target < now) s_next = now - target;
+        if (s_next > now + target) s_next = now + target;   /* target shrank (menu -> game) */
     }
     /* frame pacing stats, every 5 s: frames, mean and worst frame time */
     { static uint64_t t0 = 0, prev = 0, worst = 0; static unsigned n = 0; static double sum = 0;
