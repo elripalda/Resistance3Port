@@ -41,6 +41,18 @@ typedef struct rsx_fp_constant_block {
  * word. The decoder operates on host-order words. */
 u32 rsx_fp_read_word(const u8* p);
 u32 rsx_fp_sanitize_constant_word(u32 w);
+/* Internal-resolution scale the generated WPOS / unnormalised lookups divide
+ * by. Default: RSX_RES_SCALE (the D3D12 backend scales its surfaces); a
+ * backend that renders at guest resolution sets 1 before compiling. */
+void rsx_fp_set_res_scale(double scale);
+/* 1: engine-path shaders take the scale per draw from PSConstants: after
+ * fp_alpha, float4 fp_rscale[5] -- [0].x = 1 / the colour target's scale,
+ * [1 + u/4][u%4] = 1 / texture unit u's. */
+void rsx_fp_set_res_scale_dynamic(int on);
+/* Texture units whose TEXTURE_FORMAT dimension is 1 (not cube/volume): the
+ * next decompile samples them at float2(coord.x, 0.5) -- RPCS3's TEX1D*
+ * read .x only. 0 (the default) is every unit 2D. */
+void rsx_fp_set_tex_1d_mask(u32 mask);
 extern unsigned long long g_rsx_fp_nonfinite_constants;
 
 /* Decompile an NV40 fragment program into an HLSL pixel shader.
@@ -92,6 +104,15 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
  * the buffer would overflow. A no-op when unnorm_mask is 0. */
 int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
                               const u32 dim[][2], u32 cube_mask);
+/* As above; units in nearest_mask (min or mag filter NEAREST) also get
+ * RPCS3's subpixel bias, (coord + 0.01) / size. */
+int rsx_fp_apply_unnorm_scale_ex(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+                                 const u32 dim[][2], u32 cube_mask, u32 nearest_mask);
+/* As _ex; units in vol_mask are Texture3D and scale all three coordinates,
+ * the third by 1 / vol_depth[u]. */
+int rsx_fp_apply_unnorm_scale_vol(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+                                  const u32 dim[][2], u32 cube_mask, u32 nearest_mask,
+                                  u32 vol_mask, const u32* vol_depth);
 
 /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
@@ -123,17 +144,28 @@ int rsx_fp_decompile_buffered_ex(
     char* out, u32 out_size, u32* out_constant_count);
 
 /* Native depth texture comparison metadata. Disabled descriptors preserve the
- * original shader byte-for-byte. enabled=2 marks an active unsupported layout.
- * RSX ADDRESS zfunc0/7 and texture alpha-kill bypass comparison; modes1..6
- * compare the source reference against stored depth. R32 color snapshots are
- * sampled explicitly, so no native depth texture/SampleCmp binding is needed.
- * Supported: decoded D24_D8/D16, 2D TEX/TXP, one level, matching nearest or
- * linear min/mag filters. Float-depth formats, cubes/3D, multiple levels and
- * other texture opcodes reject translation when comparison is active.
- * The shared engine and legacy Metal supply this state; other legacy backend
- * paths retain their existing behavior until they adopt the metadata API. */
+ * original shader byte-for-byte. RSX ADDRESS zfunc 0 / 7..15 and texture
+ * alpha-kill bypass comparison; modes 1..6 compare the source reference
+ * against stored depth. R32 color snapshots are sampled explicitly, so no
+ * native depth texture/SampleCmp binding is needed.
+ * As RPCS3 (RSXGraphEngine.cpp:1303-1345, GLSLCommon.cpp:596-616,
+ * RSXFragmentTextureOps.glsl:100-222):
+ *  - D24_D8 / D16 clamp the reference to [0,1]; DEPTH24_D8_FLOAT /
+ *    DEPTH16_FLOAT (depth_float) compare it unclamped;
+ *  - 2D units compare (xyz) / TXP (xyz / w) with implicit LOD;
+ *  - cube units compare direction xyz against reference w (TEX3D_SHADOW);
+ *    a cube TXP (RPCS3 "impossible") samples normally;
+ *  - 1D and 3D units have no RPCS3 compare form and sample normally
+ *    (rsx_fp_shadow_desc_from_texture leaves them disabled);
+ *  - min filter LINEAR / *_LINEAR mips / CONVOLUTION and mag LINEAR /
+ *    CONVOLUTION filter the compared taps.
+ * A shadow unit never fails translation. RSX_FP_SHADOW_EXT=0 restores the
+ * old 2D-integer-only contract (enabled=2 for anything else, translation
+ * rejected). The shared engine and legacy Metal supply this state. */
 typedef struct rsx_fp_shadow_desc {
     u8 enabled, func, linear, unnormalized;
+    u8 depth_float;   /* DEPTH16_FLOAT / DEPTH24_D8_FLOAT: unclamped reference */
+    u8 pad[3];
 } rsx_fp_shadow_desc;
 void rsx_fp_shadow_desc_from_texture(rsx_fp_shadow_desc* out, u32 format,
     u32 dimension, u32 cube, u32 mips, u32 filter, u32 address, u32 control0);
@@ -232,6 +264,110 @@ int rsx_fp_decompile_buffered_shadow_color_ex(
     const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask,
     const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
     char* out, u32 out_size, u32* out_constant_count);
+
+/* Fixed-function fragment state RPCS3 emulates in the shader (RSXGraphEngine
+ * get_current_fragment_program, RSXFragmentPrologue/ROPPrologue/ROPEpilogue,
+ * _process_texel). Buffered form only: the dynamic parts live in fp_alpha,
+ * which the caller fills per draw as
+ *   x = alpha ref, y = FOG_PARAMS[0], z = FOG_PARAMS[1],
+ *   w = WPOS y bias (origin bottom ? SHADER_WINDOW height : 0, less 0.5 for
+ *       an integer pixel centre).
+ * Zeroed fields leave the program as the plain buffered entry point emits it. */
+typedef struct rsx_fp_frag_state {
+    u32 fog_mode;            /* NV4097_SET_FOG_MODE, used when fog is set */
+    u32 stipple_pattern[32]; /* NV4097_SET_POLYGON_STIPPLE_PATTERN rows */
+    u16 texcoord_2d_mask;    /* NV4097_SET_TEX_COORD_CONTROL bit 0, per TC0..9 */
+    u16 alpha_kill_mask;     /* TEXTURE_CONTROL0 bit 2, per unit */
+    u8  sext_masks[16];      /* rsx_fp_texture_sext_mask per unit */
+    u8  fog;                 /* FOGC reads go through RPCS3 fetch_fog_value */
+    u8  wpos;                /* WPOS emulated from SHADER_WINDOW */
+    u8  wpos_origin_bottom;
+    u8  wpos_center_integer;
+    u8  two_sided;           /* TWO_SIDE_LIGHT_EN: back colours on back faces */
+    u8  stipple;             /* polygon stipple test (polygon primitives) */
+    u8  mrt_count;           /* surface colour targets; each one is written */
+    u8  rop_round;           /* 8-bit framebuffer output quantisation */
+    u8  alpha_to_coverage;   /* stochastic A2C emulation */
+    u8  alpha_to_one;
+    /* RPCS3 RSX_SHADER_CONTROL_ROP_OUTPUT_REMAP (RSXROPEpilogue.glsl
+     * remap_ROP_output, after the alpha test): 0 RGBA, 1 BBBB (B8),
+     * 2 GBGB as .bgbg (G8B8), 3 RGB0 (X..Z formats), 4 RGB1 (X..O). */
+    u8  rop_remap;
+    /* RPCS3 emulate_depth_compare (RSX_SHADER_CONTROL_EMULATE_DEPTH_COMPARE):
+     * a depth-EQUAL polygon draw reads the bound depth (a snapshot bound at
+     * texture unit depth_compare_unit) and exports it when within one LSB
+     * of the fragment's depth (24-bit or 16-bit zeta). */
+    u8  depth_compare;
+    u8  depth_compare_unit;
+    u8  depth_compare_24;
+    /* RPCS3 RSX_SHADER_CONTROL_FLAT_SHADING (SHADE_MODE FLAT, only with a
+     * last-vertex provoking convention): COL0/COL1 and the back colours are
+     * declared `nointerpolation` (GLSLCommon.cpp:738). */
+    u8  flat_shade;
+    /* TEX_COORD_CONTROL bit 4 per TC0..9, only for AA polygon draws: the
+     * input is declared `centroid`. */
+    u16 centroid_mask;
+    /* NV4097_SET_POINT_SPRITE_CONTROL on a point draw (RPCS3
+     * texcoord_is_point_coord): bit N replaces TCN by the sprite coordinate,
+     * (PointCoord, r, q) or, under texcoord_2d_mask, (PointCoord, 0, w).
+     * RMODE is ignored, as RPCS3 does. Needs a glslang target: the coordinate input
+     * is RSX_SPIRV_POINTCOORD_LOCATION, rewritten to BuiltIn PointCoord. */
+    u16 point_sprite_mask;
+    u8  point_sprite_rmode;  /* unused: RPCS3 ignores RMODE */
+    /* RPCS3 VKFragmentProgram.cpp:407 low_precision_tests (NVIDIA without
+     * RSX_SHADER_CONTROL_ATTRIBUTE_INTERPOLATION, i.e. point and line draws
+     * on a barycentric-capable NVIDIA device, RSXGraphEngine.cpp:1159-1165):
+     * SEQ..SNE and the alpha test compare CMP_FIXUP'd operands. */
+    u8  low_precision_tests;
+    /* RPCS3 enables _GPU_LOW_PRECISION_COMPARE (VKFragmentProgram.cpp:407)
+     * and has_low_precision_rounding (VKFragmentProgram.cpp:638, the FLR
+     * floor(x + 0.000001) bias) only on NVIDIA hosts. 1 = the host GPU is
+     * not NVIDIA (Vulkan vendorID != 0x10DE): neither is emitted. 0 (the
+     * default) keeps both on, as before. */
+    u8  host_not_nvidia;
+    u8  pad1;
+    /* EXP_TEX (_bx2) gating per unit, RPCS3 _enable_texture_expand: 0 =
+     * every lane; 0x10 | lanes = biased-renormalisation format, expand the
+     * RGBA lanes the remap takes from the texture; 0x20 = format without
+     * BIASED_RENORMALIZATION, _bx2 ignored. */
+    u8  bx2_lanes[16];
+    /* RPCS3 RSX_SHADER_CONTROL_PROGRAMMABLE_BLENDING (RSXProgrammableBlend
+     * Prologue.glsl do_blend, applied after the alpha test and before the
+     * output remap, RSXROPEpilogue.glsl:52-58): colour target 0 blends in
+     * the shader against the destination read from a copy of the target
+     * bound at texture unit pb_unit, loaded at the fragment's pixel. pb_eq /
+     * pb_sf / pb_df are the BLEND_EQUATION / SFACTOR / DFACTOR halves
+     * ([0] RGB, [1] alpha), pb_const the CONSTANT_* colour, pb_int an
+     * integer framebuffer (INT_FRAMEBUFFER_BIT: saturation and rounding). */
+    u8  pb;
+    u8  pb_unit;
+    u8  pb_int;
+    u8  pad2;
+    u16 pb_eq[2];
+    u16 pb_sf[2];
+    u16 pb_df[2];
+    float pb_const[4];
+} rsx_fp_frag_state;
+
+/* Input registers (bit = OPDEST.INPUT_SRC) the program's sources read. */
+u32 rsx_fp_input_mask(const u8* ucode, u32 max_bytes);
+/* ARGB8_SIGNED (FILTER [31:28]) as a post-remap RGBA lane mask, bit 4 for
+ * 16-bit channels; 0 for formats without RSX_FORMAT_FEATURE_SIGNED_COMPONENTS. */
+u8 rsx_fp_texture_sext_mask(u32 format, u32 control1, u32 filter);
+int rsx_fp_decompile_engine(
+    const u8* ucode, u32 max_bytes, u32 ctrl, u32 tex_cube_mask, u32 tex_vol_mask,
+    const rsx_fp_shadow_desc shadow[16], const u8 gamma_masks[16],
+    const u8 expand_masks[16], const rsx_fp_frag_state* fs,
+    char* out, u32 out_size, u32* out_constant_count);
+/* ROP stages around the alpha test, in RPCS3's order: stage 0 (8-bit output
+ * rounding) after sRGB output and before rsx_fp_apply_alpha_test_buffered,
+ * stage 1 (alpha-to-coverage then alpha-to-one) after it. Returns 1 when
+ * applied, 0 when the state needs nothing, -1 without mutation on failure. */
+int rsx_fp_apply_rop_stage(char* hlsl, u32 capacity, const rsx_fp_frag_state* fs,
+                           int stage);
+/* Add back colours (VP o3/o4) to a rsx_vp_decompile_* VSOutput, for a
+ * two-sided fragment program from rsx_fp_decompile_engine. */
+int rsx_fp_patch_vs_back_colors(char* vs_hlsl, u32 capacity);
 
 /* Return the mnemonic for an NV40 fragment opcode (or "?" if unknown).
  * Useful for disassembly/logging. */

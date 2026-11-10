@@ -398,6 +398,23 @@ static void test_ack_keeps_a_concurrent_raise(void)
     while (!g_ack_entered) YieldProcessor();
     Sleep(2);                              /* time to arrive at the lock */
 
+    /* SPU_FAST_ACK (default on) acks with an interlocked AND, which cannot drop
+     * a concurrent interlocked-OR raise, so it no longer takes the lock: the
+     * ack is done by now and the raise must still land and stay. */
+    { const char* e = getenv("SPU_FAST_ACK");
+      if (!e || atoi(e) != 0) {
+          TEST("fast acknowledge completes without the lock-line lock");
+          CHECK(g_ack_done == 1);
+          CHECK_EQ_U32(g_a.event_status, 0);
+          spu_coh_notify_write(LINE_A);
+          spu_lockline_unlock();
+          pthread_join(t, NULL);
+          TEST("the acknowledge clears what it asked for and keeps the raise");
+          CHECK_EQ_U32(g_a.event_status, SPU_EVENT_LR);
+          CHECK(g_a.resv_valid == 0);
+          return;
+      } }
+
     TEST("the acknowledge cannot complete while the lock-line lock is held");
     CHECK(g_ack_done == 0);
     CHECK_EQ_U32(g_a.event_status, ACK_TAG_EVENT);
@@ -415,6 +432,43 @@ static void test_ack_keeps_a_concurrent_raise(void)
     CHECK(g_a.resv_valid == 0);
 }
 
+/* The same property raced for real: one thread raises and acks the tag event
+ * in a loop while another raises the LR bit and checks it is still there. A
+ * plain read-modify-write in the acknowledge loses some of those raises. */
+static volatile LONG g_storm_stop;
+static void* ack_storm_thread(void* arg)
+{
+    (void)arg;
+    while (!g_storm_stop) {
+        SPU_EVENT_SET(&g_a, ACK_TAG_EVENT);
+        wrch(&g_a, SPU_WrEventAck, ACK_TAG_EVENT);
+    }
+    return NULL;
+}
+
+static void test_ack_storm_keeps_raises(void)
+{
+    reset_pair();
+    g_storm_stop = 0;
+    pthread_t t;
+    if (pthread_create(&t, NULL, ack_storm_thread, NULL) != 0) {
+        TEST("the ack storm thread starts");
+        CHECK(0);
+        return;
+    }
+    unsigned lost = 0;
+    for (int i = 0; i < 200000; i++) {
+        SPU_EVENT_SET(&g_a, SPU_EVENT_LR);
+        for (int k = 0; k < 8; k++) YieldProcessor();
+        if (!(g_a.event_status & SPU_EVENT_LR)) lost++;
+        SPU_EVENT_CLEAR(&g_a, SPU_EVENT_LR);
+    }
+    g_storm_stop = 1;
+    pthread_join(t, NULL);
+    TEST("a racing acknowledge never drops an LR raise");
+    CHECK_EQ_U32(lost, 0);
+}
+
 /* ===========================================================================
  * main
  * ===========================================================================*/
@@ -427,6 +481,7 @@ int main(void)
     test_plain_put_elsewhere_is_quiet();
     test_wide_put_finds_the_reserved_line();
     test_ack_keeps_a_concurrent_raise();
+    test_ack_storm_keeps_raises();
 
     printf("\nSPU-to-SPU lock-line coherence tests: %d passed, %d failed\n",
            g_pass, g_fail);

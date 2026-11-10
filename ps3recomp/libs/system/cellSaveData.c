@@ -16,6 +16,9 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <time.h>
+#ifdef _WIN32
+#include <intrin.h>
+#endif
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros (st_atim.tv_sec
  * etc.) that collide with the identically named members of CellSaveData*Stat; undef
@@ -718,7 +721,18 @@ static s32 process_file_op(const char* save_path, CellSaveDataFileSet* set)
         }
         size_t read_size = (size_t)set->fileSize;
         if (read_size > set->fileBufSize) read_size = set->fileBufSize;
-        size_t got = fread(set->fileBuf, 1, read_size, fp);
+        /* Through a host buffer: the kernel cannot write a guest page the RSX
+         * texture cache or WCB has protected; a user-mode memcpy faults into
+         * the VM hook, which invalidates and opens it. */
+        size_t got = 0;
+        u8* bounce = read_size ? (u8*)malloc(read_size) : NULL;
+        if (bounce) {
+            got = fread(bounce, 1, read_size, fp);
+            memcpy(set->fileBuf, bounce, got);
+            free(bounce);
+        } else {
+            got = fread(set->fileBuf, 1, read_size, fp);
+        }
         int failed = ferror(fp);
         if (fclose(fp) != 0) failed = 1;
         return failed ? CELL_SAVEDATA_ERROR_ACCESS_ERROR : (s32)got;
@@ -857,12 +871,39 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     }
 }
 
-/* Core save/load implementation shared by List/Fixed/Auto variants */
+/* PC port: saves in progress (project/r2_pcport.cpp waits for 0 before it quits). */
+volatile long g_savedata_busy = 0;
+static s32 savedata_execute_body(const char* dirName, int is_save,
+                                  CellSaveDataSetBuf* setBuf,
+                                  CellSaveDataStatCallback funcStat,
+                                  CellSaveDataFileCallback funcFile,
+                                  void* userdata);
 static s32 savedata_execute(const char* dirName, int is_save,
                              CellSaveDataSetBuf* setBuf,
                              CellSaveDataStatCallback funcStat,
                              CellSaveDataFileCallback funcFile,
                              void* userdata)
+{
+#ifdef _WIN32
+    _InterlockedIncrement(&g_savedata_busy);
+#else
+    __sync_fetch_and_add(&g_savedata_busy, 1);
+#endif
+    const s32 r = savedata_execute_body(dirName, is_save, setBuf, funcStat, funcFile, userdata);
+#ifdef _WIN32
+    _InterlockedDecrement(&g_savedata_busy);
+#else
+    __sync_fetch_and_sub(&g_savedata_busy, 1);
+#endif
+    return r;
+}
+
+/* Core save/load implementation shared by List/Fixed/Auto variants */
+static s32 savedata_execute_body(const char* dirName, int is_save,
+                                  CellSaveDataSetBuf* setBuf,
+                                  CellSaveDataStatCallback funcStat,
+                                  CellSaveDataFileCallback funcFile,
+                                  void* userdata)
 {
     if (!dirName || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;

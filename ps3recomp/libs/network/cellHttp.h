@@ -34,6 +34,10 @@ extern "C" {
  * one titles compare the result with before reading the body to the end; the
  * SDK's own name for it is not confirmed here. */
 #define CELL_HTTP_ERROR_NO_CONTENT_LENGTH       0x80710017
+#define CELL_HTTP_ERROR_BAD_CLIENT              0x80710010
+#define CELL_HTTP_ERROR_NO_CONNECTION           0x80710012
+#define CELL_HTTP_ERROR_NET_SELECT              0x80710800
+#define CELL_HTTP_ERROR_NET_SELECT_TIMEOUT      0x80710093
 
 /* ---------------------------------------------------------------------------
  * HTTP methods
@@ -122,6 +126,7 @@ s32 cellHttpSetRequestContentLength(CellHttpTransId transId, u64 length);
 s32 cellHttpAddRequestHeader(CellHttpTransId transId, const char* name,
                              const char* value);
 s32 cellHttpAbortTransaction(CellHttpTransId transId);
+s32 cellHttpClientPollConnections(CellHttpClientId clientId, CellHttpTransId* transId, s64 usec);
 
 #ifdef __cplusplus
 }

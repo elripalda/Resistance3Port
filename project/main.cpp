@@ -87,6 +87,10 @@ uint8_t* vm_base = nullptr;
 uint8_t* vm_sudo_base = nullptr;
 /* RSX page-protection fault handler: guest address, 1 = write. Returns 1 if handled. */
 int (*g_vm_access_violation_hook)(uint32_t guest_addr, int is_write) = nullptr;
+/* Unclaimed protection fault on a guarded page: the RSX page-guard registry
+ * re-applies (or drops) the page's protection itself (rsx_page_guard_reconcile;
+ * set by the engine). Returns 1 when the access can be retried. */
+int (*g_vm_guard_reconcile_hook)(uint32_t guest_addr, int is_write) = nullptr;
 extern uint32_t ppu_vm_size;                  /* ppu_loader.cpp: the OOB guard */
 extern uint32_t ppu_hle_inject_base;          /* cellGcmSys.c (v163 boot check) */
 
@@ -102,10 +106,18 @@ uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
 /* The GCM half of the frame clock. */
 void     cellGcmTickVBlank(void);
 void     cellGcmTickFlip(void);
+int      cellGcm_flip_pace_poll(long long now_us, long long period_us);
 int      cellGcm_take_flip_pending(void);
+double   r2_fps_target(void);                 /* stubs.cpp: 0 = uncapped */
+double   r2_display_refresh_hz(void);
+void     r3_patches_apply(void);              /* r3_patches.cpp */
 void     cellGcm_rsx_process_fifo(void);      /* drain get -> put */
 unsigned cellGcm_flip_request_count(void);
 }
+
+/* CPU detection, PORT_CPU_PROFILE and thread placement (runs first in main). */
+#include "cpu_profile.inc"
+#include "r2_autoconfig.h"
 
 /* ---------------------------------------------------------------------------
  * RSX present backend
@@ -195,6 +207,64 @@ extern "C" unsigned cellGcmGetCurrentDisplayBufferId(void);
 #include "../ps3recomp/libs/video/rpcs3_bridge/r2rsx_bridge.h"
 
 static int s_rsx_live = 0;
+static int s_rsx_vk = 0;
+
+#if defined(PS3RECOMP_RSX_VULKAN)
+#include "../ps3recomp/libs/video/rsx_vulkan_backend.h"
+extern "C" int r3_native_aa_register(void);   /* r3_native_aa.cpp: RSX_FSR=2 DLAA, 3 FSR 3.1, 1 FSR1 */
+/* R2_RSX=vulkan (or native): ps3recomp's register-file draw engine driving
+ * the Vulkan backend, presenting into the null backend's window. */
+static int rsx_vk_wanted(void)
+{
+    const char* e = getenv("R2_RSX");
+    return e && (!_stricmp(e, "vulkan") || !_stricmp(e, "native"));
+}
+
+/* "Handle RSX Memory Tiling" from the rpcs3_config.yml the RPCS3 path uses
+ * (R2_RSX_CONFIG, else next to the exe or in its parent). R3 ships it on and
+ * its main-memory render targets are tiled; missing file/key = on. */
+static int r3_yml_tiling(void)
+{
+    char dir[MAX_PATH] = "";
+    GetModuleFileNameA(NULL, dir, sizeof dir);
+    if (char* s = strrchr(dir, '\\')) *s = 0;
+    char paths[3][MAX_PATH + 32] = {};
+    if (const char* e = getenv("R2_RSX_CONFIG"); e && *e) snprintf(paths[0], sizeof paths[0], "%s", e);
+    snprintf(paths[1], sizeof paths[1], "%s\\rpcs3_config.yml", dir);
+    snprintf(paths[2], sizeof paths[2], "%s\\..\\rpcs3_config.yml", dir);
+    for (auto& p : paths) {
+        if (!p[0]) continue;
+        FILE* f = fopen(p, "r");
+        if (!f) continue;
+        char line[512];
+        int v = 1;
+        while (fgets(line, sizeof line, f)) {
+            const char* k = strstr(line, "Handle RSX Memory Tiling:");
+            if (!k) continue;
+            k += strlen("Handle RSX Memory Tiling:");
+            while (*k == ' ' || *k == '\t') k++;
+            v = _strnicmp(k, "false", 5) != 0;
+            break;
+        }
+        fclose(f);
+        return v;
+    }
+    return 1;
+}
+
+/* Per-game native-engine defaults; an explicit environment always wins. */
+static void r3_native_env_defaults(void)
+{
+    const int tiling = r3_yml_tiling();
+    if (!getenv("GCM_HANDLE_TILED_MEMORY"))
+        _putenv(tiling ? "GCM_HANDLE_TILED_MEMORY=1" : "GCM_HANDLE_TILED_MEMORY=0");
+    if (!getenv("RSX_ENG_TILED_MEMORY"))
+        _putenv(tiling ? "RSX_ENG_TILED_MEMORY=1" : "RSX_ENG_TILED_MEMORY=0");
+    /* RPCS3 honours the centroid interpolation flag (R3's foliage/decals
+     * shimmer at MSAA edges without it). */
+    if (!getenv("RSX_FP_CENTROID")) _putenv("RSX_FP_CENTROID=1");
+}
+#endif
 
 /* location 0 = RSX local memory, 1 = main memory through the IO table. */
 static const uint8_t* rsx_live_guest_ptr(void*, uint32_t location,
@@ -213,6 +283,24 @@ static const uint8_t* rsx_live_guest_ptr(void*, uint32_t location,
 
 static int rsx_select_init(uint32_t w, uint32_t h, const char* title)
 {
+#if defined(PS3RECOMP_RSX_VULKAN)
+    if (rsx_vk_wanted()) {
+        _putenv("PS3RECOMP_VK_GUEST_PROGRAMS=1");
+        if (!getenv("PS3RECOMP_RSX_ENGINE")) _putenv("PS3RECOMP_RSX_ENGINE=dispatch");
+        r3_native_env_defaults();
+        if (rsx_null_backend_init(w, h, title) == 0) {
+            rsx_vulkan_backend_set_window(rsx_null_backend_get_hwnd());
+            r3_native_aa_register();   /* RSX_FSR: 1 FSR1, 2 DLAA, 3 FSR 3.1 (the launcher writes 3 for FSR 3.1) */
+            if (rsx_vulkan_backend_init(w, h, title) == 0) {
+                s_rsx_vk = 1;
+                rsx_null_backend_suppress_present(1);
+                fprintf(stderr, "[rsx] native Vulkan renderer up\n");
+                return 0;
+            }
+        }
+        fprintf(stderr, "[rsx] native Vulkan init FAILED -- falling back to the D3D12 backend\n");
+    }
+#endif
     if (rsx_live_draw_enabled()) {
         if (rsx_null_backend_init(w, h, title) == 0 &&
             rsx_live_draw_init(rsx_null_backend_get_hwnd(), w, h, rsx_live_guest_ptr, nullptr) == 0) {
@@ -227,12 +315,15 @@ static int rsx_select_init(uint32_t w, uint32_t h, const char* title)
 }
 static void rsx_select_present(void)
 {
+#if defined(PS3RECOMP_RSX_VULKAN)
+    if (s_rsx_vk) { rsx_vulkan_backend_present(); return; }
+#endif
     if (s_rsx_live) rsx_live_draw_present(cellGcmGetCurrentDisplayBufferId());
     else rsx_backend_present();
 }
 static int rsx_select_pump(void)
 {
-    return s_rsx_live ? rsx_null_backend_pump_messages() : rsx_backend_pump();
+    return (s_rsx_live || s_rsx_vk) ? rsx_null_backend_pump_messages() : rsx_backend_pump();
 }
 #  undef  rsx_backend_init
 #  undef  rsx_backend_present
@@ -242,9 +333,38 @@ static int rsx_select_pump(void)
 #  define rsx_backend_pump    rsx_select_pump
 #endif
 
+static long long fc_us(void);
+
+/* Present-interval statistics, every 5 s: VRR panels follow the present
+ * cadence, so jitter (or hovering around the LFC threshold) pulses the
+ * brightness. RSX_PRESENT_STATS=0 silences it. */
+static void present_stats(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_PRESENT_STATS"); on = e ? atoi(e) : 1; }
+    if (!on) return;
+    static long long last = 0, win = 0;
+    static unsigned n = 0, b[6] = { 0 };   /* <12, 12-20, 20-28, 28-36, 36-50, >=50 ms */
+    static long long mx = 0;
+    const long long now = fc_us();
+    if (last) {
+        const long long d = now - last;
+        if (d > mx) mx = d;
+        b[d < 12000 ? 0 : d < 20000 ? 1 : d < 28000 ? 2 : d < 36000 ? 3 : d < 50000 ? 4 : 5]++;
+        n++;
+    } else win = now;
+    last = now;
+    if (now - win >= 5000000) {
+        fprintf(stderr, "[present] 5 s: %u presents | <12ms %u, 12-20 %u, 20-28 %u, 28-36 %u, 36-50 %u, >=50 %u | max %.1f ms\n",
+                n, b[0], b[1], b[2], b[3], b[4], b[5], (double)mx / 1000.0);
+        n = 0; mx = 0; memset(b, 0, sizeof b); win = now;
+    }
+}
+
 static void present_guest_frame(void)
 {
     rsx_backend_present();
+    present_stats();
     /* This thread increments and guest threads read, so interlocked rather
      * than a volatile ++, which on arm64 is neither atomic nor a fence. */
     InterlockedIncrement(&g_frames_presented);
@@ -267,6 +387,7 @@ static long long fc_us(void)
 
 static DWORD WINAPI frame_clock(LPVOID)
 {
+    port_place_walker();
     const char* title = getenv("PS3_TITLE");
     if (!title || !*title) title = "ps3recomp";
 
@@ -322,7 +443,11 @@ static DWORD WINAPI frame_clock(LPVOID)
                         unsigned k = 0;
                         while (cellGcm_rsx_put_snapshot() == p0 &&
                                fc_us() - next_tick < 0) {
-                            if (++k & 63u) YieldProcessor(); else SwitchToThread();
+                            if (++k & 63u) YieldProcessor();
+                            else {
+                                if (cellGcm_flip_pace_poll(fc_us(), vb_us)) break;
+                                SwitchToThread();
+                            }
                         }
                     }
                 }
@@ -357,6 +482,7 @@ static DWORD WINAPI frame_clock(LPVOID)
          * fence every render pass on a label the drain writes, and one wave of
          * those at 16 ms apiece paces the guest into single-figure frame rates.
          * The real RSX writes them in microseconds. */
+        cellGcm_flip_pace_poll(fc_us(), vb_us);
         if (rsx_ok) {
             if (cellGcm_take_flip_pending()) {
                 present_guest_frame();
@@ -418,6 +544,19 @@ static void derive_vfs_root(const char* eboot)
  * A fault on a committed vm_base page is such a protection fault and goes to
  * g_vm_access_violation_hook; only reserved pages are demand-committed, one
  * 4 KB page at a time, so committing never resets a neighbour's protection. */
+/* Pages seen committed, one bit per 4 KB page per view. Guest pages are never
+ * decommitted, so a set bit lets the protection-fault path skip VirtualQuery. */
+static volatile LONG vm_committed_bits[2][(VM_SIZE / 0x1000 + 31) / 32];
+static inline bool vm_known_committed(int view, uintptr_t off)
+{
+    const size_t pg = off >> 12;
+    return (vm_committed_bits[view][pg >> 5] >> (pg & 31)) & 1;
+}
+static inline void vm_mark_committed(int view, uintptr_t off)
+{
+    const size_t pg = off >> 12;
+    _InterlockedOr(&vm_committed_bits[view][pg >> 5], (LONG)(1u << (pg & 31)));
+}
 static void vm_commit_range(uint8_t* p, size_t len)
 {
     for (uint8_t* q = p; q < p + len; q += 0x1000) {
@@ -435,10 +574,14 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
         for (int i = 0; i < 2; i++) {
             const uintptr_t base = (uintptr_t)bases[i];
             if (!base || fault < base || fault >= base + VM_SIZE) continue;
-            MEMORY_BASIC_INFORMATION mbi;
-            if (VirtualQuery((void*)fault, &mbi, sizeof(mbi)) && mbi.State == MEM_RESERVE) {
-                vm_commit_range((uint8_t*)(fault & ~(uintptr_t)0xFFFF), 0x10000);
-                return EXCEPTION_CONTINUE_EXECUTION;
+            MEMORY_BASIC_INFORMATION mbi = {};
+            if (!vm_known_committed(i, fault - base)) {
+                if (VirtualQuery((void*)fault, &mbi, sizeof(mbi)) && mbi.State == MEM_RESERVE) {
+                    vm_commit_range((uint8_t*)(fault & ~(uintptr_t)0xFFFF), 0x10000);
+                    return EXCEPTION_CONTINUE_EXECUTION;
+                }
+                if (mbi.State == MEM_COMMIT)
+                    vm_mark_committed(i, fault - base);
             }
             if (i == 0 && g_vm_access_violation_hook &&
                 g_vm_access_violation_hook((uint32_t)(fault - base), is_write))
@@ -458,6 +601,12 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
                 if (n <= 64 || (n & (n - 1)) == 0)
                     fprintf(stderr, "[vm] unclaimed protection fault #%ld at guest 0x%08X (%s); unprotecting\n",
                             n, (uint32_t)(fault - base), is_write ? "write" : "read");
+                /* Through the guard registry, so its owner mask and the
+                 * caches keyed on protection stay in step with the page. */
+                if (g_vm_guard_reconcile_hook) {
+                    if (g_vm_guard_reconcile_hook((uint32_t)(fault - base), is_write))
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                }
                 DWORD old;
                 if (VirtualProtect((void*)(fault & ~(uintptr_t)0xFFF), 0x1000, PAGE_READWRITE, &old))
                     return EXCEPTION_CONTINUE_EXECUTION;
@@ -468,86 +617,14 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-#include <dbghelp.h>
-/* Resistance port: crash report. A host fault that nothing claims used to end
- * the process with no message and no Windows dump. This logs the fault and
- * writes logs\dumps\r3_<pid>.dmp (full memory with CRASH_DUMP_FULL=1). */
-static void crash_where(void* addr, char* out, size_t n)
-{
-    HMODULE m = NULL;
-    char path[MAX_PATH] = "?";
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCSTR)addr, &m) && m) {
-        GetModuleFileNameA(m, path, sizeof path);
-        const char* b = strrchr(path, '\\');
-        snprintf(out, n, "%s+0x%llX", b ? b + 1 : path, (unsigned long long)((uintptr_t)addr - (uintptr_t)m));
-    } else {
-        snprintf(out, n, "%p", addr);
-    }
-}
-static void crash_report(EXCEPTION_POINTERS* ep, const char* how)
-{
-    static volatile LONG once = 0;
-    if (InterlockedExchange(&once, 1)) return;
-    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
-    char where[MAX_PATH + 32];
-    crash_where(er->ExceptionAddress, where, sizeof where);
-    fprintf(stderr, "\n[CRASH] %s: code=0x%08lX at %s thread=%lu", how, er->ExceptionCode, where,
-            GetCurrentThreadId());
-    if (er->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && er->NumberParameters >= 2) {
-        const uintptr_t fa = er->ExceptionInformation[1];
-        fprintf(stderr, " %s 0x%llX", er->ExceptionInformation[0] == 1 ? "writing" : er->ExceptionInformation[0] == 8 ? "executing" : "reading",
-                (unsigned long long)fa);
-        if (vm_base && fa >= (uintptr_t)vm_base && fa < (uintptr_t)vm_base + VM_SIZE)
-            fprintf(stderr, " (guest 0x%08X)", (uint32_t)(fa - (uintptr_t)vm_base));
-    }
-    fprintf(stderr, "\n");
-    fflush(stderr); fflush(stdout);
-    typedef BOOL (WINAPI *mdw_t)(HANDLE, DWORD, HANDLE, int, void*, void*, void*);
-    HMODULE dh = LoadLibraryA("dbghelp.dll");
-    mdw_t mdw = dh ? (mdw_t)GetProcAddress(dh, "MiniDumpWriteDump") : NULL;
-    if (!mdw) return;
-    char dir[MAX_PATH], file[MAX_PATH];
-    GetModuleFileNameA(NULL, dir, sizeof dir);
-    if (char* s = strrchr(dir, '\\')) *s = 0;
-    snprintf(file, sizeof file, "%s\\..\\logs\\dumps", dir);
-    CreateDirectoryA(file, NULL);
-    snprintf(file, sizeof file, "%s\\..\\logs\\dumps\\r3_%lu.dmp", dir, GetCurrentProcessId());
-    HANDLE f = CreateFileA(file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (f == INVALID_HANDLE_VALUE) return;
-    MINIDUMP_EXCEPTION_INFORMATION mei = { GetCurrentThreadId(), ep, FALSE };
-    const char* full = getenv("CRASH_DUMP_FULL");
-    /* MiniDumpWithIndirectlyReferencedMemory | WithThreadInfo, or WithFullMemory */
-    const int type = (full && full[0] == '1') ? 0x2 : (0x40 | 0x1000);
-    const BOOL ok = mdw(GetCurrentProcess(), GetCurrentProcessId(), f, type, &mei, NULL, NULL);
-    CloseHandle(f);
-    fprintf(stderr, "[CRASH] minidump %s: %s\n", ok ? "written" : "FAILED", file);
-    fflush(stderr);
-}
-static LONG WINAPI crash_filter(EXCEPTION_POINTERS* ep)
-{
-    crash_report(ep, "unhandled exception");
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-/* Faults that never reach the unhandled filter (stack overflow, and host code
- * that installs its own last-chance filter later) are caught here; only codes
- * no handler can recover from, after the guest-memory handlers had their go. */
-static LONG WINAPI crash_veh(EXCEPTION_POINTERS* ep)
-{
-    const DWORD c = ep->ExceptionRecord->ExceptionCode;
-    if (c == EXCEPTION_STACK_OVERFLOW || c == EXCEPTION_ILLEGAL_INSTRUCTION ||
-        c == EXCEPTION_PRIV_INSTRUCTION || c == 0xC0000374 /* heap corruption */ || c == 0xC0000409 /* fast fail */)
-        crash_report(ep, "fatal exception");
-    return EXCEPTION_CONTINUE_SEARCH;
-}
+/* Crash and hang reports: logs\crash (R2_CRASH_DUMPS, R2_HANG_S). */
+#include "r3_crash.inc"
 #endif
 
 extern "C" void vm_inline_refresh(void);
 static bool alloc_guest_vm(void)
 {
 #ifdef _WIN32
-    AddVectoredExceptionHandler(0, crash_veh);
-    SetUnhandledExceptionFilter(crash_filter);
     AddVectoredExceptionHandler(1, vm_commit_veh);
     {
         HANDLE sec = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_RESERVE,
@@ -603,6 +680,42 @@ static void harness_guest_caller(uint32_t opd, uint64_t a0, uint64_t a1,
     ppu_guest_call(opd, a0, a1, a2, a3, a4, a5, a6, a7);
 }
 
+#ifdef _WIN32
+#include <intrin.h>
+/* Resistance port: one [sys] line so a tester's run.log says what it ran on,
+ * and a readable message instead of an illegal-instruction crash on CPUs
+ * without the x86-64-v3 set (AVX2/FMA/BMI2) the lifted code is built for. */
+static void port_sys_report(void)
+{
+    int r[4]; char brand[49] = {0};
+    __cpuid(r, 0x80000000);
+    if ((unsigned)r[0] >= 0x80000004u)
+        for (int i = 0; i < 3; i++) { __cpuid(r, 0x80000002 + i); memcpy(brand + 16 * i, r, 16); }
+    __cpuid(r, 1);
+    const int fma = (r[2] >> 12) & 1, osx = (r[2] >> 27) & 1, avx = (r[2] >> 28) & 1;
+    __cpuidex(r, 7, 0);
+    const int avx2 = (r[1] >> 5) & 1, bmi2 = (r[1] >> 8) & 1;
+    const int ymm = osx && ((_xgetbv(0) & 6) == 6);
+    SYSTEM_INFO si; GetSystemInfo(&si);
+    MEMORYSTATUSEX ms; ms.dwLength = sizeof ms; GlobalMemoryStatusEx(&ms);
+    OSVERSIONINFOW ov = {0}; ov.dwOSVersionInfoSize = sizeof ov;
+    typedef LONG (WINAPI *rtlgv_t)(OSVERSIONINFOW*);
+    rtlgv_t rtlgv = (rtlgv_t)GetProcAddress(GetModuleHandleA("ntdll.dll"), "RtlGetVersion");
+    if (rtlgv) rtlgv(&ov);
+    const char* b = brand; while (*b == ' ') b++;
+    printf("[sys] CPU: %s | %lu logical CPUs | RAM %.1f GB (%.1f GB free) | Windows %lu.%lu.%lu | AVX2 %d FMA %d BMI2 %d\n",
+           *b ? b : "unknown", (unsigned long)si.dwNumberOfProcessors,
+           ms.ullTotalPhys / 1073741824.0, ms.ullAvailPhys / 1073741824.0,
+           ov.dwMajorVersion, ov.dwMinorVersion, ov.dwBuildNumber, avx && avx2 && ymm, fma, bmi2);
+    if (!(avx && avx2 && fma && bmi2 && ymm)) {
+        fprintf(stderr, "ERROR: this CPU lacks AVX2/FMA/BMI2, which this build requires\n");
+        MessageBoxA(NULL, "This build needs a CPU with AVX2/FMA/BMI2 (Intel Haswell / AMD Zen or newer).\n"
+                          "Your CPU does not support it, so the game cannot run.", "Unsupported CPU", MB_ICONERROR);
+        exit(1);
+    }
+}
+#endif
+
 extern "C" void cellGame_init_from_paramsfo(const char* sfo_path);
 
 int main(int argc, char** argv)
@@ -611,6 +724,14 @@ int main(int argc, char** argv)
         printf("usage: %s <PPU ELF>\n", argv[0]);
         return 2;
     }
+
+    /* Before anything starts: the profile sets env switches that the
+     * subsystems read when they first run. R2_PRESET fills in the settings
+     * that aren't set explicitly, before the profile reads them. */
+    if (const char* preset = getenv("R2_PRESET"); preset && *preset)
+        r2ac::apply_preset_env(preset, r2ac::Phase::startup);
+    port_cpu_profile_init();
+    r2_crash_init();
 
 #ifdef _WIN32
 #pragma comment(lib, "winmm.lib")
@@ -622,6 +743,9 @@ int main(int argc, char** argv)
 #endif
 
     printf("=== ps3recomp game runner ===\n");
+#ifdef _WIN32
+    port_sys_report();
+#endif
 
     /* No PlayStation Eye on PC: with the runtime's virtual camera attached,
      * Resistance 3 starts PlayStation Move calibration and waits on it.
@@ -665,6 +789,13 @@ int main(int argc, char** argv)
     /* Install the guest-callback hook, then start the frame clock. It no-ops
      * until the title registers its vblank and flip handlers during init. */
     g_ps3_guest_caller = harness_guest_caller;
+    /* R2_FPS and RSX_VSYNC=auto are settled before any backend reads them. */
+    {
+        const double fps = r2_fps_target();
+        printf("[boot] frame target %s%.3f fps, RSX_VSYNC=%s\n", fps > 0.0 ? "" : "uncapped ", fps,
+               getenv("RSX_VSYNC") ? getenv("RSX_VSYNC") : "(unset)");
+    }
+    r3_patches_apply();      /* RPCS3 patch.yml data patches (r3_patches.cpp) */
     CreateThread(NULL, 4u * 1024 * 1024, frame_clock, NULL, 0, NULL);
 
     printf("\n[boot] dispatching entry OPD 0x%08X (stack top 0x%08X)\n\n",

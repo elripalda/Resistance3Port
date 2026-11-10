@@ -48,6 +48,74 @@ int lv2_deadline_passed(int64_t deadline)
 }
 #endif
 
+int ps3_perf_on(const char* name, int def)
+{
+    const char* a = getenv("PS3_PERF_ALL");
+    if (a && a[0] == '0') return 0;
+    a = getenv("RSX_PERF_ALL");
+    if (a && a[0] == '0') return 0;
+    const char* e = name ? getenv(name) : NULL;
+    if (e && *e) return atoi(e) != 0;
+    return def;
+}
+
+#if defined(_MSC_VER)
+#define PS3_TLS __declspec(thread)
+#else
+#define PS3_TLS _Thread_local
+#endif
+
+/* ---------------------------------------------------------------------------
+ * Guest-memory write notification (see sys_timer.h)
+ * -----------------------------------------------------------------------*/
+volatile long g_guest_mem_seq = 0;
+static volatile long s_mem_waiters = 0;   /* threads in a notify-aware short usleep */
+void ps3_guest_mem_notify(uint32_t ea)
+{
+    (void)ea;
+    if (s_mem_waiters) {
+#ifdef _WIN32
+        InterlockedIncrement(&g_guest_mem_seq);
+#else
+        __atomic_add_fetch(&g_guest_mem_seq, 1, __ATOMIC_SEQ_CST);
+#endif
+    }
+}
+void (*volatile g_guest_mem_notify)(uint32_t ea) = ps3_guest_mem_notify;
+
+/* ---------------------------------------------------------------------------
+ * Per-thread wait accounting (see sys_timer.h)
+ * -----------------------------------------------------------------------*/
+ps3_waitstat g_ps3_waitstat[PS3_WAITSTAT_MAX];
+static volatile long s_waitstat_n = 0;
+static PS3_TLS ps3_waitstat* t_waitstat;
+static PS3_TLS int t_waitstat_full;
+ps3_waitstat* ps3_waitstat_self(void)
+{
+    if (t_waitstat || t_waitstat_full) return t_waitstat;
+#ifdef _WIN32
+    const unsigned long tid = GetCurrentThreadId();
+    const long i = InterlockedIncrement(&s_waitstat_n) - 1;
+#else
+    const unsigned long tid = (unsigned long)(uintptr_t)&t_waitstat;
+    const long i = __atomic_add_fetch(&s_waitstat_n, 1, __ATOMIC_SEQ_CST) - 1;
+#endif
+    if (i >= PS3_WAITSTAT_MAX) { t_waitstat_full = 1; return NULL; }
+    g_ps3_waitstat[i].tid = tid;
+    t_waitstat = &g_ps3_waitstat[i];
+    return t_waitstat;
+}
+
+int64_t ps3_qpc_freq(void)
+{
+#ifdef _WIN32
+    ensure_qpc_init();
+    return s_qpc_freq.QuadPart;
+#else
+    return 1000000000LL;
+#endif
+}
+
 /* ---------------------------------------------------------------------------
  * PPU timebase (mftb/mftbu) -- THE guest clock.
  *
@@ -259,6 +327,18 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         ppu_log_host_chain("usleep1ms"); } }
 
 #ifdef _WIN32
+    /* Switches, read once: PS3_USLEEP_TIMER_CACHE (one high-resolution timer
+     * per thread instead of create+close per sleep) and PS3_USLEEP_NOTIFY
+     * (a short spin ends when ps3_guest_mem_notify reports a guest write).
+     * Both default on; =0, PS3_PERF_ALL=0 or RSX_PERF_ALL=0 turn them off. */
+    static volatile int s_tcache = -1, s_notify = -1;
+    if (s_tcache < 0) {
+        s_notify = ps3_perf_on("PS3_USLEEP_NOTIFY", 1);
+        s_tcache = ps3_perf_on("PS3_USLEEP_TIMER_CACHE", 1);
+    }
+    ps3_waitstat* ws = ps3_waitstat_self();
+    LARGE_INTEGER ws_t0; ws_t0.QuadPart = 0;
+    if (ws) QueryPerformanceCounter(&ws_t0);
     /* Use high-resolution sleep via waitable timer for better precision */
     if (usec >= 1000) {
         /* A plain waitable timer fires on the next 1 ms system tick, so a
@@ -268,18 +348,25 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
-        HANDLE timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_MANUAL_RESET |
-                                              CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
-        if (!timer) timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+        static PS3_TLS HANDLE t_timer;
+        HANDLE timer = s_tcache ? t_timer : NULL;
+        if (!timer) {
+            timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_MANUAL_RESET |
+                                           CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            if (!timer) timer = CreateWaitableTimerW(NULL, TRUE, NULL);
+            if (s_tcache) t_timer = timer;
+        }
         if (timer) {
             LARGE_INTEGER due;
             due.QuadPart = -((LONGLONG)usec * 10); /* 100ns units, negative = relative */
             SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE);
             WaitForSingleObject(timer, INFINITE);
-            CloseHandle(timer);
+            if (!s_tcache) CloseHandle(timer);
         } else {
             Sleep((DWORD)(usec / 1000));
         }
+        if (ws) { LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
+                  ws->long_n++; ws->long_qpc += (unsigned long long)(t1.QuadPart - ws_t0.QuadPart); }
     } else if (usec > 0) {
         /* Sub-millisecond sleep. Sleep()/waitable timers round up to the
          * ~0.5-1 ms scheduler quantum, far too coarse for a guest that relies
@@ -288,16 +375,38 @@ int64_t sys_timer_usleep(ppu_context* ctx)
          * and busy-spins at full speed (so the wait is effectively a no-op).
          * Busy-wait to a precise QPC deadline, yielding inside the spin
          * (SwitchToThread) so a sibling host thread the guest may be waiting on
-         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail. */
+         * still gets the core. Mirrors RPCS3's "Usleep Only" TSC busy-tail.
+         *
+         * These short sleeps are the guest's poll loops (R2: the occlusion
+         * report poll usleep(30) and the frame-label wait usleep(50) were 76%
+         * of the main thread). With PS3_USLEEP_NOTIFY the spin also ends as
+         * soon as a guest write it may be waiting for is reported, so the
+         * guest re-checks immediately; an early return from usleep is
+         * harmless to a poll loop, which simply checks and sleeps again. */
         ensure_qpc_init();
         LARGE_INTEGER qpc_start, qpc_now;
         QueryPerformanceCounter(&qpc_start);
         const int64_t qpc_deadline = qpc_start.QuadPart +
             (int64_t)((usec * (uint64_t)s_qpc_freq.QuadPart) / 1000000ULL);
-        do {
-            SwitchToThread();
-            QueryPerformanceCounter(&qpc_now);
-        } while (qpc_now.QuadPart < qpc_deadline);
+        if (s_notify) {
+            InterlockedIncrement(&s_mem_waiters);
+            const long seq0 = g_guest_mem_seq;
+            int early = 0;
+            do {
+                if (g_guest_mem_seq != seq0) { early = 1; break; }
+                SwitchToThread();
+                QueryPerformanceCounter(&qpc_now);
+            } while (qpc_now.QuadPart < qpc_deadline);
+            InterlockedDecrement(&s_mem_waiters);
+            if (ws && early) ws->early_n++;
+        } else {
+            do {
+                SwitchToThread();
+                QueryPerformanceCounter(&qpc_now);
+            } while (qpc_now.QuadPart < qpc_deadline);
+        }
+        if (ws) { LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
+                  ws->short_n++; ws->short_qpc += (unsigned long long)(t1.QuadPart - ws_t0.QuadPart); }
     }
 #else
     if (usec > 0) {

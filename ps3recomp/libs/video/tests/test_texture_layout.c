@@ -37,8 +37,8 @@ static int g_fail = 0;
 #define FMT_DXT23    0x87u
 #define FMT_DXT45    0x88u
 #define FMT_G8B8     0x8Bu
-#define FMT_HILO8    0x8Cu
-#define FMT_HILO_S8  0x8Du
+#define FMT_HILO8    0x98u
+#define FMT_HILO_S8  0x99u
 #define FMT_DEPTH24  0x90u
 #define FMT_DEPTH16  0x92u
 #define FMT_X16      0x94u
@@ -71,16 +71,14 @@ static void test_argb(void)
     CHECK_EQ(L.fmt, RSX_TEXFMT_R8G8B8A8);
     CHECK_EQ(L.face_bytes, 256u * 256u * 4u);
 
-    /* Non-power-of-two cannot be swizzled even with the LN bit clear -- the
-     * hardware only swizzles POT, and treating NPOT as swizzled would read
-     * the image apart. */
+    /* RPCS3 swizzles NPOT images too (calculate_z_index over ceil-log2
+     * extents); the pitch register still does not apply. */
     rsx_texture_layout(FMT_A8R8G8B8, 100, 100, &L);
-    CHECK(!L.swizzled);
+    CHECK(L.swizzled);
     CHECK_EQ(L.row_bytes, 400);
 
-    /* One POT axis is not enough. */
     rsx_texture_layout(FMT_A8R8G8B8, 256, 100, &L);
-    CHECK(!L.swizzled);
+    CHECK(L.swizzled);
 }
 
 static void test_g8b8(void)
@@ -136,7 +134,7 @@ static void test_unknown_format_degrades(void)
     /* Anything unrecognised falls back to one byte per texel rather than
      * guessing wider and reading past the end of guest memory. B8 lands there
      * too, and means it. */
-    rsx_texture_layout(0x8Fu /* R6G5B5, not classified */, 64, 64, &L);
+    rsx_texture_layout(0x89u /* not a texture format */, 64, 64, &L);
     CHECK_EQ(L.fmt, RSX_TEXFMT_R8);
     CHECK_EQ(L.bytes_per_texel, 1);
     CHECK(!L.compressed);
@@ -349,9 +347,18 @@ static void test_hilo(void)
     CHECK_EQ(L.row_bytes, 256);
     CHECK_EQ(L.dst_row_bytes, 256);
 
+    /* HILO_S8 is signed: decoded to two halves holding the snorm values
+     * (RPCS3 samples it through R8G8_SNORM). */
     rsx_texture_layout(FMT_HILO_S8 | FMT_LN, 128, 128, &L);
-    CHECK_EQ(L.fmt, RSX_TEXFMT_R8G8);
-    CHECK_EQ(L.dst_row_bytes, 256);
+    CHECK_EQ(L.fmt, RSX_TEXFMT_R16G16F);
+    CHECK_EQ(L.row_bytes, 256);
+    CHECK_EQ(L.dst_row_bytes, 512);
+    { const u8 s[2] = { 0x7F, 0x81 };   /* +127 -> 1.0, -127 -> -1.0 */
+      u8 d[4];
+      rsx_texture_layout(FMT_HILO_S8 | FMT_LN, 1, 1, &L);
+      rsx_texture_decode(d, 4, s, 1, 1, &L, 0);
+      CHECK_EQ(d[0], 0x00); CHECK_EQ(d[1], 0x3C);
+      CHECK_EQ(d[2], 0x00); CHECK_EQ(d[3], 0xBC); }
 
     const u8 s[2] = { 0x40, 0xC0 };
     u8 d[2];
@@ -595,10 +602,16 @@ static void test_remap_identity(void)
     CHECK_EQ(m[R_], 0); CHECK_EQ(m[G_], 1);
     CHECK_EQ(m[B_], 2); CHECK_EQ(m[A_], 3);
 
-    /* An unset control word means identity, not "all channels read A". */
+    /* T2-03: RPCS3 seeds CONTROL1 to 0xAAE4 at init, so a 0 the title wrote
+     * decodes as written: every lane ZERO. RSX_TEX_REMAP_ZERO=0 (or
+     * RSX_TEX_LEGACY) reads it as the identity. */
     u8 z[4];
     rsx_texture_component_remap(0u, FMT_A8R8G8B8, z);
-    for (int i = 0; i < 4; i++) CHECK_EQ(z[i], m[i]);
+    const char* rz = getenv("RSX_TEX_REMAP_ZERO");
+    if ((rz && rz[0] == '0') || rsx_texture_legacy())
+        for (int i = 0; i < 4; i++) CHECK_EQ(z[i], m[i]);
+    else
+        for (int i = 0; i < 4; i++) CHECK_EQ(z[i], RSX_REMAP_ZERO);
 }
 
 /* Packed the way D3D12 wants it, the identity must equal
@@ -658,13 +671,15 @@ static void test_remap_force_zero_and_one(void)
     CHECK_EQ(m[B_], 2);
 }
 
-/* G8B8 has two real channels, presented as {G,R,G,R}. */
+/* G8B8 has two real channels, presented as {G,B,G,B} in A,R,G,B order (RPCS3
+ * {G,R,G,R} over a byteswapped R8G8 upload). The decode keeps guest byte
+ * order, so G -- the first byte -- is component 0. */
 static void test_remap_g8b8_lanes(void)
 {
     u8 m[4];
     rsx_texture_component_remap(0xAAE4u, FMT_G8B8, m);
-    CHECK_EQ(m[A_], 1); CHECK_EQ(m[R_], 0);
-    CHECK_EQ(m[G_], 1); CHECK_EQ(m[B_], 0);
+    CHECK_EQ(m[A_], 0); CHECK_EQ(m[R_], 1);
+    CHECK_EQ(m[G_], 0); CHECK_EQ(m[B_], 1);
 
     /* The LN flag must not change the crossbar decode. */
     u8 n[4];
@@ -688,10 +703,10 @@ static void test_remap_b8_lanes(void)
     CHECK_EQ(n[G_], 0); CHECK_EQ(n[B_], 0);
 }
 
-/* X16 decodes to a one-channel R16 resource and is presented like B8: the
- * value in R, G and B, A opaque. GoW:A's font atlas is X16 sampled through
- * 0xAAEE (G and B sources only); with the ARGB lanes every output read the
- * resource's empty G/B components and all text was transparent. */
+/* X16 decodes to a one-channel R16 resource. Its crossbar is encoded in
+ * 16-bit blocks (RPCS3 decoded_remap): 0xEE -> every lane from the data
+ * (GoW:A's font atlas, 0xAAEE), and the identity 0xE4 -> 0x66 over RPCS3's
+ * {R,1,R,1} mapping, i.e. the data in A and G, one in R and B. */
 static void test_remap_x16_lanes(void)
 {
     u8 m[4];
@@ -701,8 +716,60 @@ static void test_remap_x16_lanes(void)
 
     u8 n[4];
     rsx_texture_component_remap(0xAAE4u, FMT_X16, n);
-    CHECK_EQ(n[A_], RSX_REMAP_ONE); CHECK_EQ(n[R_], 0);
-    CHECK_EQ(n[G_], 0); CHECK_EQ(n[B_], 0);
+    CHECK_EQ(n[A_], 0); CHECK_EQ(n[R_], RSX_REMAP_ONE);
+    CHECK_EQ(n[G_], 0); CHECK_EQ(n[B_], RSX_REMAP_ONE);
+}
+
+/* New formats ported from RPCS3: 4:2:2 pairs, R6G5B5, float depth, and the
+ * per-format presentation of depth (RRRR, ignoring CONTROL1) and floats. */
+static void test_rpcs3_formats(void)
+{
+    rsx_tex_layout L;
+    /* R8B8_R8G8 bytes R0,B,R1,G: two texels sharing B and G. */
+    { const u8 s[4] = { 0x10, 0x20, 0x30, 0x40 };
+      u8 d[8];
+      rsx_texture_layout(0xAEu, 2, 1, &L);
+      CHECK_EQ(L.fmt, RSX_TEXFMT_R8G8B8A8);
+      CHECK(!L.swizzled);
+      CHECK_EQ(L.row_bytes, 4);
+      rsx_texture_decode(d, 8, s, 2, 1, &L, 0);
+      CHECK_EQ(d[0], 0x10); CHECK_EQ(d[1], 0x40); CHECK_EQ(d[2], 0x20); CHECK_EQ(d[3], 0xFF);
+      CHECK_EQ(d[4], 0x30); CHECK_EQ(d[5], 0x40); CHECK_EQ(d[6], 0x20); }
+    /* B8R8_G8R8 bytes B,R0,G,R1. */
+    { const u8 s[4] = { 0x10, 0x20, 0x30, 0x40 };
+      u8 d[8];
+      rsx_texture_layout(0xADu, 2, 1, &L);
+      rsx_texture_decode(d, 8, s, 2, 1, &L, 0);
+      CHECK_EQ(d[0], 0x20); CHECK_EQ(d[1], 0x30); CHECK_EQ(d[2], 0x10);
+      CHECK_EQ(d[4], 0x40); }
+    /* R6G5B5: 6-bit red at the top. 0xFFFF -> white. */
+    { const u8 s[2] = { 0xFC, 0x00 };
+      u8 d[4];
+      rsx_texture_layout(0x8Fu | FMT_LN, 1, 1, &L);
+      CHECK_EQ(L.fmt, RSX_TEXFMT_R8G8B8A8);
+      rsx_texture_decode(d, 4, s, 1, 1, &L, 0);
+      CHECK_EQ(d[0], 0xFF); CHECK_EQ(d[1], 0); CHECK_EQ(d[2], 0); CHECK_EQ(d[3], 0xFF); }
+    /* DEPTH16_FLOAT: half 1.0 (0x3C00) widened to float. */
+    { const u8 s[2] = { 0x3C, 0x00 };
+      float f = 0.0f;
+      rsx_texture_layout(0x93u | FMT_LN, 1, 1, &L);
+      CHECK_EQ(L.fmt, RSX_TEXFMT_R32F);
+      rsx_texture_decode(&f, 4, s, 1, 1, &L, 0);
+      CHECK(f == 1.0f); }
+    /* DEPTH24_D8_FLOAT: d24f_to_f32 is the 24-bit value shifted left 7. */
+    { const u8 s[4] = { 0x7F, 0x00, 0x00, 0xAA };   /* f32 0x3F800000 */
+      float f = 0.0f;
+      rsx_texture_layout(0x91u | FMT_LN, 1, 1, &L);
+      rsx_texture_decode(&f, 4, s, 1, 1, &L, 0);
+      CHECK(f == 1.0f); }
+    u8 m[4];
+    rsx_texture_component_remap(0xA9E4u, FMT_DEPTH24, m);
+    for (int i = 0; i < 4; i++) CHECK_EQ(m[i], 0);
+    /* Float formats cannot be remapped: 0xAA1B behaves as 0xAAE4. */
+    u8 a[4], b[4];
+    rsx_texture_component_remap(0xAA1Bu, FMT_W16F, a);
+    rsx_texture_component_remap(0xAAE4u, FMT_W16F, b);
+    for (int i = 0; i < 4; i++) CHECK_EQ(a[i], b[i]);
 }
 
 /* Compressed formats decode to RGBA, so they use the same lanes as A8R8G8B8 --
@@ -724,6 +791,9 @@ static void test_expand_mask(void)
     CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xAAE4u, 0u, 0x1000u), 0xF);
     /* UNSIGNED_REMAP_NORMAL: nothing to expand. */
     CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xAAE4u, 0u, 0u), 0);
+    /* T2-04: the 4-bit UNSIGNED_REMAP field; only 1 (BIASED) expands. */
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xAAE4u, 0u, 0x3000u), 0);
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xAAE4u, 0u, 0x11000u), 0xF);
     /* A lane the crossbar forces to ONE (0xA9E4: A's op = 1) is not a
      * source and stays out. */
     CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xA9E4u, 0u, 0x1000u), 0x7);
@@ -731,11 +801,13 @@ static void test_expand_mask(void)
      * sign-extension read instead: b signed (bit 31) drops the B lane. */
     CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0xAAE4u, 0x80000000u, 0x1000u), 0xB);
     /* Float formats never expand (DEPTH24_D8 and X16 do, as on RPCS3); a
-     * zero control1 is the identity crossbar. */
+     * zero control1 has no REMAP lane (T2-03; identity with RSX_TEX_REMAP_ZERO=0). */
     CHECK_EQ(rsx_texture_expand_mask(0x9Au, 0xAAE4u, 0u, 0x1000u), 0);
     CHECK_EQ(rsx_texture_expand_mask(0x9Bu, 0xAAE4u, 0u, 0x1000u), 0);
     CHECK_EQ(rsx_texture_expand_mask(0x90u, 0xAAE4u, 0u, 0x1000u), 0xF);
-    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0u, 0u, 0x1000u), 0xF);
+    CHECK_EQ(rsx_texture_expand_mask(FMT_A8R8G8B8, 0u, 0u, 0x1000u),
+             ((getenv("RSX_TEX_REMAP_ZERO") && getenv("RSX_TEX_REMAP_ZERO")[0] == '0') ||
+              rsx_texture_legacy()) ? 0xF : 0);
     /* 16-bit channels (X16, Y16_X16) carry bit 4; DEPTH24_D8 above did not. */
     CHECK_EQ(rsx_texture_expand_mask(0x94u, 0xAAE4u, 0u, 0x1000u) & 0x10u, 0x10u);
     CHECK_EQ(rsx_texture_expand_mask(0x95u, 0xAAE4u, 0u, 0x1000u) & 0x10u, 0x10u);
@@ -788,6 +860,7 @@ int main(void)
     test_remap_identity_packs_to_d3d_default();
     test_remap_b8_lanes();
     test_remap_x16_lanes();
+    test_rpcs3_formats();
     test_remap_y16x16_lanes();
     test_remap_field_order_is_not_reversed();
     test_remap_force_zero_and_one();

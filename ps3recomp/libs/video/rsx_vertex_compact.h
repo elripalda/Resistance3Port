@@ -44,6 +44,11 @@ typedef struct rsx_vertex_remap {
     rsx_vertex_remap_slot* slots;
     u32 slot_capacity;
     u32 generation;
+    /* Direct-mapped table (generation << 32 | unique) for a draw whose ids
+     * span a narrow range; the hash above handles everything else. */
+    u64* dense;
+    u32 dense_capacity;
+    u32 dense_generation;
 } rsx_vertex_remap;
 
 typedef struct rsx_vertex_fetch_attr {
@@ -55,6 +60,19 @@ typedef struct rsx_vertex_fetch_attr {
     u32 stable_first;
     u32 stable_last;
 } rsx_vertex_fetch_attr;
+
+/* Per-slot fetch recipe resolved once by _prepare: how to find the element
+ * and which (type, size)-specialised decoder reads it. Internal to
+ * rsx_vertex_compact.c. */
+typedef struct rsx_vertex_fetch_fast {
+    const u8* base;              /* stable_base, NULL = per-element path */
+    u32 first, last, stride;
+    u32 elem_base;
+    u32 frequency;
+    u8 attr;
+    u8 kind;
+    u8 decoder;                  /* 0 = rsx_vertex_decode_element         */
+} rsx_vertex_fetch_fast;
 
 typedef struct rsx_vertex_fetch_plan {
     rsx_vertex_layout_plan layout;
@@ -70,7 +88,31 @@ typedef struct rsx_vertex_fetch_plan {
     u32 inline_bytes;
     u32 inline_off[RSX_DSP_NUM_VERTEX_ATTR]; /* byte offset within a vertex */
     u32 inline_stride;                       /* decoded once, at _init      */
+    /* Element rule (see rsx_vertex_plan_element): 0 = rsx_vertex_element_index
+     * for every reference; RSX_VERTEX_FREQ_RPCS3_ARRAYS / _INDEXED = RPCS3's
+     * per-draw rebasing (RSXVertexFetch read_location over the upload range
+     * of calculate_required_range). Set by the caller between _init and
+     * _prepare; _prepare fills draw_min/draw_max from the references. */
+    u8 freq_mode;
+    u32 draw_min, draw_max, draw_base_index;
+    /* RPCS3 interleaved-block upload origin per attribute (the block's
+     * calculate_required_range first); filled by _prepare in RPCS3 modes. */
+    u32 elem_base[RSX_DSP_NUM_VERTEX_ATTR];
+    /* Filled by _prepare, one entry per layout slot (fast_ready 1; 2 when
+     * every slot is a plain array with a specialised decoder); _init
+     * clears it. Changing the plan after _prepare requires another
+     * _prepare before fetching. */
+    u8 fast_ready;
+    rsx_vertex_fetch_fast fast[RSX_DSP_NUM_VERTEX_ATTR];
 } rsx_vertex_fetch_plan;
+
+#define RSX_VERTEX_FREQ_LEGACY          0
+#define RSX_VERTEX_FREQ_RPCS3_ARRAYS    1
+#define RSX_VERTEX_FREQ_RPCS3_INDEXED   2
+
+/* RSX_VTX_LEGACY=1: the vertex/index rules this tree used before the RPCS3
+ * parity pass (scratch/parity/vertex.md). Read once. */
+int rsx_vertex_legacy(void);
 
 /* Deterministic ascending-register layout; each selected register remains a
  * float4 and retains its original ATTR semantic index. */
@@ -115,6 +157,16 @@ void rsx_vertex_fetch_plan_prepare(
  * invalid enabled ATTR0 remains fatal. */
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
+
+/* Batch form of rsx_vertex_fetch_one: vertex i of refs goes to
+ * out + i * layout.stride, attribute by attribute. Returns 1 with output
+ * bit-identical to calling rsx_vertex_fetch_one for every reference in
+ * order; returns 0 where that loop would stop (an invalid ATTR0), and the
+ * contents of out are then unspecified. */
+#define RSX_VERTEX_HAVE_FETCH_MANY 1
+int rsx_vertex_fetch_many(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    u8* out);
 
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map

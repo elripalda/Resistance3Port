@@ -30,6 +30,7 @@
  */
 #include "rsx_vp_decompiler.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* ---- little-endian word read (RPCS3-capture native order) --------------- */
@@ -92,13 +93,19 @@ static void emit_src(u32 src, int is_abs, u32 input_src, u32 const_src,
     switch (reg_type) {
     case 2:  snprintf(base, sizeof(base), "v[%u]", input_src & 15); break;
     case 3:
+        /* RPCS3 GetSRC: a direct constant past 467 reads float4(0) with no
+         * swizzle/abs/neg; an indexed one wraps at 512 and reads 0 past 467
+         * (_fetch_indexed_constant). */
         if (index_const)
-            snprintf(base, sizeof(base), "vp_c[(%uu + a%u.%c) & 511u]",
+            snprintf(base, sizeof(base), "vp_cidx((%uu + (uint)a%u.%c) & 511u)",
                      const_src, addr_sel & 1, SWZ[addr_swz & 3]);
-        else
-            snprintf(base, sizeof(base), "vp_c[%u]", const_src & 511);
+        else if (const_src >= 468u) {
+            snprintf(buf, bufsz, "float4(0,0,0,0)");
+            return;
+        } else
+            snprintf(base, sizeof(base), "vp_c[%u]", const_src);
         break;
-    default: snprintf(base, sizeof(base), "r[%u]", tmp_src & 31); break;
+    default: snprintf(base, sizeof(base), "r[%u]", tmp_src & 63); break;
     }
 
     char swz[8];
@@ -120,22 +127,63 @@ static void mask_str(int mx,int my,int mz,int mw, char* m)
     m[i]='\0';
 }
 
-/* Emit "    dst.mask = _v.mask;" (skips when mask empty). */
-static void emit_store(Out* b, const char* dst_fmt, u32 idx, const char* m)
+/* Emit "    dst.mask = src.mask;" (skips when mask empty). */
+static void emit_store_src(Out* b, const char* dst_fmt, u32 idx, const char* m, const char* src)
 {
     if (!m[0]) return;
     char line[96];
     char dst[32];
     snprintf(dst, sizeof(dst), dst_fmt, idx);
-    snprintf(line, sizeof(line), "        %s.%s = _v.%s;\n", dst, m, m);
+    snprintf(line, sizeof(line), "        %s.%s = %s.%s;\n", dst, m, src, m);
     emit(b, line);
 }
 
 /* ---- flow control -------------------------------------------------------- */
-#define RSX_VP_MAX_INSTR 512
+/* RPCS3 rsx::max_vertex_program_instructions. At 512, a branching program
+ * longer than that (R3 91D15F3FE80BE076, 543 slots) never opened blocks past
+ * slot 512 while its branches still closed them: unbalanced braces. */
+#define RSX_VP_MAX_INSTR 544
 
 static u32 s_vp_branch_base = 0;   /* VP slot the program being decompiled starts at */
 void rsx_vp_set_branch_base(u32 start_slot) { s_vp_branch_base = start_slot; }
+static int s_vp_clip_distances = 0;
+void rsx_vp_set_clip_distances(int enabled) { s_vp_clip_distances = enabled != 0; }
+/* RPCS3 VERTEX_TEXTURE_FETCH1D: a 1D vertex unit reads coordinate .x only. */
+static u32 s_vp_vtex_1d_mask;
+void rsx_vp_set_vtex_1d_mask(u32 mask) { s_vp_vtex_1d_mask = mask; }
+/* RPCS3 VERTEX_TEXTURE_FETCH3D / FETCHCUBE (GLSLCommon.cpp:647-649): 3D and
+ * cube vertex units read coordinate .xyz from a sampler3D / samplerCube
+ * (VertexProgramDecompiler.cpp:220-240). */
+static u32 s_vp_vtex_3d_mask, s_vp_vtex_cube_mask;
+void rsx_vp_set_vtex_3d_mask(u32 mask) { s_vp_vtex_3d_mask = mask; }
+void rsx_vp_set_vtex_cube_mask(u32 mask) { s_vp_vtex_cube_mask = mask; }
+/* H2-01: RPCS3 VKVertexProgram.cpp:367 low_precision_tests = is_NVIDIA. */
+static int s_vp_low_precision = 1;
+void rsx_vp_set_low_precision_compare(int enabled) { s_vp_low_precision = enabled != 0; }
+/* T2-08: RPCS3 VKDraw.cpp:593-619 vertex samplers take unnormalizedCoordinates
+ * from CELL_GCM_TEXTURE_UN. 1D/2D units in the mask divide the coordinate by
+ * the texture size: the baked guest size when given, else GetDimensions. */
+static u32 s_vp_vtex_un_mask, s_vp_vtex_un_dim[4][2];
+void rsx_vp_set_vtex_unnorm(u32 mask, const u32 dims[4][2])
+{
+    s_vp_vtex_un_mask = mask & 15u;
+    for (u32 u = 0; u < 4; u++) {
+        s_vp_vtex_un_dim[u][0] = dims ? dims[u][0] : 0u;
+        s_vp_vtex_un_dim[u][1] = dims ? dims[u][1] : 0u;
+    }
+}
+static int vp_env_on(const char* name, int* cache)
+{
+    if (*cache < 0) { const char* e = getenv(name); *cache = !(e && *e == '0'); }
+    return *cache;
+}
+/* H2-02: RPCS3 keeps all 6-bit temps distinct; RSX_VP_TEMP64=0 aliases
+ * writes to R32+ onto R0+ again. */
+static int vp_temp64(void) { static int c = -1; return vp_env_on("RSX_VP_TEMP64", &c); }
+static int vp_vtex_un(void) { static int c = -1; return vp_env_on("RSX_VP_VTEX_UN", &c); }
+/* H2-07: RSXVertexPrologue.glsl snaps with floor(d + 0.5); RSX_VP_ZSNAP_FLOOR=0
+ * restores round(). */
+static int vp_zsnap_floor(void) { static int c = -1; return vp_env_on("RSX_VP_ZSNAP_FLOOR", &c); }
 
 /* BRA BRI CAL CLI RET BRB CLB (scalar opcodes). */
 static int vp_is_flow(u32 sca_op)
@@ -146,10 +194,10 @@ static int vp_is_flow(u32 sca_op)
 
 /* Branch target (NV40 layout, RPCS3 as oracle): D0[23] << 9 | D2[0:5] << 3 |
  * D3[29:31], an absolute VP slot; made relative to the program start. */
-static u32 vp_branch_target(u32 d0, u32 d2, u32 d3)
+static u32 vp_branch_target_from(u32 d0, u32 d2, u32 d3, u32 base)
 {
     const u32 t = (((d0 >> 23) & 1u) << 9) | ((d2 & 0x3Fu) << 3) | ((d3 >> 29) & 7u);
-    return t >= s_vp_branch_base ? t - s_vp_branch_base : t;
+    return t >= base ? t - base : t;
 }
 
 /* Condition-code state for one instruction (D0). The NV40 VP has two CC
@@ -159,9 +207,10 @@ static u32 vp_branch_target(u32 d0, u32 d2, u32 d3)
 typedef struct { int test; u32 cond, sel; char swz[4]; } CondCtx;
 
 /* Emit the store, predicated per component when a cond test is active. */
-static void emit_store_cc(Out* b, const char* dst_fmt, u32 idx, const char* m, const CondCtx* cc)
+static void emit_store_cc_src(Out* b, const char* dst_fmt, u32 idx, const char* m,
+                              const CondCtx* cc, const char* src)
 {
-    if (!cc->test) { emit_store(b, dst_fmt, idx, m); return; }
+    if (!cc->test) { emit_store_src(b, dst_fmt, idx, m, src); return; }
     if (cc->cond == 0) return;                      /* FL: never writes */
     static const char* cmp[8] = { 0, "<", "==", "<=", ">", "!=", ">=", 0 };
     char dst[32];
@@ -169,10 +218,14 @@ static void emit_store_cc(Out* b, const char* dst_fmt, u32 idx, const char* m, c
     for (const char* c = m; *c; c++) {
         const int ci = (*c == 'x') ? 0 : (*c == 'y') ? 1 : (*c == 'z') ? 2 : 3;
         char line[160];
-        snprintf(line, sizeof(line), "        if (cc[%u].%c %s 0.0) %s.%c = _v.%c;\n",
-                 cc->sel, cc->swz[ci], cmp[cc->cond], dst, *c, *c);
+        snprintf(line, sizeof(line), "        if (cc[%u].%c %s 0.0) %s.%c = %s.%c;\n",
+                 cc->sel, cc->swz[ci], cmp[cc->cond], dst, *c, src, *c);
         emit(b, line);
     }
+}
+static void emit_store_cc(Out* b, const char* dst_fmt, u32 idx, const char* m, const CondCtx* cc)
+{
+    emit_store_cc_src(b, dst_fmt, idx, m, cc, "_v");
 }
 
 static u32 vec_source_use(u32 op, int* exact)
@@ -237,12 +290,12 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
         const u32 src1 = (d2 >> 6) & 0x1FFFF;
         const u32 src2 = ((d3 >> 21) & 0x7FF) | ((d2 & 0x3F) << 11);
         const u32 sources[3] = {src0, src1, src2};
-        const int vec_writes = ((d3 >> 13) & 0xFu) != 0;
-        const int sca_writes = ((d3 >> 17) & 0xFu) != 0;
+        /* An empty write mask is a full one (RPCS3 GetMask); flow control
+         * makes the straight-line walk inexact. */
         u32 use = 0;
-        if (vec_writes && vec_op)
+        if (vec_op)
             use |= vec_source_use(vec_op, &analysis->exact);
-        if (sca_writes && sca_op)
+        if (sca_op)
             use |= sca_source_use(sca_op, &analysis->exact);
         for (u32 source = 0; source < 3; source++)
             if ((use & (1u << source)) && (sources[source] & 3u) == 2u)
@@ -294,9 +347,193 @@ int rsx_vp_decompile_compact_ex(
         ucode, max_bytes, vtex_mask, 1, input_mask, out, out_size);
 }
 
+static int rsx_vp_decompile_core(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
+    u32 input_mask, const rsx_vp_program_info* info, char* out, u32 out_size);
+
 static int rsx_vp_decompile_impl(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
     u32 input_mask, char* out, u32 out_size)
+{
+    return rsx_vp_decompile_core(ucode, max_bytes, vtex_mask, compact_inputs,
+                                 input_mask, NULL, out, out_size);
+}
+
+/* ---- program analysis (RPCS3 vertex_program_utils::analyse_vertex_program) */
+static int vp_walk(const u8* mem, u32 total, u32 start, int fast_exit,
+                   rsx_vp_program_info* r, u32* range_lo, u32* range_hi,
+                   int* has_branch, u32* call_stack, u32* csp, int depth)
+{
+    u32 cur = start;
+    u32 targets[RSX_VP_MAX_INSTR];
+    u32 n_targets = 0;
+    if (depth > 64) return -1;
+    for (;;) {
+        if (cur >= total) return -1;
+        if (r->mask[cur >> 5] & (1u << (cur & 31))) break;   /* self-intersection */
+        const u8* p = mem + cur * 16u;
+        const u32 d0 = rd_le(p), d1 = rd_le(p + 4), d2 = rd_le(p + 8), d3 = rd_le(p + 12);
+        r->mask[cur >> 5] |= 1u << (cur & 31);
+        if (cur < *range_lo) *range_lo = cur;
+        if (cur > *range_hi) *range_hi = cur;
+
+        const u32 sca = (d1 >> 27) & 0x1Fu;
+        int static_jump = 0, function_call = 1, jumped = 0;
+        switch (sca) {
+        case 0x09:                                   /* BRI */
+            static_jump = ((d0 >> 10) & 7u) == 7u;
+            /* fallthrough */
+        case 0x11:                                   /* BRB */
+            function_call = 0;
+            /* fallthrough */
+        case 0x0A: case 0x0B: case 0x12: {           /* CAL CLI CLB */
+            *has_branch = 1;
+            const u32 t = (((d0 >> 23) & 1u) << 9) | ((d2 & 0x3Fu) << 3) | ((d3 >> 29) & 7u);
+            if (function_call) {
+                if (*csp >= 64) return -1;
+                call_stack[(*csp)++] = cur + 1;
+                cur = t; jumped = 1;
+            } else if (static_jump) {
+                cur = t; jumped = 1;
+            } else {
+                u32 k = 0;
+                while (k < n_targets && targets[k] != t) k++;
+                if (k == n_targets && n_targets < RSX_VP_MAX_INSTR) targets[n_targets++] = t;
+                if (t > *range_hi) *range_hi = t;
+            }
+            break;
+        }
+        case 0x0C:                                   /* RET */
+            if (*csp) { cur = call_stack[--(*csp)]; jumped = 1; }
+            break;
+        default: break;
+        }
+        if (jumped) continue;
+
+        if (d3 & 1u) {
+            if (!*has_branch || fast_exit || cur >= *range_hi) break;
+        } else if (cur + 1 == total) {
+            break;
+        }
+        cur++;
+    }
+    /* std::set iteration order: ascending */
+    for (u32 i = 0; i < n_targets; i++)
+        for (u32 j = i + 1; j < n_targets; j++)
+            if (targets[j] < targets[i]) { const u32 t = targets[i]; targets[i] = targets[j]; targets[j] = t; }
+    for (u32 i = 0; i < n_targets; i++) {
+        const u32 t = targets[i];
+        if (t < total && !(r->mask[t >> 5] & (1u << (t & 31))))
+            if (vp_walk(mem, total, t, 1, r, range_lo, range_hi, has_branch,
+                        call_stack, csp, depth + 1) < 0)
+                return -1;
+    }
+    return 0;
+}
+
+int rsx_vp_analyse_program(const u8* vp_mem, u32 total_slots, u32 entry,
+                           rsx_vp_program_info* info)
+{
+    if (!vp_mem || !info) return -1;
+    if (total_slots > RSX_VP_MAX_INSTR) total_slots = RSX_VP_MAX_INSTR;
+    memset(info, 0, sizeof *info);
+    if (entry >= total_slots) return -1;
+    u32 lo = 0xFFFFFFFFu, hi = 0, csp = 0;
+    u32 call_stack[64];
+    int has_branch = 0;
+    if (vp_walk(vp_mem, total_slots, entry, 0, info, &lo, &hi, &has_branch,
+                call_stack, &csp, 0) < 0 || lo > hi || hi >= total_slots)
+        return -1;
+    info->base = lo;
+    info->count = hi - lo + 1u;
+    info->entry = entry - lo;
+    info->has_branch = has_branch;
+    /* Shift the touched-instruction mask down to the program base. */
+    u32 shifted[RSX_VP_MASK_WORDS];
+    memset(shifted, 0, sizeof shifted);
+    for (u32 i = 0; i < info->count; i++) {
+        const u32 s = lo + i;
+        if (info->mask[s >> 5] & (1u << (s & 31))) shifted[i >> 5] |= 1u << (i & 31);
+    }
+    memcpy(info->mask, shifted, sizeof shifted);
+    return (int)info->count;
+}
+
+/* Whole-program entry point: analyse from `entry_slot` over the full
+ * transform program memory, then decompile the touched range with branch
+ * targets relative to its base (RPCS3 patches them the same way). */
+int rsx_vp_decompile_program(const u8* vp_mem, u32 total_slots, u32 entry_slot,
+                             u32 vtex_mask, u32 input_mask, int compact_inputs,
+                             char* out, u32 out_size)
+{
+    rsx_vp_program_info info;
+    if (rsx_vp_analyse_program(vp_mem, total_slots, entry_slot, &info) < 0) return -1;
+    const u8* uc = vp_mem + info.base * 16u;
+    const u32 bytes = info.count * 16u;
+    if (compact_inputs) {
+        rsx_vp_input_analysis analysis;
+        if (rsx_vp_analyze_inputs(uc, bytes, &analysis) < 0 || !analysis.exact ||
+            info.has_branch || info.entry ||
+            (analysis.input_mask & ~(input_mask & 0xFFFFu)) != 0)
+            input_mask = 0xFFFFu;
+        else
+            input_mask = analysis.input_mask;
+    }
+    return rsx_vp_decompile_core(uc, bytes, vtex_mask, compact_inputs, input_mask,
+                                 &info, out, out_size);
+}
+
+/* Destination write (RPCS3 VertexProgramDecompiler::SetDST / GetDST):
+ *   - cond == FL: nothing is written, cond test or not;
+ *   - an empty write mask is a full one;
+ *   - o[dst] when this unit owns the result (VEC: vec_result, SCA: !vec_result)
+ *     and dst != 0x1F (dst > 15 is not an output and is dropped);
+ *   - the temp (address register for ARL) when its index != 0x3F;
+ *   - otherwise CC when this unit does not own the result, or, with no
+ *     destination at all, when either CC update bit is set.
+ * Cond-tested writes go per component through the CC swizzle. */
+static void vp_write(Out* b, const char* value, int is_sca, int is_arl,
+                     u32 d0, u32 d3, const CondCtx* cc, u32* out_written)
+{
+    if (((d0 >> 10) & 7u) == 0u) return;
+    char m[6];
+    if (is_sca) mask_str((d3 >> 20) & 1, (d3 >> 19) & 1, (d3 >> 18) & 1, (d3 >> 17) & 1, m);
+    else        mask_str((d3 >> 16) & 1, (d3 >> 15) & 1, (d3 >> 14) & 1, (d3 >> 13) & 1, m);
+    if (!m[0]) memcpy(m, "xyzw", 5);
+    const u32 dst = (d3 >> 2) & 0x1Fu;
+    const u32 tmp = is_sca ? ((d3 >> 7) & 0x3Fu) : ((d0 >> 15) & 0x3Fu);
+    const int is_result = is_sca ? !((d0 >> 30) & 1u) : (int)((d0 >> 30) & 1u);
+    const int saturate = (d0 >> 26) & 1;
+
+    char line[700];
+    snprintf(line, sizeof line, "    { float4 _v = (float4)(%s);%s\n", value,
+             (saturate && !is_arl) ? " _v = saturate(_v);" : "");
+    emit(b, line);
+    if (dst != 0x1Fu || tmp != 0x3Fu) {
+        if (is_result && dst != 0x1Fu && !is_arl && dst < 16u) {
+            emit_store_cc(b, "o[%u]", dst, m, cc);
+            *out_written |= 1u << dst;
+        }
+        if (tmp != 0x3Fu) {
+            if (is_arl) {
+                /* RPCS3 writes "a" + dst_tmp; only a0/a1 are ever read. */
+                emit(b, "        int4 _vi = (int4)_v;\n");
+                if (tmp < 2u) emit_store_cc_src(b, "a%u", tmp, m, cc, "_vi");
+            } else {
+                emit_store_cc(b, "r[%u]", tmp & (vp_temp64() ? 63u : 31u), m, cc);
+            }
+        } else if (!is_result) {
+            emit_store_cc(b, "cc[%u]", cc->sel, m, cc);
+        }
+    } else if (((d0 >> 14) & 1u) || ((d0 >> 29) & 1u)) {
+        emit_store_cc(b, "cc[%u]", cc->sel, m, cc);
+    }
+    emit(b, "    }\n");
+}
+
+static int rsx_vp_decompile_core(
+    const u8* ucode, u32 max_bytes, u32 vtex_mask, int compact_inputs,
+    u32 input_mask, const rsx_vp_program_info* info, char* out, u32 out_size)
 {
     if (!ucode || !out || out_size < 256) return -1;
 
@@ -305,57 +542,67 @@ static int rsx_vp_decompile_impl(
     Out b = { body, sizeof(body), 0, 0 };
     body[0] = '\0';
 
-    int n_cond_skipped = 0, n_flow_skipped = 0;
+    u32 out_written = 0;   /* o[] registers the program writes (RPCS3 HasParam) */
+    /* Flow control: a branching program is emitted as a block state machine.
+     * Leaders are the entry, every branch target, the instruction after
+     * every branch or program exit, and the first live instruction after a
+     * dead one; each block is "if (_pc == N) { ... _pc = next; }" inside a
+     * bounded loop, with a small call stack for CAL/RET. Branch-free
+     * programs are emitted straight. With `info` (rsx_vp_decompile_program)
+     * the instruction range, entry and live mask come from the RPCS3-style
+     * walk and branch targets are relative to info->base; without it the
+     * program runs from the first instruction to the first end bit and
+     * targets are relative to rsx_vp_set_branch_base(). */
+    const u32 base = info ? info->base : s_vp_branch_base;
+    u32 n_instr = 0;
+    if (info) {
+        n_instr = info->count;
+        if (n_instr * 16u > max_bytes) return -1;
+    } else {
+        n_instr = rsx_vp_program_size_instrs(ucode, max_bytes);
+        if (!n_instr) n_instr = max_bytes / 16u;
+    }
+    if (n_instr > RSX_VP_MAX_INSTR) n_instr = RSX_VP_MAX_INSTR;
+#define VP_LIVE(k) (info ? ((info->mask[(k) >> 5] >> ((k) & 31)) & 1u) : 1u)
+    const u32 entry = info ? info->entry : 0u;
 
-    /* Flow control (BRI/CAL/CLI/RET...). It carries no write mask, so it was
-     * dropped and every block ran straight through: a lit shader that
-     * branches around its lighting when lighting is off (@20 -> 134 on
-     * cc.y == 0 in Tornado Outbreak's UI/particle shader) zeroed its colour
-     * and summed no lights -- black text, black smoke, black leaves.
-     *
-     * A branching program is emitted as a block state machine: leaders are
-     * the entry, every branch target and the instruction after every branch;
-     * each block is "if (_pc == N) { ... _pc = next-or-target; }" inside a
-     * bounded loop, with a small call stack for CAL/RET. Branch-free programs
-     * are emitted exactly as before. Targets are VP slot addresses; the slot
-     * the program starts at comes from rsx_vp_set_branch_base(). */
     static u8 leader[RSX_VP_MAX_INSTR + 1];
     memset(leader, 0, sizeof leader);
     int has_flow = 0;
-    {
-        u32 o2 = 0; int k = 0;
-        while (o2 + 16 <= max_bytes && k < RSX_VP_MAX_INSTR) {
-            const u32 e0 = rd_le(ucode + o2), e1 = rd_le(ucode + o2 + 4);
-            const u32 e2 = rd_le(ucode + o2 + 8), e3 = rd_le(ucode + o2 + 12);
-            const u32 so = (e1 >> 27) & 0x1F;
-            if (vp_is_flow(so)) {
-                has_flow = 1;
-                const u32 t = vp_branch_target(e0, e2, e3);
-                if (t < RSX_VP_MAX_INSTR) leader[t] = 1;
-                leader[k + 1] = 1;
-            }
-            k++; o2 += 16;
-            if (e3 & 1u) break;
+    for (u32 k = 0; k < n_instr; k++) {
+        if (!VP_LIVE(k)) continue;
+        const u8* p = ucode + k * 16u;
+        const u32 e0 = rd_le(p), e1 = rd_le(p + 4), e2 = rd_le(p + 8), e3 = rd_le(p + 12);
+        if (vp_is_flow((e1 >> 27) & 0x1F)) {
+            has_flow = 1;
+            const u32 t = vp_branch_target_from(e0, e2, e3, base);
+            if (t < RSX_VP_MAX_INSTR) leader[t] = 1;
+            leader[k + 1] = 1;
         }
-        leader[0] = 1;
+        if (e3 & 1u) leader[k + 1] = 1;
+        if (k && !VP_LIVE(k - 1)) leader[k] = 1;
     }
+    if (entry) has_flow = 1;
+    leader[entry] = 1;
+    leader[0] = 1;
     int block_open = 0;
 
-    u32 off = 0; int instrs = 0;
-    while (off + 16 <= max_bytes) {
-        u32 d0 = rd_le(ucode+off+0), d1 = rd_le(ucode+off+4);
-        u32 d2 = rd_le(ucode+off+8), d3 = rd_le(ucode+off+12);
-        if (has_flow && instrs < RSX_VP_MAX_INSTR && leader[instrs]) {
+    int instrs = 0;
+    for (u32 i = 0; i < n_instr; i++) {
+        if (!VP_LIVE(i)) continue;
+        const u8* p = ucode + i * 16u;
+        u32 d0 = rd_le(p), d1 = rd_le(p + 4), d2 = rd_le(p + 8), d3 = rd_le(p + 12);
+        if (has_flow && leader[i]) {
             char line[64];
             if (block_open) {
-                snprintf(line, sizeof line, "        _pc = %d;\n    }\n", instrs);
+                snprintf(line, sizeof line, "        _pc = %u;\n    }\n", i);
                 emit(&b, line);
             }
-            snprintf(line, sizeof line, "    if (_pc == %d) {\n", instrs);
+            snprintf(line, sizeof line, "    if (_pc == %u) {\n", i);
             emit(&b, line);
             block_open = 1;
         }
-        off += 16; instrs++;
+        instrs = (int)i + 1;
 
         u32 vec_op = (d1 >> 22) & 0x1F;
         u32 sca_op = (d1 >> 27) & 0x1F;
@@ -370,215 +617,187 @@ static int rsx_vp_decompile_impl(
         int a0 = (d0 >> 21) & 1, a1 = (d0 >> 22) & 1, a2 = (d0 >> 23) & 1;
         u32 addr_sel = (d0 >> 24) & 1;
         u32 addr_swz = d0 & 3;
-        int saturate = (d0 >> 26) & 1;
         int cond_test = (d0 >> 13) & 1;
         u32 cond = (d0 >> 10) & 7;
+
+        /* RPCS3: a source with register type 0 aborts the program there. */
+        int program_end = 0;
+        if (!(src0 & 3u) || !(src1 & 3u) || !(src2 & 3u)) {
+            emit(&b, "    /* src check failed: program aborts */\n");
+            program_end = 1;
+            vec_op = sca_op = 0;
+        }
 
         char A[96], B[96], C[96];
         emit_src(src0, a0, input_src, const_src, index_const, addr_sel, addr_swz, A, sizeof(A));
         emit_src(src1, a1, input_src, const_src, index_const, addr_sel, addr_swz, B, sizeof(B));
         emit_src(src2, a2, input_src, const_src, index_const, addr_sel, addr_swz, C, sizeof(C));
 
-        u32 dst_tmp     = (d0 >> 15) & 0x3F;
-        u32 dst_out     = (d3 >> 2) & 0x1F;
-        u32 sca_dst_tmp = (d3 >> 7) & 0x3F;
-        int vec_result  = (d0 >> 30) & 1;
-
-        int vmx=(d3>>16)&1, vmy=(d3>>15)&1, vmz=(d3>>14)&1, vmw=(d3>>13)&1;
-        int smx=(d3>>20)&1, smy=(d3>>19)&1, smz=(d3>>18)&1, smw=(d3>>17)&1;
-
         /* Condition codes (D0: CC swizzle [2:9], cond [10:12], test [13],
-         * update-enable [14] and [29], CC register select [25]). They were
-         * not modeled: every predicated write ran unconditionally and every
-         * CC-only write was dropped. Tornado Outbreak's UI shader replaces
-         * the vertex colour with a material constant under a CC test, so its
-         * text took that constant's alpha of 0 and the alpha test discarded
-         * every glyph. */
+         * update-enable [14] / [29], CC register select [25]). */
         CondCtx cc = { cond_test && cond != 7, cond, (d0 >> 25) & 1, {0} };
         cc.swz[0] = SWZ[(d0 >> 8) & 3]; cc.swz[1] = SWZ[(d0 >> 6) & 3];
         cc.swz[2] = SWZ[(d0 >> 4) & 3]; cc.swz[3] = SWZ[(d0 >> 2) & 3];
-        const int cc_update = ((d0 >> 14) & 1) && ((d0 >> 29) & 1);
-        if (cc.test) n_cond_skipped++;
 
         /* ---- vector ALU ---- */
-        if ((vmx|vmy|vmz|vmw) && vec_op != 0x00) {
+        if (vec_op != 0x00) {
             char rhs[512];
-            int handled = 1;
+            int handled = 1, is_arl = 0;
             switch (vec_op) {
             case 0x01: snprintf(rhs,sizeof rhs,"%s",A); break;                 /* MOV */
             case 0x02: snprintf(rhs,sizeof rhs,"vp_mul((%s),(%s))",A,B); break;  /* MUL */
             case 0x03: snprintf(rhs,sizeof rhs,"(%s)+(%s)",A,C); break;        /* ADD: src0 + src2 */
-            case 0x04: snprintf(rhs,sizeof rhs,"vp_mul((%s),(%s))+(%s)",A,B,C); break; /* MAD */
+            case 0x04: snprintf(rhs,sizeof rhs,"vp_mad((%s),(%s),(%s))",A,B,C); break; /* MAD */
             case 0x05: snprintf(rhs,sizeof rhs,"vp_dot3((%s),(%s))",A,B); break; /* DP3 */
             case 0x06: snprintf(rhs,sizeof rhs,"(vp_dot3((%s),(%s))+(%s).w)",A,B,B); break; /* DPH */
             case 0x07: snprintf(rhs,sizeof rhs,"vp_dot4((%s),(%s))",A,B); break; /* DP4 */
             case 0x08: snprintf(rhs,sizeof rhs,"float4(1,(%s).y*(%s).y,(%s).z,(%s).w)",A,B,A,B); break; /* DST */
             case 0x09: snprintf(rhs,sizeof rhs,"min((%s),(%s))",A,B); break;   /* MIN */
             case 0x0A: snprintf(rhs,sizeof rhs,"max((%s),(%s))",A,B); break;   /* MAX */
-            case 0x0B: snprintf(rhs,sizeof rhs,"(float4)((%s)<(%s))",A,B); break;  /* SLT */
-            case 0x0C: snprintf(rhs,sizeof rhs,"(float4)((%s)>=(%s))",A,B); break; /* SGE */
+            case 0x0B: snprintf(rhs,sizeof rhs,"(float4)(vp_cmpfix(%s)<vp_cmpfix(%s))",A,B); break;  /* SLT */
+            case 0x0C: snprintf(rhs,sizeof rhs,"(float4)(vp_cmpfix(%s)>=vp_cmpfix(%s))",A,B); break; /* SGE */
+            case 0x0D: snprintf(rhs,sizeof rhs,"%s",A); is_arl = 1; break;     /* ARL: int4($0), truncating */
             case 0x0E: snprintf(rhs,sizeof rhs,"frac(%s)",A); break;           /* FRC */
             case 0x0F: snprintf(rhs,sizeof rhs,"floor(%s)",A); break;          /* FLR */
-            case 0x10: snprintf(rhs,sizeof rhs,"(float4)((%s)==(%s))",A,B); break; /* SEQ */
+            case 0x10: snprintf(rhs,sizeof rhs,"(float4)(vp_cmpfix(%s)==vp_cmpfix(%s))",A,B); break; /* SEQ */
             case 0x11: snprintf(rhs,sizeof rhs,"(float4)0"); break;            /* SFL */
-            case 0x12: snprintf(rhs,sizeof rhs,"(float4)((%s)>(%s))",A,B); break;  /* SGT */
-            case 0x13: snprintf(rhs,sizeof rhs,"(float4)((%s)<=(%s))",A,B); break; /* SLE */
-            case 0x14: snprintf(rhs,sizeof rhs,"(float4)((%s)!=(%s))",A,B); break; /* SNE */
+            case 0x12: snprintf(rhs,sizeof rhs,"(float4)(vp_cmpfix(%s)>vp_cmpfix(%s))",A,B); break;  /* SGT */
+            case 0x13: snprintf(rhs,sizeof rhs,"(float4)(vp_cmpfix(%s)<=vp_cmpfix(%s))",A,B); break; /* SLE */
+            case 0x14: snprintf(rhs,sizeof rhs,"(float4)(vp_cmpfix(%s)!=vp_cmpfix(%s))",A,B); break; /* SNE */
             case 0x15: snprintf(rhs,sizeof rhs,"float4(1,1,1,1)"); break;      /* STR */
             case 0x16: snprintf(rhs,sizeof rhs,"sign(%s)",A); break;           /* SSG */
-            case 0x19: {
+            case 0x19: {                                                       /* TXL */
                 const u32 tex_unit = (d2 >> 8) & 3u;
-                if ((vtex_mask >> tex_unit) & 1u)
+                /* T2-08: UN 1D/2D units divide by the texture size. */
+                const int un = vp_vtex_un() && (((vtex_mask & s_vp_vtex_un_mask) >> tex_unit) & 1u) &&
+                    !((((s_vp_vtex_3d_mask | s_vp_vtex_cube_mask) & ~s_vp_vtex_1d_mask) >> tex_unit) & 1u);
+                if (((vtex_mask & s_vp_vtex_1d_mask) >> tex_unit) & 1u)
                     snprintf(rhs, sizeof rhs,
-                        "rsx_vtex%u.SampleLevel(rsx_vsamp%u, (%s).xy, 0.0)",
+                        un ? "rsx_vtex%u.SampleLevel(rsx_vsamp%u, float2((%s).x / _rsx_vtex_size%u().x, 0.5), 0.0)"
+                           : "rsx_vtex%u.SampleLevel(rsx_vsamp%u, float2((%s).x, 0.5), 0.0)",
+                        tex_unit, tex_unit, A, tex_unit);
+                else if (((vtex_mask & (s_vp_vtex_3d_mask | s_vp_vtex_cube_mask)) >> tex_unit) & 1u)
+                    snprintf(rhs, sizeof rhs,
+                        "rsx_vtex%u.SampleLevel(rsx_vsamp%u, (%s).xyz, 0.0)",
                         tex_unit, tex_unit, A);
+                else if ((vtex_mask >> tex_unit) & 1u)
+                    snprintf(rhs, sizeof rhs,
+                        un ? "rsx_vtex%u.SampleLevel(rsx_vsamp%u, (%s).xy / _rsx_vtex_size%u(), 0.0)"
+                           : "rsx_vtex%u.SampleLevel(rsx_vsamp%u, (%s).xy, 0.0)",
+                        tex_unit, tex_unit, A, tex_unit);
                 else
                     snprintf(rhs, sizeof rhs, "float4(0,0,0,0)");
                 break;
             }
-            case 0x0D: /* ARL: address register load, rounds down */
-                if (vmx|vmy|vmz|vmw) {
-                    char m[6]; mask_str(vmx,vmy,vmz,vmw,m);
-                    char line[256];
-                    /* Resistance port: the ARL destination is address register
-                     * D0.dst_tmp (RPCS3 GetDST: "a" + dst_tmp), NOT addr_reg_sel --
-                     * that bit picks the register an INDEXED READ uses. Taking it
-                     * here sent every a1 load into a0, so a1-indexed reads (Fall of
-                     * Man's particle light grid: vc[83 + a1.y]) always used index 0
-                     * and the fire lit itself white. */
-                    const u32 adst = ((d0 >> 15) & 0x3Fu) & 1u;
-                    snprintf(line,sizeof line,
-                        "    { int4 _a = (int4)floor(%s); a%u.%s = _a.%s; }\n",
-                        A, adst, m, m);
-                    emit(&b, line);
-                }
-                handled = 0;
-                break;
             default:
-                n_flow_skipped++;
-                emit(&b, "    /* TODO: unhandled VP vec op */\n");
+                /* RPCS3: unknown vector opcode ends the program. */
+                emit(&b, "    /* unknown VP vec op: program aborts */\n");
+                program_end = 1;
                 handled = 0;
                 break;
             }
-
-            if (handled) {
-                char m[6]; mask_str(vmx,vmy,vmz,vmw,m);
-                char line[600];
-                snprintf(line,sizeof line,"    { float4 _v = (float4)(%s);%s\n",
-                         rhs, saturate ? " _v = saturate(_v);" : "");
-                emit(&b, line);
-                if (vec_result && dst_out != 0x1F)
-                    emit_store_cc(&b, "o[%u]", dst_out & 15, m, &cc);
-                if (dst_tmp != 0x3F)
-                    emit_store_cc(&b, "r[%u]", dst_tmp & 31, m, &cc);
-                if (cc_update)
-                    emit_store_cc(&b, "cc[%u]", cc.sel, m, &cc);
-                emit(&b, "    }\n");
-            }
+            if (handled)
+                vp_write(&b, rhs, 0, is_arl, d0, d3, &cc, &out_written);
         }
 
-        /* Flow control has no write mask, so the ALU path below skips it
-         * silently. Mark it, with the decoded target, so a dump shows where a
-         * program branches. */
+        /* ---- scalar ALU (reads SRC2, per component like RPCS3) ---- */
         char flow_term[256] = "";
+        if (sca_op != 0x00 && !vp_is_flow(sca_op)) {
+            char rhs[256];
+            rhs[0] = '\0';
+            switch (sca_op) {
+            case 0x01: snprintf(rhs,sizeof rhs,"%s",C); break;                          /* MOV */
+            case 0x02: snprintf(rhs,sizeof rhs,"(1.0/(%s))",C); break;                  /* RCP */
+            case 0x03: snprintf(rhs,sizeof rhs,"clamp(1.0/(%s), 5.42101e-20, 1.884467e19)",C); break; /* RCC */
+            case 0x04: snprintf(rhs,sizeof rhs,"(float4)(1.0/sqrt(max((%s).x, 1e-10)))",C); break; /* RSQ */
+            case 0x05: snprintf(rhs,sizeof rhs,"exp(%s)",C); break;                     /* EXP */
+            case 0x06: snprintf(rhs,sizeof rhs,"log(%s)",C); break;                     /* LOG */
+            case 0x07: snprintf(rhs,sizeof rhs,"vp_lit(%s)",C); break;                  /* LIT */
+            case 0x0D: snprintf(rhs,sizeof rhs,"log2(max((%s), 1e-10))",C); break;      /* LG2 */
+            case 0x0E: snprintf(rhs,sizeof rhs,"exp2(%s)",C); break;                    /* EX2 */
+            case 0x0F: snprintf(rhs,sizeof rhs,"sin(%s)",C); break;                     /* SIN */
+            case 0x10: snprintf(rhs,sizeof rhs,"cos(%s)",C); break;                     /* COS */
+            case 0x13: case 0x14:                                                       /* PSH POP */
+                emit(&b, "    /* PSH/POP: unimplemented (RPCS3 too) */\n");
+                break;
+            default:
+                emit(&b, "    /* unknown VP sca op: program aborts */\n");
+                program_end = 1;
+                break;
+            }
+            if (rhs[0])
+                vp_write(&b, rhs, 1, 0, d0, d3, &cc, &out_written);
+        }
+
+        /* Branches are decoded last, after a co-issued vector op (RPCS3). */
         if (vp_is_flow(sca_op)) {
-            const u32 tgt = vp_branch_target(d0, d2, d3);
+            const u32 tgt = vp_branch_target_from(d0, d2, d3, base);
             char line[160];
-            snprintf(line, sizeof line, "    /* FLOW %s @%d -> %u cond=%u test=%d swz=%c%c%c%c */\n",
-                     rsx_vp_sca_name(sca_op), instrs - 1, tgt, cond, cond_test,
-                     SWZ[(d0 >> 8) & 3], SWZ[(d0 >> 6) & 3], SWZ[(d0 >> 4) & 3], SWZ[(d0 >> 2) & 3]);
+            snprintf(line, sizeof line, "    /* FLOW %s @%u -> %u cond=%u test=%d swz=%c%c%c%c */\n",
+                     rsx_vp_sca_name(sca_op), i, tgt, cond, cond_test,
+                     cc.swz[0], cc.swz[1], cc.swz[2], cc.swz[3]);
             emit(&b, line);
-            /* The condition applies whether or not cond_test is set: every
-             * branch in these programs has test=0 with a real cond. */
+            /* RPCS3 GetCond: any() of the CC swizzle compared against zero,
+             * applied whether or not the cond-test bit is set. */
             static const char* cmp[8] = { 0, "<", "==", "<=", ">", "!=", ">=", 0 };
-            char c[48];
+            char c[64];
             if (cond == 7)      snprintf(c, sizeof c, "true");
             else if (cond == 0) snprintf(c, sizeof c, "false");
-            else snprintf(c, sizeof c, "(cc[%u].%c %s 0.0)", (d0 >> 25) & 1,
-                          SWZ[(d0 >> 8) & 3], cmp[cond]);
-            const int next = instrs;
+            else snprintf(c, sizeof c, "any(cc[%u].%c%c%c%c %s (float4)0)", cc.sel,
+                          cc.swz[0], cc.swz[1], cc.swz[2], cc.swz[3], cmp[cond]);
+            const u32 next = i + 1;
             if (sca_op == 0x09 || sca_op == 0x08)          /* BRI, BRA */
-                snprintf(flow_term, sizeof flow_term, "        _pc = %s ? %u : %d;\n", c, tgt, next);
+                snprintf(flow_term, sizeof flow_term, "        _pc = %s ? %u : %u;\n", c, tgt, next);
             else if (sca_op == 0x0A || sca_op == 0x0B)     /* CAL, CLI */
                 snprintf(flow_term, sizeof flow_term,
-                         "        if (%s) { _cs[_csp] = %d; _csp = min(_csp + 1, 7); _pc = %u; } else _pc = %d;\n",
+                         "        if (%s) { _cs[_csp] = %u; _csp = min(_csp + 1, 7); _pc = %u; } else _pc = %u;\n",
                          c, next, tgt, next);
             else if (sca_op == 0x0C)                       /* RET */
+                /* RPCS3: a RET inside a call returns unconditionally; at top
+                 * level it ends the program when its condition holds. */
                 snprintf(flow_term, sizeof flow_term,
-                         "        if (%s) { if (_csp > 0) { _csp--; _pc = _cs[_csp]; } else _pc = -1; } else _pc = %d;\n",
+                         "        if (_csp > 0) { _csp--; _pc = _cs[_csp]; } else _pc = (%s) ? -1 : %u;\n",
                          c, next);
-            else {                                         /* BRB/CLB: boolean-register branches */
-                /* Resistance port: static branches on the transform branch bits
-                 * (NV4097_SET_TRANSFORM_BRANCH_BITS, per draw in vp_branch.x).
-                 * D3[23:27] = bit index, D3[28] = taken when the bit is set
-                 * (else when clear); RPCS3's GetOptionalBranchCond. Fall of
-                 * Man's particle program picks its particle type this way
-                 * (@6 BRB -> 30, @30 BRB -> 69, ...); unmodelled, every
-                 * particle ran the first path: fire/Bullseye rounds white,
-                 * tracers missing. */
+            else {                                         /* BRB/CLB: transform branch bits */
+                /* D3[23:27] = bit index, D3[28] = taken when the bit is set
+                 * (else when clear); RPCS3's GetOptionalBranchCond. */
                 char bc[80];
                 snprintf(bc, sizeof bc, "((vp_branch.x & %uu) %s 0u)",
                          1u << ((d3 >> 23) & 0x1Fu), ((d3 >> 28) & 1u) ? "!=" : "==");
                 if (sca_op == 0x11)                        /* BRB */
-                    snprintf(flow_term, sizeof flow_term, "        _pc = %s ? %u : %d;\n", bc, tgt, next);
+                    snprintf(flow_term, sizeof flow_term, "        _pc = %s ? %u : %u;\n", bc, tgt, next);
                 else                                       /* CLB */
                     snprintf(flow_term, sizeof flow_term,
-                             "        if (%s) { _cs[_csp] = %d; _csp = min(_csp + 1, 7); _pc = %u; } else _pc = %d;\n",
+                             "        if (%s) { _cs[_csp] = %u; _csp = min(_csp + 1, 7); _pc = %u; } else _pc = %u;\n",
                              bc, next, tgt, next);
             }
         }
-        /* ---- scalar ALU (reads SRC2) ---- */
-        if ((smx|smy|smz|smw) && sca_op != 0x00) {
-            char rhs[256];
-            switch (sca_op) {
-            case 0x01: snprintf(rhs,sizeof rhs,"%s",C); break;                /* MOV */
-            case 0x02: snprintf(rhs,sizeof rhs,"(1.0/(%s).x)",C); break;      /* RCP */
-            case 0x03: snprintf(rhs,sizeof rhs,"clamp(1.0/(%s).x, 5.42101e-20, 1.884467e19)",C); break; /* RCC */
-            case 0x04: snprintf(rhs,sizeof rhs,"rsqrt(max(abs((%s).x), 1e-10))",C); break; /* RSQ */
-            case 0x05: snprintf(rhs,sizeof rhs,"exp2((%s).x)",C); break;      /* EXP */
-            case 0x06: snprintf(rhs,sizeof rhs,"log2(max(abs((%s).x), 1e-10))",C); break; /* LOG */
-            case 0x0D: snprintf(rhs,sizeof rhs,"log2(max(abs((%s).x), 1e-10))",C); break; /* LG2 */
-            case 0x0E: snprintf(rhs,sizeof rhs,"exp2((%s).x)",C); break;      /* EX2 */
-            case 0x0F: snprintf(rhs,sizeof rhs,"sin((%s).x)",C); break;       /* SIN */
-            case 0x10: snprintf(rhs,sizeof rhs,"cos((%s).x)",C); break;       /* COS */
-            case 0x07: /* LIT: (1, max(s.x,0), s.x>0 ? 2^(s.w*log2(max(s.y,eps))) : 0, 1) */
-                snprintf(rhs,sizeof rhs,
-                    "float4(1.0, max((%s).x, 0.0), ((%s).x > 0.0) ? "
-                    "exp2(clamp((%s).w, -127.996, 127.996) * log2(max((%s).y, 1e-10))) : 0.0, 1.0)",
-                    C, C, C, C);
-                break;
-            default:
-                n_flow_skipped++;
-                emit(&b, "    /* TODO: VP flow-control op skipped */\n");
-                rhs[0]='\0';
-                break;
-            }
-            if (rhs[0]) {
-                char m[6]; mask_str(smx,smy,smz,smw,m);
-                char line[600];
-                snprintf(line,sizeof line,"    { float4 _v = (float4)(%s);%s\n",
-                         rhs, saturate ? " _v = saturate(_v);" : "");
-                emit(&b, line);
-                /* SCA writes the output register when the VEC unit does not
-                 * own it; otherwise it targets its own temp. */
-                if (!vec_result && dst_out != 0x1F)
-                    emit_store_cc(&b, "o[%u]", dst_out & 15, m, &cc);
-                if (sca_dst_tmp != 0x3F)
-                    emit_store_cc(&b, "r[%u]", sca_dst_tmp & 31, m, &cc);
-                emit(&b, "    }\n");
-            }
-        }
 
-        if (has_flow && flow_term[0]) {
-            emit(&b, flow_term);
-            emit(&b, "    }\n");
-            block_open = 0;
+        const int exits = program_end || (d3 & 1u);
+        if (has_flow) {
+            if (exits) {
+                emit(&b, "        _pc = -1;\n    }\n");
+                block_open = 0;
+            } else if (flow_term[0]) {
+                emit(&b, flow_term);
+                emit(&b, "    }\n");
+                block_open = 0;
+            }
+        } else if (exits) {
+            break;
         }
-        if (d3 & 1u) break; /* end */
     }
     if (block_open) emit(&b, "        _pc = -1;\n    }\n");
+#undef VP_LIVE
 
     if (b.overflow) return -1;
+    /* RPCS3 BuildCode: a program that never writes o[0] is NOPed whole; the
+     * position stays (0,0,0,1) and every other output its default. */
+    if (!(out_written & 1u)) {
+        body[0] = '\0';
+        out_written = 0;
+        has_flow = 0;
+    }
 
     /* ---- assemble full shader ---- */
     Out o = { out, out_size, 0, 0 };
@@ -612,6 +831,26 @@ static int rsx_vp_decompile_impl(
         "    float4 t0:TEXCOORD0; float4 t1:TEXCOORD1; float4 t2:TEXCOORD2; float4 t3:TEXCOORD3;\n"
         "    float4 t4:TEXCOORD4; float4 t5:TEXCOORD5; float4 t6:TEXCOORD6; float4 t7:TEXCOORD7;\n"
         "    float4 t8:TEXCOORD8; float4 t9:TEXCOORD9;\n"
+        /* Built-ins last: they take no interpolant location, and the
+         * varyings above keep theirs. glslang does not map PSIZE to the
+         * PointSize built-in by itself (it would take location 15); its
+         * paths define RSX_FRAGCOORD_W_IS_RCP, FXC never sees the attribute. */
+        "#ifdef RSX_FRAGCOORD_W_IS_RCP\n"
+        "    [[vk::builtin(\"PointSize\")]]\n"
+        "#endif\n"
+        "    float psize:PSIZE;\n");
+    if (s_vp_clip_distances)
+        emit(&o, "    float4 cd0:SV_ClipDistance0; float2 cd1:SV_ClipDistance1;\n");
+    {
+        static int legacy_mul = -1;
+        if (legacy_mul < 0) {
+            const char* e = getenv("RSX_VP_LEGACY_MUL");
+            legacy_mul = e && *e && *e != '0';
+        }
+        if (legacy_mul)
+            emit(&o, "#define RSX_VP_LEGACY_MUL 1\n");
+    }
+    emit(&o,
         "};\n"
         /* b0: 512 vec4 transform constants + the RSX viewport transform,
          * pre-mapped by the harness to D3D clip space:
@@ -620,7 +859,7 @@ static int rsx_vp_decompile_impl(
         "    float4 vp_c[512];\n"
         "    float4 vp_posscale;\n"
         "    float4 vp_posoffset;\n"
-        "    uint4  vp_branch;   /* x: transform branch bits (BRB/CLB) */\n"
+        "    uint4  vp_branch;   /* x: branch bits, y: output mask, z: clip ctl|valid, w: point size */\n"
         /* Resistance port: GPU vertex fetch (rsx_d3d12_backend gf_*). Per
          * attribute: x = byte base in the raw buffer (signed), y = stride,
          * z = type | n<<8 | mode<<16 (mode 1 = array, else constant);
@@ -635,20 +874,66 @@ static int rsx_vp_decompile_impl(
          * text came out NaN, which the FP's NaN guard turned into black. */
         /* Scalar logic per component: glslang's HLSL front end (the Metal
          * path) does not take || on vectors. */
+        "#ifdef RSX_VP_LEGACY_MUL\n"
         "float vp_mul1(float a, float b) { return (a == 0.0 || b == 0.0) ? 0.0 : a * b; }\n"
         "float4 vp_mul(float4 a, float4 b) { return float4(vp_mul1(a.x, b.x), vp_mul1(a.y, b.y),"
         " vp_mul1(a.z, b.z), vp_mul1(a.w, b.w)); }\n"
         "float vp_dot3(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z; }\n"
-        "float vp_dot4(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z + m.w; }\n");
+        "float vp_dot4(float4 a, float4 b) { float4 m = vp_mul(a, b); return m.x + m.y + m.z + m.w; }\n"
+        "float4 vp_mad(float4 a, float4 b, float4 c) { return vp_mul(a, b) + c; }\n"
+        "#else\n"
+        /* RPCS3 VertexProgramDecompiler: MUL `$0 * $1`, MAD `fma`, DPx `dot`
+         * -- plain IEEE. RSX_VP_LEGACY_MUL=1 restores the 0*x=0 rule. */
+        "float4 vp_mul(float4 a, float4 b) { return a * b; }\n"
+        "float vp_dot3(float4 a, float4 b) { return dot(a.xyz, b.xyz); }\n"
+        "float vp_dot4(float4 a, float4 b) { return dot(a, b); }\n"
+        "float4 vp_mad(float4 a, float4 b, float4 c) { return mad(a, b, c); }\n"
+        "#endif\n"
+        /* RPCS3 _fetch_indexed_constant: in range wraps at 512, past 467 reads 0. */
+        "float4 vp_cidx(uint i) { return i < 468u ? vp_c[i] : float4(0, 0, 0, 0); }\n"
+        /* RPCS3 lit_legacy (VertexProgramDecompiler LIT). */
+        "float4 vp_lit(float4 v) { float4 t = float4(max(v.x, 0.0), max(v.y, 1e-10), v.z, v.w);"
+        " return float4(1.0, t.x, t.x > 0.0 ? exp2(t.w * log2(t.y)) : 0.0, 1.0); }\n");
+    {
+        /* RPCS3 VKVertexProgram.cpp:367 low_precision_tests = is_NVIDIA ->
+         * _GPU_LOW_PRECISION_COMPARE (GLSLCommon.cpp:183-186), CMP_FIXUP(a) =
+         * (sign(a) * 16. + a) (RSXProgramCommon.glsl:9-13) around both
+         * operands of SEQ..SNE (VertexProgramDecompiler.cpp:625-634).
+         * RSX_VP_CMP_FIXUP=0 compares the raw operands. */
+        static int cmp_fixup = -1;
+        if (cmp_fixup < 0) {
+            const char* e = getenv("RSX_VP_CMP_FIXUP");
+            cmp_fixup = !(e && *e == '0');
+        }
+        emit(&o, (cmp_fixup && s_vp_low_precision)
+            ? "float4 vp_cmpfix(float4 a) { return sign(a) * 16.0 + a; }\n"
+            : "float4 vp_cmpfix(float4 a) { return a; }\n");
+    }
 
     for (u32 vtu = 0; vtu < 4; vtu++) {
         if (!((vtex_mask >> vtu) & 1u)) continue;
-        char decl[128];
+        char decl[256];
+        const u32 bit = 1u << vtu;
         snprintf(decl, sizeof(decl),
-            "Texture2D rsx_vtex%u : register(t%u);\n"
+            "%s rsx_vtex%u : register(t%u);\n"
             "SamplerState rsx_vsamp%u : register(s%u);\n",
+            (s_vp_vtex_1d_mask & bit) ? "Texture2D" :
+            (s_vp_vtex_3d_mask & bit) ? "Texture3D" :
+            (s_vp_vtex_cube_mask & bit) ? "TextureCube" : "Texture2D",
             vtu, 16u + vtu, vtu, vtu);
         emit(&o, decl);
+        if (vp_vtex_un() && (s_vp_vtex_un_mask & bit) &&
+            ((s_vp_vtex_1d_mask & bit) || !((s_vp_vtex_3d_mask | s_vp_vtex_cube_mask) & bit))) {
+            if (s_vp_vtex_un_dim[vtu][0] && s_vp_vtex_un_dim[vtu][1])
+                snprintf(decl, sizeof(decl),
+                    "float2 _rsx_vtex_size%u() { return float2(%u.0, %u.0); }\n",
+                    vtu, s_vp_vtex_un_dim[vtu][0], s_vp_vtex_un_dim[vtu][1]);
+            else
+                snprintf(decl, sizeof(decl),
+                    "float2 _rsx_vtex_size%u() { uint w, h; rsx_vtex%u.GetDimensions(w, h); return float2(w, h); }\n",
+                    vtu, vtu);
+            emit(&o, decl);
+        }
     }
 
     emit(&o, "VSOutput main(VSInput input) {\n");
@@ -672,35 +957,95 @@ static int rsx_vp_decompile_impl(
         }
     }
     emit(&o,
-        "    float4 r[32]; float4 o[16];\n"
-        "    [unroll] for (int _i=0;_i<32;_i++) r[_i]=(float4)0;\n"
+        "    float4 r[64]; float4 o[16];\n"
+        "    [unroll] for (int _i=0;_i<64;_i++) r[_i]=(float4)0;\n"
         "    [unroll] for (int _j=0;_j<16;_j++) o[_j]=float4(0,0,0,1);\n"
         "    int4 a0 = (int4)0; int4 a1 = (int4)0;\n"
         "    float4 cc[2]; cc[0] = (float4)0; cc[1] = (float4)0;\n");
 
-    if (has_flow)
-        emit(&o, "    int _pc = 0; int _cs[8]; int _csp = 0;\n"
-                 "    [loop] for (int _it = 0; _it < 16384 && _pc >= 0; _it++) {\n");
+    if (has_flow) {
+        char line[64];
+        snprintf(line, sizeof line, "    int _pc = %u; int _cs[8]; int _csp = 0;\n", entry);
+        emit(&o, line);
+        emit(&o, "    [loop] for (int _it = 0; _it < 16384 && _pc >= 0; _it++) {\n");
+    }
     emit(&o, body);
     if (has_flow) emit(&o, "    }\n");
 
-    /* Output register map (see header comment): o0 = HPOS through the RSX
-     * viewport transform, o1/o2 = colors, o5.x = fog, o7..o14 = TEX0..7,
-     * o15 = TEX8, o6 = TEX9 (RPCS3's reg_table: TEX9 shares the point-size
-     * register). */
+    /* Output register map (RPCS3 VKVertexProgram reg_table/insertMainEnd):
+     * o0 = HPOS through the RSX viewport transform, o1/o2 = colours, o5.x =
+     * fog, o5.yzw / o6.yzw = user clip distances 0-2 / 3-5, o6.x = point
+     * size, o7..o14 = TEX0..7, o15 = TEX8, o6 = TEX9. A varying the program
+     * never writes, or that VERTEX_ATTRIB_OUTPUT_MASK leaves off, reads
+     * (0,0,0,1); a point size it does not supply comes from POINT_SIZE. */
     emit(&o,
         "    VSOutput Out;\n"
+        "    const uint _om = (vp_branch.z & 0x80000000u) != 0u ? vp_branch.y : 0xFFFFFFFFu;\n"
+        "    const float4 _d = float4(0, 0, 0, 1);\n"
         "    float4 _p = o[0];\n"
         "    Out.pos = float4(_p.xyz * vp_posscale.xyz + _p.w * vp_posoffset.xyz, _p.w);\n"
-        "    Out.col0 = o[1]; Out.col1 = o[2]; Out.fog = o[5].xxxx;\n"
-        "    Out.t0=o[7];  Out.t1=o[8];  Out.t2=o[9];  Out.t3=o[10];\n"
-        "    Out.t4=o[11]; Out.t5=o[12]; Out.t6=o[13]; Out.t7=o[14];\n"
-        "    Out.t8=o[15]; Out.t9=o[6];\n"
+        /* RPCS3 apply_zclip_xform snap; vp_posoffset.w = 1/(range*16777215). */
+        "    if (vp_posoffset.w > 0.0 && Out.pos.w != 0.0) {\n");
+    emit(&o, vp_zsnap_floor()
+        ? "        float _zd = Out.pos.z / Out.pos.w; float _zn = floor(_zd + 0.5);\n"
+        : "        float _zd = Out.pos.z / Out.pos.w; float _zn = round(_zd);\n");
+    emit(&o,
+        "        if (abs(_zd - _zn) < vp_posoffset.w) Out.pos.z = _zn * Out.pos.w;\n"
+        "    }\n");
+    {
+        static const struct { const char* dst; u32 reg; u32 mask; const char* swz; } k_out[] = {
+            { "col0", 1,  (1u << 0) | (1u << 2), "" },
+            { "col1", 2,  (1u << 1) | (1u << 3), "" },
+            { "fog",  5,  1u << 4,  ".xxxx" },
+            { "t0",   7,  1u << 14, "" }, { "t1", 8,  1u << 15, "" },
+            { "t2",   9,  1u << 16, "" }, { "t3", 10, 1u << 17, "" },
+            { "t4",   11, 1u << 18, "" }, { "t5", 12, 1u << 19, "" },
+            { "t6",   13, 1u << 20, "" }, { "t7", 14, 1u << 21, "" },
+            { "t8",   15, 1u << 12, "" }, { "t9", 6,  1u << 13, "" },
+        };
+        char line[160];
+        for (u32 i = 0; i < sizeof k_out / sizeof k_out[0]; i++) {
+            if (out_written & (1u << k_out[i].reg))
+                snprintf(line, sizeof line,
+                         "    Out.%s = (_om & %uu) != 0u ? o[%u]%s : _d;\n",
+                         k_out[i].dst, k_out[i].mask, k_out[i].reg, k_out[i].swz);
+            else
+                snprintf(line, sizeof line, "    Out.%s = _d;\n", k_out[i].dst);
+            emit(&o, line);
+        }
+    }
+    /* RPCS3 VKVertexProgram.cpp:305/465-498: gl_PointSize = dst_reg6.x only
+     * when the POINTSIZE output-mask bit is set and the program writes o6;
+     * otherwise (mask bit clear included) `gl_PointSize = point_size`, the
+     * POINT_SIZE register (already resolution-scaled in vp_branch.w). */
+    emit(&o,
+        "    Out.psize = (vp_branch.z & 0x80000000u) != 0u ? asfloat(vp_branch.w) : 1.0;\n");
+    if (out_written & (1u << 6))
+        emit(&o, "    if ((_om & 32u) != 0u) Out.psize = o[6].x;\n");
+    if (s_vp_clip_distances) {
+        /* USER_CLIP_PLANE_CONTROL, a nibble per plane: 1 = LT (factor -1),
+         * 2 = GE (+1), else disabled (0.5, i.e. never clipped). */
+        static const char* const k_uc[6] = {
+            "o[5].y", "o[5].z", "o[5].w", "o[6].y", "o[6].z", "o[6].w" };
+        static const char* const k_cd[6] = {
+            "cd0.x", "cd0.y", "cd0.z", "cd0.w", "cd1.x", "cd1.y" };
+        char line[200];
+        for (u32 i = 0; i < 6; i++) {
+            if (out_written & (1u << (i < 3 ? 5u : 6u)))
+                snprintf(line, sizeof line,
+                         "    { const uint _op = (vp_branch.z >> %uu) & 15u;"
+                         " Out.%s = ((_om & %uu) != 0u && (_op == 1u || _op == 2u))"
+                         " ? %s * (_op == 2u ? 1.0 : -1.0) : 0.5; }\n",
+                         i * 4u, k_cd[i], 1u << (6u + i), k_uc[i]);
+            else
+                snprintf(line, sizeof line, "    Out.%s = 0.5;\n", k_cd[i]);
+            emit(&o, line);
+        }
+    }
+    emit(&o,
         "    return Out;\n"
         "}\n");
 
-    (void)n_cond_skipped;
-    (void)n_flow_skipped;
     if (o.overflow) return -1;
     return instrs;
 }

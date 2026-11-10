@@ -355,6 +355,7 @@ extern "C" {
     void cellHttpDestroyTransaction(void);
     void cellHttpSendRequest(void);
     void cellHttpRecvResponse(void);
+    void cellHttpClientPollConnections(void);
     void cellHttpResponseGetStatusCode(void);
     void cellHttpResponseGetContentLength(void);
     void cellHttpResponseGetAllHeaders(void);
@@ -1575,6 +1576,7 @@ extern "C" void ppu_hle_register_all(void) {
     ps3_hle_register(0x32F5CAE2u, "cellHttpDestroyTransaction", (void*)cellHttpDestroyTransaction);
     ps3_hle_register(0xA755B005u, "cellHttpSendRequest", (void*)cellHttpSendRequest);
     ps3_hle_register(0x61C90691u, "cellHttpRecvResponse", (void*)cellHttpRecvResponse);
+    ps3_hle_register(0xADC0A4B2u, "cellHttpClientPollConnections", (void*)cellHttpClientPollConnections);
     ps3_hle_register(0x10D0D7FCu, "cellHttpResponseGetStatusCode", (void*)cellHttpResponseGetStatusCode);
     ps3_hle_register(0x464FF889u, "cellHttpResponseGetContentLength", (void*)cellHttpResponseGetContentLength);
     ps3_hle_register(0xBEA17389u, "cellHttpResponseGetAllHeaders", (void*)cellHttpResponseGetAllHeaders);

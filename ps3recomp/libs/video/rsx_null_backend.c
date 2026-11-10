@@ -56,7 +56,7 @@ static void nb_set_fullscreen(HWND hwnd, int on)
     if (on) {
         if (!s_state.fullscreen) GetWindowRect(hwnd, &s_state.windowed_rect);
         MONITORINFO mi = { sizeof mi };
-        GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi);
+        GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
         SetWindowLongPtrA(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
         SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
                      mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
@@ -76,10 +76,19 @@ static void nb_set_fullscreen(HWND hwnd, int on)
 
 static int s_present_suppressed = 0;
 
+/* Hooks for a port's PC front-end layer (set from the game project; NULL = none):
+ *  g_port_ui_tick(hwnd)    -- every pump of this window's message loop
+ *  g_port_close_hook(hwnd) -- before the window closes (Alt+F4, the X button):
+ *                             e.g. wait for a save to finish. */
+void (*volatile g_port_ui_tick)(void* hwnd) = 0;
+void (*volatile g_port_close_hook)(void* hwnd) = 0;
+extern volatile int g_port_ui_modal;   /* libs/input/cellPad.c: a port overlay wants the cursor */
+
 static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_CLOSE:
+        { void (*h)(void*) = g_port_close_hook; if (h) h(hwnd); }
         s_state.window_closed = 1;
         DestroyWindow(hwnd);
         return 0;
@@ -88,9 +97,22 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         PostQuitMessage(0);
         return 0;
 
+    case WM_ERASEBKGND:
+        /* A GPU swap chain owns the client area: erasing it with the class
+         * brush flashes the window colour over the last presented frame (and
+         * a GDI write knocks a fullscreen flip model out of independent flip,
+         * which the monitor shows as flicker / a mode change). */
+        if (s_present_suppressed) return 1;
+        break;
+
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
+        if (s_present_suppressed) {
+            /* Validate only; the swap chain repaints on the next flip. */
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
 
         /* Fill with current clear color */
         HBRUSH brush = CreateSolidBrush(s_state.clear_color);
@@ -125,6 +147,10 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (!(lp & (1 << 30))) nb_set_fullscreen(hwnd, !s_state.fullscreen);
             return 0;
         }
+        if (wp == VK_F10) return 0;                     /* F10 is a game key, not the menu bar */
+        break;
+    case WM_SYSKEYUP:
+        if (wp == VK_F10) return 0;
         break;
     case WM_SYSCHAR:
         if (wp == VK_RETURN) return 0;                  /* no beep for Alt+Enter */
@@ -158,7 +184,7 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_SETCURSOR: {
         extern volatile int g_kbm_capture;
-        if (g_kbm_capture && LOWORD(lp) == HTCLIENT) { SetCursor(NULL); return TRUE; }
+        if (g_kbm_capture && !g_port_ui_modal && LOWORD(lp) == HTCLIENT) { SetCursor(NULL); return TRUE; }
         break; }
     }
 
@@ -291,6 +317,16 @@ static rsx_backend s_null_backend = {
  * Public API
  * -----------------------------------------------------------------------*/
 
+static BOOL CALLBACK nb_mon_enum(HMONITOR m, HDC dc, LPRECT r, LPARAM lp)
+{
+    struct NbMon { int want, i, found; RECT work; }* s = (struct NbMon*)lp;
+    (void)dc; (void)r;
+    if (++s->i != s->want) return TRUE;
+    MONITORINFO mi = { sizeof mi };
+    if (GetMonitorInfoA(m, &mi)) { s->work = mi.rcWork; s->found = 1; }
+    return FALSE;
+}
+
 int rsx_null_backend_init(u32 width, u32 height, const char* title)
 {
     memset(&s_state, 0, sizeof(s_state));
@@ -305,6 +341,10 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     wc.lpfnWndProc = null_wndproc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    /* the exe's own icon (resource 1, project/app.rc) in the title bar and taskbar */
+    wc.hIcon = LoadIconA(GetModuleHandle(NULL), MAKEINTRESOURCEA(1));
+    wc.hIconSm = (HICON)LoadImageA(GetModuleHandle(NULL), MAKEINTRESOURCEA(1), IMAGE_ICON,
+                                   GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = "ps3recomp_null";
     RegisterClassExA(&wc);
@@ -322,8 +362,17 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     const char* dm = getenv("RSX_DISPLAY");
     const int start_full = dm && (!_stricmp(dm, "borderless") || !_stricmp(dm, "exclusive") || !_stricmp(dm, "fullscreen"));
 
-    /* Window size from the client area, kept inside the screen and centred */
+    /* Window size from the client area, kept inside the screen and centred.
+     * RSX_MONITOR=<n> (1-based, in EnumDisplayMonitors order) picks the
+     * monitor; default / 0 = the primary one. */
     RECT work; SystemParametersInfoA(SPI_GETWORKAREA, 0, &work, 0);
+    { const char* e = getenv("RSX_MONITOR"); const int want = e ? atoi(e) : 0;
+      if (want > 0) {
+          struct NbMon { int want, i, found; RECT work; } s = { want, 0, 0, {0} };
+          EnumDisplayMonitors(NULL, NULL, nb_mon_enum, (LPARAM)&s);
+          if (s.found) work = s.work;
+          else printf("[RSX null] RSX_MONITOR=%d: no such monitor, using the primary one\n", want);
+      } }
     RECT wr = {0, 0, (LONG)width, (LONG)height};
     AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
     int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
@@ -391,6 +440,7 @@ int rsx_null_backend_pump_messages(void)
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
+    { void (*t)(void*) = g_port_ui_tick; if (t && s_state.hwnd && !s_state.window_closed) t(s_state.hwnd); }
     /* RPCS3-style caption, once a second: guest FPS (flips), draws in the last
      * live-draw frame, window size. Here on the window's own thread, so the
      * WM_SETTEXT never blocks the renderer. */

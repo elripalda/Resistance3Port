@@ -21,6 +21,12 @@ void vm_write32(uint32_t addr, uint32_t value) { (void)addr; (void)value; }
 void ps3_ms(const char* key) { (void)key; }
 uint32_t gcm_io_offset_to_ea(uint32_t io) { (void)io; return 0; }
 unsigned long long ps3_ms_now(void) { return 0; }
+/* ...and routes getenv, the backend read flush and located-offset resolution
+ * through hooks the runtime provides. */
+#include <stdlib.h>
+char* rsx_getenv(const char* name) { return getenv(name); }
+void rsx_backend_flush_reads(void) {}
+u32 cellGcmResolveLocated(int local, u32 offset) { (void)local; return offset; }
 
 static int g_failures;
 

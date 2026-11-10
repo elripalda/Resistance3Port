@@ -68,6 +68,12 @@ extern SPU_THREAD_LOCAL spu_rt_lane g_spu_rt;
  * mark costs one locked PPU store to a line the kernel owns anyway. */
 void spu_coh_reserve(spu_context* ctx, uint32_t ea);
 
+/* GETLLAR re-read of a line `ctx` already holds a valid reservation on, as a
+ * seqlock read without taking the lock-line lock (see spu_coherency.c).
+ * Copies the line to `ls` and the reservation snapshot and returns 1, or
+ * returns 0 when the caller must take the locked path. SPU_FAST_LLAR=0 off. */
+int spu_coh_llar_fast(spu_context* ctx, uint32_t ea, uint8_t* ls);
+
 /* Is `addr`'s line marked? The PPU store fast path -- a range-free O(1) bitmap
  * lookup guarded by a global that is zero until the first GETLLAR. */
 int spu_coh_is_reserved(uint32_t addr);

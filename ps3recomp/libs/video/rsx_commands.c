@@ -21,6 +21,28 @@
 #include <string.h>
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
 #include "ps3emu/log_first.h"
+
+/* Monotonic host nanoseconds for NV4097_NOTIFY. */
+#ifdef _WIN32
+#include <windows.h>
+static unsigned long long rsx_notify_now_ns(void)
+{
+    static LARGE_INTEGER fq;
+    LARGE_INTEGER n;
+    if (!fq.QuadPart) QueryPerformanceFrequency(&fq);
+    QueryPerformanceCounter(&n);
+    const unsigned long long c = (unsigned long long)n.QuadPart, f = (unsigned long long)fq.QuadPart;
+    return (c / f) * 1000000000ull + (c % f) * 1000000000ull / f;
+}
+#else
+#include <time.h>
+static unsigned long long rsx_notify_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+#endif
 /* Resistance port: getenv() is called on hot paths (per draw / per method);
  * the UCRT version takes a lock and scans the environment every time, which
  * profiled at ~20% of the render thread. Cached by call-site string pointer. */
@@ -624,20 +646,39 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
               { static int n = 0; if (n < 4 && ++n)   /* TEMP */
                   fprintf(stderr, "[RSX] NOTIFY slot %u -> ea 0x%08X\n", (s_notify_ctx & 7u) ^ 7u, ea); }
               if (ea) {
-                  unsigned long long ts = ps3_ms_now() * 1000000ull;
+                  /* RPCS3 nv4097.cpp:759-782 set_notify writes
+                   * thread::timestamp(): nanoseconds, never repeating (a
+                   * millisecond clock x 1e6 gave every notify in the same ms
+                   * the same stamp). RSX_NOTIFY_MS=1 restores the old one. */
+                  static int old_ts = -1; static unsigned long long last_ts;
+                  if (old_ts < 0) { const char* e = getenv("RSX_NOTIFY_MS"); old_ts = e && atoi(e) != 0; }
+                  unsigned long long ts;
+                  if (old_ts) ts = ps3_ms_now() * 1000000ull;
+                  else {
+                      ts = rsx_notify_now_ns();
+                      if (ts <= last_ts) ts = last_ts + 1;
+                      last_ts = ts;
+                  }
                   vm_write32(ea, (u32)(ts >> 32)); vm_write32(ea + 4, (u32)ts);
                   vm_write32(ea + 8, 0); vm_write32(ea + 12, 0);
               }
           }
           return 0;
       } }
-    { static u32 s_sem_off = 0, s_sem_ctx = 0;
+    { static u32 s_sem_off = 0, s_sem_ctx = 0x66606660u;   /* rsx_methods.cpp init: CONTEXT_DMA_SEMAPHORE */
       if (method == 0x01A4) {
           if (data != s_sem_ctx) { static int _l = 0; if (_l < 8 && ++_l)
               fprintf(stderr, "[RSX] semaphore context dma = 0x%08X\n", data); }
           s_sem_ctx = data;
       }
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
+      /* RPCS3 nv4097 texture_read/back_end_write_semaphore_release: an offset
+       * that is not 16-byte aligned is a desync -- recover_fifo, no write. */
+      if ((method == 0x1D70 || method == 0x1D74) && (s_sem_off & 15u)) {
+          static int _u = 0; if (PS3_LOG_FIRST(_u, 4))
+              fprintf(stderr, "[RSX] NV4097 semaphore unaligned offset 0x%X, ignored\n", s_sem_off);
+          return 0;
+      }
       if (method == 0x1D70 || method == 0x1D74) {   /* v180: reads land before the label */
           extern void rsx_backend_flush_reads(void); rsx_backend_flush_reads(); }
       if ((method == 0x1D70 || method == 0x1D74) && s_sem_ctx == 0xFEED0001u) {
@@ -648,6 +689,29 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
                 : (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
         if (ea) vm_write32(ea, val);
         return 0;
+      }
+      /* RPCS3 nv47_sync write_gcm_label -> get_address(ctx): FEED0000 is local
+       * memory, SEMAPHORE_RW/R (0x66606660/0x66616661) the label area, anything
+       * else invalid (no write). RSX_SEM_CTX_STRICT=0: always the label area. */
+      if (method == 0x1D70 || method == 0x1D74) {
+        static int strict = -1;
+        if (strict < 0) { const char* e = getenv("RSX_SEM_CTX_STRICT"); strict = !(e && atoi(e) == 0); }
+        if (strict && s_sem_ctx != 0x66606660u && s_sem_ctx != 0x66616661u) {
+          extern void vm_write32(uint32_t a, uint32_t v);
+          extern u32 cellGcmResolveLocated(int local, u32 offset);
+          const u32 ea = s_sem_ctx == 0xFEED0000u ? cellGcmResolveLocated(1, s_sem_off) : 0;
+          if (ea) vm_write32(ea, method == 0x1D74 ? data
+                  : (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16));
+          else { static int _l = 0; if (PS3_LOG_FIRST(_l, 8))
+              fprintf(stderr, "[RSX] NV4097 semaphore ctx 0x%08X off 0x%X: invalid location, no write\n",
+                      s_sem_ctx, s_sem_off); }
+          return 0;
+        }
+        if (strict && s_sem_off >= 0x1000u) {
+          static int _l = 0; if (PS3_LOG_FIRST(_l, 8))
+              fprintf(stderr, "[RSX] NV4097 semaphore offset 0x%X out of range, no write\n", s_sem_off);
+          return 0;
+        }
       }
       if (method == 0x1D70) {
         extern void vm_write32(uint32_t a, uint32_t v);
@@ -1281,15 +1345,23 @@ L_scissor:
  * Command buffer parsing
  * -----------------------------------------------------------------------*/
 
+/* FIFO words sit in guest memory, so they are big-endian (RPCS3 FIFO reads
+ * them through be_t<u32>). */
+static inline u32 rsx_fifo_word(const u32* buf, u32 i)
+{
+    const u8* p = (const u8*)(buf + i);
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+}
+
 int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
 {
     int methods_processed = 0;
     u32 pos = 0;
     u32 count = size / 4; /* size in dwords */
 
-    { static int _c=0; if (count && PS3_LOG_FIRST(_c, 16)) fprintf(stderr, "[RSX] process_cmd_buffer words=%u first_hdr=0x%08X\n", count, buf[0]); }
+    { static int _c=0; if (count && PS3_LOG_FIRST(_c, 16)) fprintf(stderr, "[RSX] process_cmd_buffer words=%u first_hdr=0x%08X\n", count, rsx_fifo_word(buf, 0)); }
     while (pos < count) {
-        u32 header = buf[pos++];
+        u32 header = rsx_fifo_word(buf, pos++);
         u32 type = (header >> 29) & 0x7;
 
         if (type == 0 || type == 2) {
@@ -1300,7 +1372,7 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
             int increasing = (type == 0);
 
             for (u32 i = 0; i < num_data && pos < count; i++) {
-                u32 data = buf[pos++];
+                u32 data = rsx_fifo_word(buf, pos++);
                 u32 m = increasing ? (method + i * 4) : method;
                 rsx_process_method(state, m, data);
                 methods_processed++;

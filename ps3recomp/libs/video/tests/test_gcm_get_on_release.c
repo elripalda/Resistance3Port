@@ -16,6 +16,10 @@
  * GCM_GET_EQ_PUT=1 (argument "eq-put") the RELEASE publishes nothing and get
  * is put at the end of the pass, as before.
  *
+ * Also: a blocking ACQUIRE with its bound and the label-68 exemption (D1),
+ * device/unaligned RELEASE rules (D11), and recover_fifo back to the restore
+ * point for the RPCS3 desync cases (D2).
+ *
  * gcc -std=gnu17 -I include -I libs/video
  *   libs/video/tests/test_gcm_get_on_release.c -ffunction-sections
  *   -fdata-sections -Wl,--gc-sections -pthread -o /tmp/test_gcm_get_on_release
@@ -49,6 +53,18 @@ void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
+void rsx_draw_engine_range_read(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+void rsx_draw_engine_range_wrote(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+void rsx_draw_engine_range_will_write(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+void rsx_draw_engine_range_cpu_wrote(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+int rsx_draw_engine_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g_, u32 h, u32 i, u32 j,
+                         u32 k, u32 l, u32 m, u32 n, int lin, u32 iwh)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g_; (void)h; (void)i; (void)j;
+  (void)k; (void)l; (void)m; (void)n; (void)lin; (void)iwh; return 0; }
+int rsx_draw_engine_blit_swizzled(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g_, u32 h, u32 i,
+                                  u32 j, u32 k, int lin)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g_; (void)h; (void)i; (void)j;
+  (void)k; (void)lin; return 0; }
 int  rsx_live_draw_enabled(void) { return 0; }
 void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
 int  rsx_live_draw_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 w, u32 h)
@@ -62,10 +78,11 @@ int  rsx_live_draw_resolve_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g,
 #define LABEL_EA  (GCM_LABEL_GUEST_BASE + SEMA_OFF)
 
 /* Records the label and get each time a probe user command runs. */
-static u32 seen_get[8], seen_label[8], seen_n;
+static u32 seen_get[16], seen_label[16], seen_cnt[16], seen_n;
 void rsx_raise_user_cmd(uint32_t arg)
 {
-    if (arg < 8) {
+    if (arg < 16) {
+        seen_cnt[arg]++;
         seen_get[arg] = vm_read32(GCM_CONTROL_GUEST_ADDR + 4);
         seen_label[arg] = vm_read32(LABEL_EA);
         seen_n++;
@@ -112,8 +129,9 @@ int main(int argc, char** argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     const int eq_put = argc > 1 && !strcmp(argv[1], "eq-put");
+    setenv("GCM_SEMA_ACQUIRE_MS", "50", 1);
     if (eq_put != gcm_get_eq_put()) { puts("FAIL: GCM_GET_EQ_PUT does not match the argument"); return 1; }
-    const uint32_t vm_size = ppu_hle_inject_base + 0x10000u;
+    const uint32_t vm_size = ppu_hle_inject_base + 0x40000u;
     vm_base = (uint8_t*)calloc(1, vm_size);
     if (!vm_base) { puts("FAIL: guest VM alloc"); return 1; }
     ppu_vm_size = vm_size;
@@ -135,14 +153,17 @@ int main(int argc, char** argv)
     io = put_probe(io, 2);
     io = put_probe(io, 3);
     const u32 put = io;
+    u32 put_end = put;
 
     s_fifo_getoff = 0;
     vm_write32(ctrl + 4, 0);
     vm_write32(ctrl + 0, put);
+    const u32 label_before = vm_read32(LABEL_EA);   /* RPCS3's 0x1337C0D3 fill */
     cellGcm_rsx_process_fifo();
 
     check(seen_n == 4, "the four probe commands ran");
-    check(seen_get[0] == 0 && seen_label[0] == 0, "before any RELEASE, neither get nor the label has moved");
+    check(seen_get[0] == 0 && seen_label[0] == label_before,
+          "before any RELEASE, neither get nor the label has moved");
     check(seen_label[1] == 0x11u, "the RELEASE wrote its label");
     check(seen_label[2] == 0x22u, "the RELEASE inside ACQUIRE+RELEASE wrote its label");
     if (!eq_put) {
@@ -154,6 +175,127 @@ int main(int argc, char** argv)
               "GCM_GET_EQ_PUT: a RELEASE publishes nothing mid-pass");
     }
     check(vm_read32(ctrl + 4) == put, "after the pass, get is put");
+
+    /* D1 (RPCS3 nv406e.cpp:57-107): an unsatisfied ACQUIRE blocks the walker
+     * until the label matches, bounded by GCM_SEMA_ACQUIRE_MS (50 here), and
+     * the flip-pacing label 68 (offset 0x440) never blocks. */
+    {
+        const u32 o20 = 0x20u, five = 5u;
+        vm_write32(GCM_LABEL_GUEST_BASE + 0x20u, 0);
+        u32 p = put_cmd(put, 0, 0x64u, 1, &o20);
+        const u32 acq_at = p;
+        p = put_cmd(p, 0, 0x68u, 1, &five);
+        p = put_probe(p, 4);
+        vm_write32(ctrl + 0, p);
+        cellGcm_rsx_process_fifo();
+        check(s_fifo_getoff == acq_at && !seen_cnt[4], "an unsatisfied ACQUIRE stops the walker on it");
+        cellGcm_rsx_process_fifo();
+        check(s_fifo_getoff == acq_at && !seen_cnt[4], "...and the next pass still waits");
+        vm_write32(GCM_LABEL_GUEST_BASE + 0x20u, 5u);
+        cellGcm_rsx_process_fifo();
+        check(seen_cnt[4] == 1 && s_fifo_getoff == p, "the label lands: the walker goes on");
+
+        const u32 o30 = 0x30u, nine = 9u;
+        vm_write32(GCM_LABEL_GUEST_BASE + 0x30u, 0);
+        u32 q = put_cmd(p, 0, 0x64u, 1, &o30);
+        q = put_cmd(q, 0, 0x68u, 1, &nine);
+        q = put_probe(q, 5);
+        vm_write32(ctrl + 0, q);
+        extern unsigned long long ps3_ms_now(void);
+        const unsigned long long t0 = ps3_ms_now();
+        while (!seen_cnt[5] && ps3_ms_now() - t0 < 2000u) { cellGcm_rsx_process_fifo(); }
+        const unsigned long long dt = ps3_ms_now() - t0;
+        check(seen_cnt[5] == 1 && dt >= 40u && s_fifo_getoff == q,
+              "a never-satisfied ACQUIRE gives up after GCM_SEMA_ACQUIRE_MS");
+
+        const u32 o440 = 0x440u, one = 1u;
+        vm_write32(GCM_LABEL_GUEST_BASE + 0x440u, 0);
+        u32 r = put_cmd(q, 0, 0x64u, 1, &o440);
+        r = put_cmd(r, 0, 0x68u, 1, &one);
+        r = put_probe(r, 6);
+        vm_write32(ctrl + 0, r);
+        cellGcm_rsx_process_fifo();
+        check(seen_cnt[6] == 1 && s_fifo_getoff == r, "the flip-pacing ACQUIRE (label 68) does not block");
+        put_end = r;
+    }
+
+    /* D11 (RPCS3 nv406e.cpp:110-150): a RELEASE through the device context
+     * lands at device+offset and 0 at device+0x30 is written as 1; an
+     * unaligned offset is ignored. */
+    {
+        const u32 dev = 0x56616660u, o30 = 0x30u, zero = 0u, o31 = 0x31u, five = 5u, lab = 0x66616661u;
+        vm_write32(R2RSX_DEVICE_EA + 0x30u, 0xABCDu);
+        u32 p = put_cmd(put_end, 0, 0x60u, 1, &dev);
+        p = put_cmd(p, 0, 0x64u, 1, &o30);
+        p = put_cmd(p, 0, 0x6Cu, 1, &zero);
+        vm_write32(ctrl + 0, p);
+        cellGcm_rsx_process_fifo();
+        check(s_fifo_getoff == p && vm_read32(R2RSX_DEVICE_EA + 0x30u) == 1u,
+              "a RELEASE of 0 to device+0x30 writes 1");
+        p = put_cmd(p, 0, 0x64u, 1, &o31);
+        p = put_cmd(p, 0, 0x6Cu, 1, &five);
+        p = put_cmd(p, 0, 0x60u, 1, &lab);
+        vm_write32(ctrl + 0, p);
+        cellGcm_rsx_process_fifo();
+        check(s_fifo_getoff == p && vm_read32(R2RSX_DEVICE_EA + 0x30u) == 1u &&
+              vm_read32(R2RSX_DEVICE_EA + 0x34u) == 0u, "an unaligned RELEASE is ignored");
+        put_end = p;
+    }
+
+    /* D2 (RPCS3 RSXFIFO.cpp:777-833, RSXThread.cpp:1740-1780): a RET with no
+     * CALL, a CALL inside a CALL, a malformed word, an unaligned 0x1D70 and an
+     * invalid INDEX_ARRAY_DMA go back to the restore point; the commands from
+     * there run again once the producer has fixed the word. */
+    {
+        struct { const char* what; u32 bad_hdr, bad_arg; int sub; } cases[] = {
+            { "RET without CALL", 0x00020000u, 0, 0 },
+            { "malformed word",   0x00010040u, 0, 0 },
+            { "unaligned 0x1D70", (2u << 18) | 0x1D6Cu, 4u, 3 },   /* offset 4, then 0x1D70 */
+            { "INDEX_ARRAY_DMA 2", (1u << 18) | 0x1820u, 2u, 1 },
+            { "CALL inside CALL", 0, 0, 2 },
+        };
+        for (u32 c = 0; c < sizeof cases / sizeof cases[0]; c++) {
+            const u32 start = put_end;
+            const u32 sub = start + 0x400u;
+            u32 bad_at, p;
+            seen_cnt[7] = seen_cnt[8] = 0;
+            p = put_probe(start, 7);
+            bad_at = p;
+            if (cases[c].sub == 2) {
+                gw32(IO_ADDR + bad_at, sub | 2u);         /* CALL sub */
+                gw32(IO_ADDR + sub, (sub + 8u) | 2u);     /* CALL inside it */
+                gw32(IO_ADDR + sub + 4u, 0x00020000u);    /* RET */
+                gw32(IO_ADDR + sub + 8u, 0x00020000u);
+                p = bad_at + 4u;
+            } else {
+                gw32(IO_ADDR + bad_at, cases[c].bad_hdr);
+                if (cases[c].sub >= 1) gw32(IO_ADDR + bad_at + 4u, cases[c].bad_arg);
+                if (cases[c].sub == 3) gw32(IO_ADDR + bad_at + 8u, 1u);
+                p = bad_at + (cases[c].sub == 3 ? 12u : cases[c].sub == 1 ? 8u : 4u);
+            }
+            p = put_probe(p, 8);
+            s_fifo_sync_req = 1;
+            vm_write32(ctrl + 0, p);
+            cellGcm_rsx_process_fifo();
+            char msg[96];
+            snprintf(msg, sizeof msg, "%s: back to the restore point, nothing after it ran", cases[c].what);
+            check(s_fifo_getoff == start && seen_cnt[7] == 1 && !seen_cnt[8], msg);
+            /* the producer fixes the word: a NOP (and a NOP over the argument). */
+            if (cases[c].sub == 2) gw32(IO_ADDR + sub, 0);
+            else if (cases[c].sub == 3) gw32(IO_ADDR + bad_at + 4u, 0x10u);   /* aligned offset */
+            else { gw32(IO_ADDR + bad_at, 0); if (cases[c].sub == 1) gw32(IO_ADDR + bad_at + 4u, 0); }
+            cellGcm_rsx_process_fifo();
+            snprintf(msg, sizeof msg, "%s: once fixed, the commands from the restore point run again", cases[c].what);
+            check(s_fifo_getoff == p && seen_cnt[7] == 2 && seen_cnt[8] == 1, msg);
+            put_end = (sub + 0x20u + 15u) & ~15u;
+            s_fifo_getoff = p; s_fifo_calloff = GCM_CALL_NONE;
+            if (put_end < p) put_end = p;
+            /* move get on to the next case without the gap in between */
+            gw32(IO_ADDR + p, put_end | 0x20000000u);
+            vm_write32(ctrl + 0, put_end);
+            cellGcm_rsx_process_fifo();
+        }
+    }
 
     printf("[gcm_get_on_release%s] %s (%d failed)\n", eq_put ? " eq-put" : "", fails ? "FAIL" : "PASS", fails);
     free(vm_base);

@@ -67,5 +67,5 @@ int main(int argc, char** argv)
     printf("D3DCompile OK  : %d  (%.1f%%)\n", compiled, total?100.0*compiled/total:0);
     printf("D3DCompile FAIL: %d\n", fail);
 #endif
-    return 0;
+    return (total == 0 || decode_err || fail) ? 1 : 0;
 }

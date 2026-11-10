@@ -1,0 +1,54 @@
+#version 450
+// Temporal upscaler input prep (RPCS3 VKR2Upscaler's r2aa_prep_pass): scene
+// colour/depth -> RGBA16F colour, R32F depth, RG16F motion vectors (NDC/2 =
+// UV units, previous - current) from a camera reprojection T, and a mask of
+// pixels whose reprojected depth disagrees (things that moved on their own).
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D ColorIn;
+layout(set = 0, binding = 1) uniform sampler2D DepthIn;
+layout(set = 0, binding = 2, rgba16f) uniform writeonly image2D ColorOut;
+layout(set = 0, binding = 3, r32f) uniform writeonly image2D DepthOut;
+layout(set = 0, binding = 4, rg16f) uniform writeonly image2D MvOut;
+layout(set = 0, binding = 5) uniform sampler2D PrevDepthIn;
+layout(set = 0, binding = 6, r8) uniform writeonly image2D MaskOut;
+// view: jitter ndc xy, viewport wh; opts: zA, zB, rw, rh; opts2: has previous depth, depth inverted
+layout(push_constant) uniform PC { mat4 T; vec4 view; vec4 opts; vec4 opts2; };
+float lin(float raw) { return opts2.y > 0.5 ? raw : 1.0 - raw; }
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(opts.z) || p.y >= int(opts.w)) return;
+    vec4 c = texelFetch(ColorIn, p, 0);
+    float d = texelFetch(DepthIn, p, 0).r;
+    imageStore(ColorOut, p, c);
+    imageStore(DepthOut, p, vec4(d));
+    vec2 ndc = (vec2(p) + 0.5) / view.zw * 2.0 - 1.0 - view.xy;
+    vec4 q = T * vec4(ndc, d * opts.x + opts.y, 1.0);
+    vec2 mv = vec2(0.0);
+    float m = 0.0;
+    if (abs(q.w) > 1e-7)
+    {
+        mv = (q.xy / q.w - ndc) * 0.5;
+        if (any(isnan(mv)) || any(isinf(mv)) || any(greaterThan(abs(mv), vec2(2.0)))) mv = vec2(0.0);
+        else if (opts2.x > 0.5)
+        {
+            ivec2 ip = ivec2(floor((q.xy / q.w + 1.0) * 0.5 * view.zw));
+            ivec2 lim = ivec2(opts.zw) - 1;
+            if (all(greaterThanEqual(ip, ivec2(0))) && all(lessThanEqual(ip, lim)))
+            {
+                float lo = 1e30, hi = -1e30;
+                for (int y = -1; y <= 1; ++y)
+                    for (int x = -1; x <= 1; ++x)
+                    {
+                        float l = lin(texelFetch(PrevDepthIn, clamp(ip + ivec2(x, y), ivec2(0), lim), 0).r);
+                        lo = min(lo, l); hi = max(hi, l);
+                    }
+                float lc = lin(((q.z / q.w) - opts.y) / opts.x);
+                float e = max(lo * 0.97 - lc, lc - hi * 1.03) / max(max(lc, hi), 1e-6);
+                m = 0.85 * smoothstep(0.0, 0.12, e);
+            }
+        }
+    }
+    imageStore(MvOut, p, vec4(mv, 0.0, 0.0));
+    imageStore(MaskOut, p, vec4(m));
+}

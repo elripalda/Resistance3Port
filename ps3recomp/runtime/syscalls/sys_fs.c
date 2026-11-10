@@ -31,6 +31,18 @@ sys_fs_fd_info  g_sys_fs_fds[SYS_FS_FD_MAX];
 sys_fs_dir_info g_sys_fs_dirs[SYS_FS_DIR_MAX];
 char            g_sys_fs_root[512] = ".";
 
+/* PC port: the opening logo movie is open (slot + 1, 0 = none); cellPad.c
+ * presses Start/Cross while it is, to skip it (R2_SKIP_INTRO). Resistance 3
+ * skips its boot movies in sys_fs_open instead (SKIP_INTRO), so this stays 0. */
+volatile int    g_port_intro_movie = 0;
+
+/* PC port: push every open file's buffered writes to disk (quit path). */
+void sys_fs_flush_all(void)
+{
+    for (int i = 0; i < SYS_FS_FD_MAX; i++)
+        if (g_sys_fs_fds[i].active && g_sys_fs_fds[i].fp) fflush(g_sys_fs_fds[i].fp);
+}
+
 static void write_be32(uint32_t addr, uint32_t val)
 {
     uint32_t* p = (uint32_t*)vm_to_host(addr);
@@ -93,7 +105,16 @@ static void fs_normalize_sep(char* p) {
  * only weak reference to it: under COFF each one emits its own fallback. */
 extern __attribute__((weak)) const char* cellGame_get_hdd_title_id(void);
 
+static void ps3_vfs_ps3game_fallback_impl(char* path, size_t cap);
+/* Port hook (project/r3_mods.cpp, R2_MODS): may replace the resolved host path
+ * with a file from the mods folder. Runs after every translation. */
+void (*volatile g_vfs_override_hook)(char* path, size_t cap) = NULL;
 void ps3_vfs_ps3game_fallback(char* path, size_t cap)
+{
+    ps3_vfs_ps3game_fallback_impl(path, cap);
+    if (g_vfs_override_hook && path && *path) g_vfs_override_hook(path, cap);
+}
+static void ps3_vfs_ps3game_fallback_impl(char* path, size_t cap)
 {
     struct stat st;
     if (!path || !*path || stat(path, &st) == 0)

@@ -324,6 +324,11 @@ static CellGcmTileInfo s_tiles[CELL_GCM_MAX_TILE_COUNT];
 /* Zcull configuration (8 zcull regions) */
 static CellGcmZcullInfo s_zcull[CELL_GCM_MAX_ZCULL_COUNT];
 
+/* RPCS3 gcm_config tiles_addr / zculls_addr: the guest copies of the packed
+ * CellGcmTileInfo (16 bytes) / CellGcmZcullInfo (24 bytes) arrays. */
+static u32 s_tiles_guest_ea, s_zculls_guest_ea;
+static void gcm_register_ctx_handlers(void);
+
 /* Report data area (256 slots, each 16 bytes) */
 static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
 
@@ -334,7 +339,15 @@ static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
  * report's 24-bit offset is an IO offset, and the 16-byte report goes to
  * guest memory at gcm_io2ea(offset), where the title reads it itself.
  * Killzone 3 sets 0xFEED0001 and keeps its reports in its own frame data. */
-static u32 s_report_dma = 0xFEED0000u;
+static u32 s_report_dma = 0x66626660u;
+/* RPCS3 rsx_methods.cpp init: CONTEXT_DMA_REPORT = REPORT_LOCATION_LOCAL.
+ * GCM_REPORT_DMA_LOCAL_INIT=0 restores the old 0xFEED0000 seed. */
+static u32 gcm_report_dma_init(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_REPORT_DMA_LOCAL_INIT"); on = !(e && atoi(e) == 0); }
+    return on ? 0x66626660u : 0xFEED0000u;
+}
 static u64 s_report_last_ts;
 
 /* GET_REPORT timestamp in nanoseconds, strictly rising: two reports in one
@@ -488,6 +501,38 @@ static const int s_valid_pitch_count = sizeof(s_valid_pitches) / sizeof(s_valid_
  * API implementations -- Initialization
  * -----------------------------------------------------------------------*/
 
+/* RPCS3 sys_rsx_context_allocate fills RsxReports before the title runs: the
+ * semaphore words (labels are every 4th, 16 bytes apart) repeat 0x1337C0D3,
+ * 0x1337BABE, 0x1337BEEF, 0x1337F001, and the 2048 local reports read
+ * {timestamp -1, value 0, pad -1}. A label or report the title reads before
+ * anything wrote it sees that, not zero. RSX_LABEL_INIT_LEGACY=1 leaves zeros.
+ * (RPCS3's notify[] block has no native counterpart: cellGcmGetNotifyDataAddress
+ * hands out the title's IO page 0xF1.) */
+static void gcm_init_report_memory(void)
+{
+    static int legacy = -1;
+    if (legacy < 0) { const char* e = getenv("RSX_LABEL_INIT_LEGACY"); legacy = e && e[0] && e[0] != '0'; }
+    if (legacy) return;
+    /* ppu_vm_size != 0: a partially backed guest (unit tests); skip what is not there. */
+    const int labels_ok = !ppu_vm_size ||
+        (u64)GCM_LABEL_GUEST_BASE + CELL_GCM_MAX_LABEL_COUNT * GCM_LABEL_STRIDE <= ppu_vm_size;
+    const int reports_ok = !ppu_vm_size || (u64)GCM_REPORT_GUEST_BASE + 2048u * 16u <= ppu_vm_size;
+    static const u32 sema[4] = { 0x1337C0D3u, 0x1337BABEu, 0x1337BEEFu, 0x1337F001u };
+    for (u32 i = 0; labels_ok && i < CELL_GCM_MAX_LABEL_COUNT * GCM_LABEL_STRIDE / 4u; i++)
+        vm_write32(GCM_LABEL_GUEST_BASE + i * 4u, sema[i & 3u]);
+    for (u32 i = 0; i < 2048u; i++) {
+        const u32 r = GCM_REPORT_GUEST_BASE + i * 16u;
+        if (reports_ok) {
+            vm_write32(r + 0u, 0xFFFFFFFFu);
+            vm_write32(r + 4u, 0xFFFFFFFFu);
+            vm_write32(r + 8u, 0u);
+            vm_write32(r + 12u, 0xFFFFFFFFu);
+        }
+        s_report_data[i].timestamp = ~0ull;
+        s_report_data[i].value = 0u;
+    }
+}
+
 /* NID: 0xB2E761D4 */
 s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
 {
@@ -507,7 +552,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
-    s_report_dma = 0xFEED0000u;
+    s_report_dma = gcm_report_dma_init();
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
@@ -560,10 +605,13 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
         s_io_mapping_count = 1;
     }
 
-    /* Zero the guest-visible control register (put/get/ref). */
+    /* Zero the guest-visible control register (put/get); ref starts at
+     * 0xFFFFFFFF as RPCS3 rsx_methods.cpp:683 (NV406E_SET_REFERENCE = umax)
+     * and RSXThread.cpp's dma control init. GCM_REF_INIT_MAX=0 starts it at 0. */
     vm_write32(GCM_CONTROL_GUEST_ADDR + 0, 0);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, 0);
-    vm_write32(GCM_CONTROL_GUEST_ADDR + 8, 0);
+    { const char* e = getenv("GCM_REF_INIT_MAX");
+      vm_write32(GCM_CONTROL_GUEST_ADDR + 8, (e && atoi(e) == 0) ? 0u : 0xFFFFFFFFu); }
 
     /* Watch SPU DMA for pushbuffers. A title that builds its command stream on
      * an SPU never tells libgcm where that stream is, so the write is the only
@@ -591,6 +639,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     }
 
     s_gcm_initialized = 1;
+    if (!s_r2rsx) gcm_init_report_memory();
     return CELL_OK;
 }
 
@@ -614,6 +663,13 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
         ioAddress = galloc(ioSize ? ioSize : 0x100000, 0x100000);
 
     cellGcmInit(cmdSize, ioSize, ioAddress);
+    gcm_register_ctx_handlers();
+    if (galloc && !s_tiles_guest_ea) {
+        s_tiles_guest_ea = galloc(16u * CELL_GCM_MAX_TILE_COUNT, 16);
+        s_zculls_guest_ea = galloc(24u * CELL_GCM_MAX_ZCULL_COUNT, 16);
+        for (u32 i = 0; s_tiles_guest_ea && i < 16u * CELL_GCM_MAX_TILE_COUNT; i += 4) vm_write32(s_tiles_guest_ea + i, 0);
+        for (u32 i = 0; s_zculls_guest_ea && i < 24u * CELL_GCM_MAX_ZCULL_COUNT; i += 4) vm_write32(s_zculls_guest_ea + i, 0);
+    }
 
     u32 cmdbuf = ioAddress;                 /* FIFO lives at the IO region start */
     u32 cdata  = galloc ? galloc(16, 16) : 0;
@@ -897,8 +953,12 @@ void ppu_gcm_pump(void)
                            calls, nv, nf, s_vblank_count, 10); } }
     if ((p & 1) && s_vblank_handler_opd && g_ps3_guest_caller) {
         ydkj_restore_handler_opd(s_vblank_handler_opd, s_vblank_handler_code);
-        g_ps3_guest_caller(s_vblank_handler_opd, (uint64_t)s_vblank_count,
-                           0, 0, 0, 0, 0, 0, 0);
+        /* RPCS3 RSXDisplayEngine post_vblank_event: the handler gets 1, not
+         * the vblank count. GCM_VBLANK_ARG_COUNT=1 restores the count. */
+        { static int cnt = -1;
+          if (cnt < 0) cnt = getenv("GCM_VBLANK_ARG_COUNT") ? 1 : 0;
+          g_ps3_guest_caller(s_vblank_handler_opd, cnt ? (uint64_t)s_vblank_count : 1u,
+                             0, 0, 0, 0, 0, 0, 0); }
     }
     if (p & 2) {
         /* Delivery waits for a guest thread to reach an HLE call or a timer
@@ -940,9 +1000,41 @@ void cellGcmTickVBlank(void) { if (s_r2rsx) return; s_vblank_count++; GCM_PENDIN
  * and its handler runs code that puts the status back to WAITING, so the
  * poll never saw DONE and the game never rendered another frame. On hardware
  * the callback IS the flip interrupt -- no flip, no callback. */
+/* RPCS3 handle_emu_flip with "Frame limit: Auto" (Vblank Rate 60): a flip
+ * completes as soon as the RSX has executed it, but no sooner than one frame
+ * period after the previous completion; a late flip completes at once and
+ * restarts the cadence. Completing only on the 60 Hz beat instead made frame
+ * times alternate between one and two periods whenever the drain reached the
+ * flip just after a beat. GCM_FLIP_PACE=0 restores the beat. */
+static int gcm_flip_pace_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_FLIP_PACE"); on = e ? atoi(e) : 1; }
+    return on;
+}
+static long long s_flip_pace_target_us = 0;
+static volatile int s_flip_pace_host = 0;   /* the host calls the poll */
+int cellGcm_flip_pace_poll(long long now_us, long long period_us)
+{
+    if (s_r2rsx || !gcm_flip_pace_on()) return 0;
+    s_flip_pace_host = 1;
+    rsx_draw_engine_wcb_service();
+    if (s_flip_status != CELL_GCM_FLIP_STATUS_WAITING) return 0;
+    if (now_us < s_flip_pace_target_us - 1000) return 0;
+    FLIP_LOCK();
+    const int done = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
+    if (done) s_flip_tick_seq = s_flip_req_seq;
+    FLIP_UNLOCK();
+    if (!done) return 0;
+    s_flip_pace_target_us = (now_us > s_flip_pace_target_us ? now_us : s_flip_pace_target_us) + period_us;
+    GCM_PENDING_SET(2);
+    return 1;
+}
+
 void cellGcmTickFlip(void)
 {
     if (s_r2rsx) return;
+    if (s_flip_pace_host) return;            /* cellGcm_flip_pace_poll completes flips */
     /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
      * not happened yet. */
     FLIP_LOCK();
@@ -1036,8 +1128,132 @@ static u32 gcm_fifo_backlog(u32 put, u32 get)
     return (e - get) + (put - b);
 }
 static u32 s_last_ring_off = 0;   /* last offset the walker actually consumed */
-static u32 s_fifo_calloff = 0;
+/* RPCS3 RSX_CALL_STACK_EMPTY (RSXFIFO.h): no CALL outstanding. 3 is not a
+ * valid (4-aligned) return offset, so it cannot collide with one. */
+#define GCM_CALL_NONE 3u
+static u32 s_fifo_calloff = GCM_CALL_NONE;
+/* RPCS3 recover_fifo state (RSXThread.cpp:886-891, 1740-1780): the restore
+ * point is the command `get` stood on when a sync point was last requested
+ * outside a BEGIN/END, and the CALL return that was live there. */
+static u32 s_fifo_restore = 0xFFFFFFFFu;
+static u32 s_fifo_saved_ret = GCM_CALL_NONE;
+static int s_fifo_sync_req = 1;            /* RSXThread.cpp:1316, set at init */
+static u32 s_sema406e_ctx = 0x66616661u;   /* rsx_methods.cpp init: NV406E 0x60 */
+static u32 s_sema4097_off = 0;
+static const char* s_fifo_rec_why = "";
+/* GCM_FIFO_RECOVER=0: no recovery -- CALL-in-CALL overwrites the return, RET
+ * with no CALL returns to 0, malformed words are skipped (the old walker). */
+static int gcm_fifo_recover_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_FIFO_RECOVER"); on = !(e && atoi(e) == 0); }
+    return on;
+}
+/* Per-method desync checks the walker applies before dispatch (subchannel 0 /
+ * 3D methods). 1 = recover_fifo instead of executing the word. */
+static int gcm_walk_check(u32 m, u32 v)
+{
+    if (m == 0x0060u) { s_sema406e_ctx = v; return 0; }
+    if (m == 0x1D6Cu) { s_sema4097_off = v; return 0; }
+    if (m != 0x1D70u && m != 0x1D74u && m != 0x1820u) return 0;
+    if (!gcm_fifo_recover_on()) return 0;
+    /* nv4097.cpp:792-797 / 822-827: unaligned NV4097 semaphore -> recover. */
+    if (m != 0x1820u && (s_sema4097_off & 15u)) { s_fifo_rec_why = "unaligned NV4097 semaphore"; return 1; }
+    /* nv4097.cpp:468-479 check_index_array_dma: location/type invalid -> recover. */
+    if (m == 0x1820u && (v & ~0x11u)) { s_fifo_rec_why = "invalid INDEX_ARRAY_DMA"; return 1; }
+    return 0;
+}
 
+/* RPCS3 rsx_methods.cpp:1281-1773: every register not explicitly listed is
+ * invalid_method -> recover_fifo. Bit per (subch << 13 | method) >> 2.
+ * Generated from the RPCS3 table. */
+static const u32 s_rsx_valid_methods[512] = {
+    0x0F100001u, 0x00000000u, 0x00010013u, 0x00007FFFu, 0x000FFFFFu, 0xFFFFC00Fu, 0xFFFFFFFFu, 0xFFFFD067u,
+    0xFFFFFFFFu, 0x0000FFFFu, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x027B0000u, 0xFFFFFFFFu, 0x00000000u, 0xFF00FF8Bu, 0xFFFFFFFFu, 0x03FFFFFFu, 0xFFFFFFFFu,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0xC0B04C00u, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0x00000000u, 0x0000FFFFu, 0xFFFFC0F0u, 0x000C0000u,
+    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFB00FFFFu, 0x00007AFFu, 0xFFFF0000u, 0xC7000FE0u, 0xFFFFFFFFu, 0x7D7F0000u,
+    0x00000001u, 0x00000000u, 0x00000001u, 0x00000007u, 0x00000000u, 0x00000000u, 0x000007F8u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000001u, 0x00000000u, 0x00000000u, 0x00000007u, 0x00000000u, 0x00000000u, 0x0000000Fu, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000001u, 0x00000000u, 0x00000000u, 0x00000003u, 0x00000000u, 0x00000000u, 0x00000003u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000001u, 0x00000000u, 0x00000000u, 0x000000FFu, 0x00000000u, 0xC0000000u, 0x0000000Fu, 0x00000000u,
+    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+    0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+    0x00000001u, 0x00000000u, 0x00000000u, 0x0000007Fu, 0x00000000u, 0x80000000u, 0x000000FFu, 0x00000000u,
+    0x0000000Fu, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000001u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00FF0300u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000003u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x40000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u,
+    0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000000u, 0x00000800u, 0x00000000u, 0x00000000u,
+};
+/* GCM_INVALID_METHOD_RECOVER=0: unlisted methods are stored/ignored as before. */
+static int gcm_invalid_method_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_INVALID_METHOD_RECOVER"); on = !(e && atoi(e) == 0); }
+    return on && gcm_fifo_recover_on();
+}
+static unsigned long s_invalid_methods;
+/* reg: the full 16-bit method, subchannel included. */
+static int gcm_method_invalid(u32 reg, u32 v)
+{
+    reg &= 0xFFFCu;
+    if (s_rsx_valid_methods[reg >> 7] & (1u << ((reg >> 2) & 31u))) return 0;
+    if (!gcm_invalid_method_on()) return 0;
+    s_invalid_methods++;
+    { static int n = 0; if (PS3_LOG_FIRST(n, 16) || (s_invalid_methods & 1023u) == 0)
+        fprintf(stderr, "[cellGcmSys] Invalid RSX method 0x%04X (arg=0x%08X) at get 0x%08X (#%lu)\n",
+                reg, v, s_fifo_getoff, s_invalid_methods); }
+    s_fifo_rec_why = "invalid method";
+    return 1;
+}
 /* ---------------------------------------------------------------------------
  * 2D transfer engines (FIFO subchannels != 0).
  *
@@ -1053,18 +1269,46 @@ static u32 s_fifo_calloff = 0;
  * -----------------------------------------------------------------------*/
 extern u32 cellGcmResolveLocated(int local, u32 offset);
 
+/* RPCS3 Utils/rsx_utils.cpp:278-298 get_address: the two report DMA handles.
+ * REPORT_LOCATION_MAIN (0xBAD68000) is IO 0x0E000000 + off (off < 16MB);
+ * REPORT_LOCATION_LOCAL (0x66626660) is the report area the
+ * cellGcmGetReportData* calls hand out. Returns 1 for a report handle, with
+ * *ea = 0 when the offset is out of range. Shared with gcm_zc_sink. */
+static int gcm_report_dma_ea(u32 dma, u32 off, u32* ea)
+{
+    switch (dma) {
+    case 0xBAD68000u: *ea = off < 0x1000000u ? gcm_io2ea(0x0E000000u + off) : 0; return 1;
+    case 0x66626660u: *ea = off < 0x100000u ? GCM_REPORT_GUEST_BASE + off : 0; return 1;
+    default:          return 0;
+    }
+}
+
+/* A 2D-engine (NV0039 / NV3062 / NV3089 / NV309E) DMA handle + offset -> guest
+ * EA (RPCS3 rsx_utils.cpp:224 get_address). 0xFEED0001 is main memory (IO
+ * offset), the report handles as above, anything else local memory. */
+static u32 gcm_dma_ea(u32 dma, u32 off)
+{
+    u32 ea;
+    if (gcm_report_dma_ea(dma, off, &ea)) return ea;
+    return cellGcmResolveLocated(dma != 0xFEED0001u, off);
+}
+
 static struct {
+    u32 src_dma;      /* NV3062 0x0184 SET_CONTEXT_DMA_IMAGE_SOURCE */
     u32 dst_dma;      /* NV3062 0x0188 SET_CONTEXT_DMA_IMAGE_DESTIN */
     u32 color_fmt;    /* NV3062 0x0300 SET_COLOR_FORMAT             */
     u32 pitch;        /* NV3062 0x0304 SET_PITCH (dst in bits 16-31) */
     u32 dst_offset;   /* NV3062 0x030C SET_OFFSET_DESTIN            */
     u32 point;        /* NV308A 0x0304 SET_POINT ((y<<16)|x)        */
     u32 size_out;     /* NV308A 0x0308 SET_SIZE_OUT                 */
-} s_gcm2d;
+} s_gcm2d = { 0xFEED0000u, 0xFEED0000u, 0xAu, 0x400040u };   /* rsx_methods.cpp:533-534, 659-660 init */
 
 static struct {
     u32 src_dma, dst_surf, fmt, op, clip_pt, clip_sz, out_pt, out_sz;
     u32 ds_dx, dt_dy, in_sz, in_fmt, in_off, in_uv;
+    int op_written;   /* SET_OPERATION seen: until then SRCCOPY is assumed */
+    int flip_x, flip_y; /* negative DS_DX / DT_DY of the blit in flight (ds_dx /
+                         * dt_dy then hold the magnitudes) */
 } s_nv3089;
 
 /* NV309E "swizzled surface" -- the destination object for a scaled-image blit
@@ -1081,12 +1325,12 @@ static struct {
                      * this title has NV309E on 4 and NV308A on 5, and a global
                      * flag made 5's NV308A POINT (also 0x0304) be swallowed as
                      * an NV309E offset, breaking every inline transfer. */
+    u32 dma;        /* 0x0184: SET_CONTEXT_DMA_IMAGE (0 = not set: local) */
 } s_nv309e;
 
 /* Execute one NV3089 blit into the currently-bound NV3062 destination surface.
- * Point-sampled: ds/dx and dt/dy are 20.12 fixed point and are 0x100000 (1.0)
- * for the straight uploads this exists for; a scaled blit still lands, just
- * without filtering. */
+ * ds/dx and dt/dy are 20-bit fixed point (0x100000 = 1.0); the CPU copy
+ * samples texel centres, bilinear under the FOH interpolator (nv3089_tap_at). */
 /* Morton/Z-order offset for an NV309E swizzled surface: interleave the low
  * min(l2w,l2h) bits of x and y, then append the remaining bits of the larger
  * dimension above them. */
@@ -1104,19 +1348,188 @@ static u32 nv309e_swz(u32 x, u32 y, u32 l2w, u32 l2h)
  * The origin in the steps' scale is therefore origin << 16: an origin of one texel (0x10) is 0x100000. */
 static inline u64 nv3089_origin(u32 p) { return (u64)p << 16; }
 
+/* RPCS3 nv3089.cpp: the destination is the NV309E swizzled surface when
+ * SET_CONTEXT_SURFACE (0x0198) names the swizzle-2D context object, the NV3062
+ * linear surface when it names the surface-2D one. Titles whose object handles
+ * differ fall back to the old guess: a swizzled object is bound with a format
+ * whose log2 size matches the output. */
+#define NV3089_CTX_SURFACE2D 0x313371C3u
+#define NV3089_CTX_SWIZZLE2D 0x31337A73u
+static int nv3089_dst_swizzled(u32 out_w, u32 out_h)
+{
+    if (!s_nv309e.active) return 0;
+    if (s_nv3089.dst_surf == NV3089_CTX_SWIZZLE2D) return 1;
+    if (s_nv3089.dst_surf == NV3089_CTX_SURFACE2D) return 0;
+    const u32 l2w = (s_nv309e.fmt >> 16) & 0xFF, l2h = (s_nv309e.fmt >> 24) & 0xFF;
+    /* An NV309E surface at offset 0 is still swizzled (D7): gate on `active`. */
+    return (s_nv3089.fmt & 0xFF) == 3 && l2w < 32 && l2h < 32 &&
+           (1u << l2w) == out_w && (1u << l2h) == out_h;
+}
+
+/* RPCS3 nv3089.cpp decode_transfer_registers + clip_image: the destination is
+ * the clip SIZE placed at the output POINT (clip size clamped to the output
+ * size; zero is a NOP), and the clip POINT selects where in the scaled image
+ * that rectangle starts -- reset to 0 when it would run past the output size.
+ * Destination pixel (x0 + i, y0 + j) shows scaled-image texel (ix0 + i,
+ * iy0 + j). `legacy` is the old absolute-destination clip: the clip rectangle
+ * intersected with the output rectangle, both in destination coordinates. */
+typedef struct { u32 x0, y0, w, h, ix0, iy0; } nv3089_geom;
+
+static int nv3089_geom_calc(u32 out_pt, u32 out_sz, u32 clip_pt, u32 clip_sz, int legacy,
+                            nv3089_geom* g)
+{
+    const u32 out_x = out_pt & 0xFFFF, out_y = out_pt >> 16;
+    const u32 out_w = out_sz & 0xFFFF, out_h = out_sz >> 16;
+    u32 clip_x = clip_pt & 0xFFFF, clip_y = clip_pt >> 16;
+    u32 clip_w = clip_sz & 0xFFFF, clip_h = clip_sz >> 16;
+    if (legacy) {
+        const u32 cx1 = clip_w ? clip_x + clip_w : 0xFFFFFFFFu;
+        const u32 cy1 = clip_h ? clip_y + clip_h : 0xFFFFFFFFu;
+        const u32 x0 = out_x > clip_x ? out_x : clip_x, y0 = out_y > clip_y ? out_y : clip_y;
+        const u32 x1 = out_x + out_w < cx1 ? out_x + out_w : cx1;
+        const u32 y1 = out_y + out_h < cy1 ? out_y + out_h : cy1;
+        if (x1 <= x0 || y1 <= y0) return 0;
+        g->x0 = x0; g->y0 = y0; g->w = x1 - x0; g->h = y1 - y0;
+        g->ix0 = x0 - out_x; g->iy0 = y0 - out_y;
+        return 1;
+    }
+    if (clip_w > out_w) clip_w = out_w;
+    if (clip_h > out_h) clip_h = out_h;
+    if (!clip_w || !clip_h) return 0;
+    if (clip_x && out_x + clip_x + clip_w > out_w) clip_x = 0;
+    if (clip_y && out_y + clip_y + clip_h > out_h) clip_y = 0;
+    g->x0 = out_x; g->y0 = out_y; g->w = clip_w; g->h = clip_h;
+    g->ix0 = clip_x; g->iy0 = clip_y;
+    return 1;
+}
+
+static int nv3089_dstclip_legacy(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("NV3089_DSTCLIP"); v = e && e[0] == '1'; }
+    return v;
+}
+
+/* Big-endian guest pixels. R5G6B5 -> A8R8G8B8 widens by bit replication and
+ * sets alpha opaque; A8R8G8B8 -> R5G6B5 truncates (swscale's conversions in
+ * RPCS3's CPU blit path). */
+static u32 nv3089_r5g6b5_to_argb(u16 c)
+{
+    const u32 r = (c >> 11) & 31u, g = (c >> 5) & 63u, b = c & 31u;
+    return 0xFF000000u | (((r << 3) | (r >> 2)) << 16) | (((g << 2) | (g >> 4)) << 8) | ((b << 3) | (b >> 2));
+}
+
+static u16 nv3089_argb_to_r5g6b5(u32 c)
+{
+    return (u16)((((c >> 19) & 31u) << 11) | (((c >> 10) & 63u) << 5) | ((c >> 3) & 31u));
+}
+
+static u32 nv3089_next_pow2(u32 v)
+{
+    u32 p = 1;
+    while (p < v && p < 0x80000000u) p <<= 1;
+    return p;
+}
+
+/* CPU scaled-copy sampling, one axis. RPCS3 Utils/rsx_utils.cpp:34
+ * convert_scale_image runs swscale with SWS_FAST_BILINEAR when the
+ * interpolator is FOH (nv3089.cpp:616) and SWS_POINT otherwise; both sample at
+ * texel centres, as the GPU path's vkCmdBlitImage does. Output texel i of a
+ * 20-bit fixed-point step ds reads image texels t0/t1 (relative to the image
+ * origin), t1 weighted w/256:
+ *   FOH: bilinear at (i+0.5)*ds - 0.5, the neighbour clamped to the n-texel
+ *        input image;
+ *   ZOH: nearest, floor((i+0.5)*ds).
+ * At ds == 1.0 both give t0 = i, w = 0 (bit-exact 1:1 copies). */
+typedef struct { u32 t0, t1, w; } nv3089_tap;
+
+static nv3089_tap nv3089_tap_at(u32 i, u32 ds, u32 n, int foh)
+{
+    nv3089_tap r;
+    const u64 c = ((2ull * i + 1ull) * ds) >> 1;          /* (i+0.5)*ds */
+    if (!foh) {
+        /* SWS_POINT never reads past the image: clamp to n-1 (NV3089_ZOH_CLAMP=0 off). */
+        static int zclamp = -1;
+        if (zclamp < 0) { const char* e = getenv("NV3089_ZOH_CLAMP"); zclamp = !(e && atoi(e) == 0); }
+        r.t0 = r.t1 = (u32)(c >> 20);
+        if (zclamp && n && r.t0 >= n) r.t0 = r.t1 = n - 1u;
+        r.w = 0; return r;
+    }
+    const u64 p = c > 0x80000u ? c - 0x80000u : 0;        /* - 0.5, clamped at 0 */
+    const u32 t = (u32)(p >> 20);
+    r.w = (u32)(p >> 12) & 0xFFu;
+    r.t0 = r.t1 = t;
+    if (r.w) {
+        if (n && t + 1u < n) r.t1 = t + 1u;
+        else { if (n && t >= n) r.t0 = r.t1 = n - 1u; r.w = 0; }
+    }
+    return r;
+}
+
+/* Image texel t from origin o; mirrored (RPCS3 nv3089.cpp:535 _mirror_transform,
+ * applied at 590-596 for a negative scale) it runs backwards from o. */
+static inline u32 nv3089_src_coord(u32 o, u32 t, int flip)
+{
+    return flip ? (t > o ? 0u : o - t) : o + t;
+}
+
+static inline int nv3089_foh(void) { return ((s_nv3089.in_fmt >> 24) & 0xFFu) == 1u; }
+
+/* Source texel span [lo, hi] output texels i0..i0+cnt-1 read on one axis. */
+static void nv3089_src_span(u32 o, u32 i0, u32 cnt, u32 ds, u32 n, int foh, int flip, u32* lo, u32* hi)
+{
+    const nv3089_tap a = nv3089_tap_at(i0, ds, n, foh), b = nv3089_tap_at(i0 + cnt - 1u, ds, n, foh);
+    const u32 s0 = nv3089_src_coord(o, a.t0, flip), s1 = nv3089_src_coord(o, b.t1, flip);
+    *lo = s0 < s1 ? s0 : s1;
+    *hi = s0 < s1 ? s1 : s0;
+}
+
+/* One guest texel (big-endian A8R8G8B8, or R5G6B5 widened) as A8R8G8B8. */
+static inline u32 nv3089_px(u32 ea, u32 sbpp)
+{
+    extern u8* vm_base;
+    const u8* p = vm_base + ea;
+    if (sbpp == 2) return nv3089_r5g6b5_to_argb((u16)(((u32)p[0] << 8) | p[1]));
+    return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | p[3];
+}
+
+/* Bilinear per 8-bit channel (R5G6B5 is unpacked to 8 bits first, and packed
+ * again by the caller). With both weights zero this is the exact texel. */
+static u32 nv3089_sample(u32 base, u32 pitch, u32 sbpp, u32 sx0, u32 sx1, u32 wx,
+                         u32 sy0, u32 sy1, u32 wy)
+{
+    const u32 r0 = base + sy0 * pitch, r1 = base + sy1 * pitch;
+    const u32 c00 = nv3089_px(r0 + sx0 * sbpp, sbpp);
+    if (!wx && !wy) return c00;
+    const u32 c10 = nv3089_px(r0 + sx1 * sbpp, sbpp);
+    const u32 c01 = nv3089_px(r1 + sx0 * sbpp, sbpp);
+    const u32 c11 = nv3089_px(r1 + sx1 * sbpp, sbpp);
+    const u32 w00 = (256u - wx) * (256u - wy), w10 = wx * (256u - wy);
+    const u32 w01 = (256u - wx) * wy, w11 = wx * wy;
+    u32 out = 0;
+    for (u32 sh = 0; sh < 32; sh += 8) {
+        const u32 v = (((c00 >> sh) & 0xFFu) * w00 + ((c10 >> sh) & 0xFFu) * w10 +
+                       ((c01 >> sh) & 0xFFu) * w01 + ((c11 >> sh) & 0xFFu) * w11 + 32768u) >> 16;
+        out |= (v > 255u ? 255u : v) << sh;
+    }
+    return out;
+}
+
 /* The draw engine renders on the host GPU, so the scene a title copies out
  * with NV3089 is not in guest memory, and what it copies in never reaches the
  * engine's surfaces. Around the guest-memory copy below: write the source
  * rectangle back from any engine surface first, and push the written
  * rectangle into any engine surface after. 32-bit pixels only. */
-static void nv3089_engine_read(u32 in_pitch, u32 out_w, u32 out_h)
+static void nv3089_engine_read(u32 in_pitch, u32 ix0, u32 iy0, u32 w, u32 h)
 {
-    if (!rsx_draw_engine_enabled() || !out_w || !out_h) return;
+    if (!rsx_draw_engine_enabled() || !w || !h) return;
     const u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 */
-    const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
-    const u32 sx1 = (u32)((nv3089_origin(u0) + (u64)(out_w - 1) * s_nv3089.ds_dx) >> 20);
-    const u32 sy1 = (u32)((nv3089_origin(v0) + (u64)(out_h - 1) * s_nv3089.dt_dy) >> 20);
-    if (sx1 < sx0 || sy1 < sy0) return;
+    const int foh = nv3089_foh();
+    u32 sx0, sx1, sy0, sy1;
+    nv3089_src_span((u32)(nv3089_origin(u0) >> 20), ix0, w, s_nv3089.ds_dx, s_nv3089.in_sz & 0xFFFF,
+                    foh, s_nv3089.flip_x, &sx0, &sx1);
+    nv3089_src_span((u32)(nv3089_origin(v0) >> 20), iy0, h, s_nv3089.dt_dy, s_nv3089.in_sz >> 16,
+                    foh, s_nv3089.flip_y, &sy0, &sy1);
     const u32 loc = (s_nv3089.src_dma != 0xFEED0001u) ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
     rsx_draw_engine_guest_read(loc, s_nv3089.in_off + sy0 * in_pitch + sx0 * 4u, in_pitch,
                                sx1 - sx0 + 1u, sy1 - sy0 + 1u);
@@ -1151,13 +1564,130 @@ static void gcm_row_copy(u32 d, u32 s, u32 n)
 
 volatile int g_port_trace_left = 0;
 
+/* R2 patch to RPCS3 (texture_cache.h blit): a blit whose source scales down
+ * to zero columns or rows -- (u16)(clip_w / scale_x), scale_x = 1/|DS_DX| --
+ * is reported handled and copies nothing. RPCS3 only reaches that path when
+ * the source or destination is local memory (nv3089.cpp image_in).
+ * RSX_R2PATCH_LEGACY=1 copies them as before. */
+static int nv3089_degenerate_drop(u32 out_w, u32 out_h)
+{
+    static int legacy = -1;
+    if (legacy < 0) { const char* e = getenv("RSX_R2PATCH_LEGACY"); legacy = e && e[0] && e[0] != '0'; }
+    if (legacy) return 0;
+    if (s_nv3089.src_dma == 0xFEED0001u && s_gcm2d.dst_dma == 0xFEED0001u) return 0;
+    u32 clip_w = s_nv3089.clip_sz & 0xFFFF, clip_h = s_nv3089.clip_sz >> 16;
+    if (!clip_w || clip_w > out_w) clip_w = out_w;
+    if (!clip_h || clip_h > out_h) clip_h = out_h;
+    const s32 dx = (s32)s_nv3089.ds_dx, dy = (s32)s_nv3089.dt_dy;
+    const u64 adx = dx < 0 ? (u64)(-(s64)dx) : (u64)dx, ady = dy < 0 ? (u64)(-(s64)dy) : (u64)dy;
+    if (!adx || !ady) return 0;
+    const u16 src_w = (u16)(((u64)clip_w * adx) >> 20), src_h = (u16)(((u64)clip_h * ady) >> 20);
+    return !src_w || !src_h;
+}
+
+/* RPCS3 Common/tiled_dma_copy.hpp tiled_dma_copy (encode): the tiled address
+ * of linear byte (row, col) of an image at base_offset into a tile region. */
+static u32 gcm_tile_address(u32 row, u32 col, u32 bpp, u32 base, u32 base_off, u32 pitch,
+                            u32 bank, u32 tiles_per_row, u32 factor)
+{
+    static const u32 lut[16] = { 0, 1, 2, 3, 2, 3, 0, 1, 1, 2, 3, 0, 3, 0, 1, 2 };
+    const u32 this_address = row * pitch + base + base_off + col * bpp;
+    const u32 texel_offset = (this_address - base) / 256u;
+    const u32 tile_x = texel_offset % tiles_per_row;
+    const u32 tile_y = (texel_offset / tiles_per_row) / 64u;
+    const u32 tile_id = tile_y * tiles_per_row + tile_x;
+    const u32 tile_selector = (tile_id + (base >> 14)) & 0x3ffffu;
+    const u32 row_address = (tile_selector >> 2) & 0xffffu;
+    u32 bank_selector = 0;
+    if (factor == 1) bank_selector = tile_selector & 3u;
+    else if (factor == 2) bank_selector = lut[((tile_selector + ((tile_y & 1u) << 1)) & 3u) * 4u + (tile_y & 3u)];
+    else if (factor >= 4) bank_selector = lut[(tile_selector & 3u) * 4u + (tile_y & 3u)];
+    bank_selector = (bank_selector + bank) & 3u;
+    const u32 line = (texel_offset / tiles_per_row) % 64u;
+    u32 column_selector = ((line >> 3) & 7u) << 7;
+    column_selector |= ((this_address >> 5) & 7u) << 4;
+    column_selector |= (line & 3u) << 2;
+    const u32 partition = (((line >> 2) & 1u) + ((this_address >> 6) & 1u)) & 1u;
+    u32 a = (row_address & 0xFFFFu) << 16;
+    a |= (bank_selector & 3u) << 14;
+    a |= ((column_selector >> 4) & 0x3Fu) << 8;
+    a |= (partition & 1u) << 7;
+    a |= ((column_selector >> 2) & 3u) << 5;
+    a |= this_address & 0x1Fu;
+    a ^= (((a >> 12) ^ ((bank_selector ^ tile_selector) & 1u) ^ (a >> 14)) & 1u) << 9;
+    a ^= ((a >> 11) & 1u) << 10;
+    return a;
+}
+
+/* RPCS3 tile_texel_data<T, false>: lin (image_pitch = tile pitch) -> tiled
+ * bytes written relative to dst_ea. */
+static void gcm_tile_texel_data(u32 dst_ea, const u8* lin, u32 bpp, u32 base, u32 base_off,
+                                u32 size, u32 bank, u32 pitch, u32 w, u32 h)
+{
+    const u32 b = pitch >> 8;
+    u32 prime = 0, factor = 0;
+    if ((pitch & (pitch - 1u)) == 0) { prime = 1; factor = b; }
+    else {
+        static const u32 primes[5] = { 3, 5, 7, 11, 13 };
+        for (int k = 0; k < 5; k++) if (b % primes[k] == 0) { prime = primes[k]; factor = b / primes[k]; break; }
+    }
+    const u32 tpr = prime * factor;
+    if (!tpr) return;
+    extern u8* vm_base;
+    for (u32 row = 0; row < h; row++)
+        for (u32 col = 0; col < w; col++) {
+            const u32 ta = gcm_tile_address(row, col, bpp, base, base_off, pitch, bank, tpr, factor);
+            const u32 tbo = ta - base;
+            if (tbo >= size) continue;
+            memcpy(vm_base + dst_ea + (tbo - base_off), lin + row * pitch + col * bpp, bpp);
+        }
+}
+
+/* RPCS3 fw_device_state::get_tiled_memory_region: only MAIN-memory tiles
+ * (local tiling is transparent), and only with "Handle RSX Memory Tiling",
+ * which RPCS3 ships off -- GCM_HANDLE_TILED_MEMORY=1 turns it on here. */
+static int gcm_handle_tiled_memory(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_HANDLE_TILED_MEMORY"); on = e && e[0] == '1'; }
+    return on;
+}
+
+static const CellGcmTileInfo* gcm_tiled_region(u32 ea, u32 len, u32* base_ea)
+{
+    if (!gcm_handle_tiled_memory()) return NULL;
+    for (u32 i = 0; i < CELL_GCM_MAX_TILE_COUNT; i++) {
+        const CellGcmTileInfo* t = &s_tiles[i];
+        if (!t->bound || (t->tile & 1u) != 1u || !t->size) continue;
+        const u32 tb = gcm_io2ea(t->offset);
+        if (!tb) continue;
+        if (ea >= tb && ea - tb < t->size && (u64)ea + len > tb) { *base_ea = tb; return t; }
+    }
+    return NULL;
+}
+
 static void nv3089_blit(void)
 {
     u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
     u32 out_x = s_nv3089.out_pt & 0xFFFF, out_y = s_nv3089.out_pt >> 16;
     u32 in_pitch = s_nv3089.in_fmt & 0xFFFF;
     u32 dst_pitch = s_gcm2d.pitch >> 16;
+    /* RPCS3 nv3089.cpp: a zero pitch means tightly packed rows. */
+    if (!in_pitch)
+        in_pitch = ((s_nv3089.fmt & 0xFF) == 7 ? 2u : 4u) * (s_nv3089.in_sz & 0xFFFF);
+    if (!dst_pitch)
+        dst_pitch = (s_gcm2d.color_fmt == 4u ? 2u : s_gcm2d.color_fmt == 1u ? 1u : 4u) * out_w;
     if (!out_w || !out_h || !in_pitch || !dst_pitch) return;
+    if (nv3089_degenerate_drop(out_w, out_h)) return;
+    /* A mirrored blit (negative DS_DX / DT_DY) stays on the CPU path, which
+     * applies RPCS3's _mirror_transform; the GPU paths below take no flip. */
+    const int mir = s_nv3089.flip_x || s_nv3089.flip_y;
+    /* RPCS3 has one path per blit (scaled_image_from_memory or the CPU copy):
+     * with the draw engine on, the legacy backend hooks below stay out.
+     * GCM_NV3089_EXCLUSIVE=0 runs them as well. */
+    static int excl = -1;
+    if (excl < 0) { const char* e = getenv("GCM_NV3089_EXCLUSIVE"); excl = !(e && atoi(e) == 0); }
+    const int legacy_hooks = !(excl && rsx_draw_engine_enabled());
 #ifdef _WIN32
     /* Resistance port: a scaled blit INTO a display buffer is the frame's
      * resolve (the game renders the scene into an anti-aliased surface at
@@ -1169,7 +1699,7 @@ static void nv3089_blit(void)
       if (en < 0) { const char* e = getenv("NV3089_COMPOSITE"); en = e ? atoi(e) : 1; }
       extern int cellGcmOffsetIsDisplay(u32 offset);
       extern void rsx_d3d12_composite_from_offscreen(u32 raw_off);
-      if (en && cellGcmOffsetIsDisplay(s_gcm2d.dst_offset)) {
+      if (legacy_hooks && en && cellGcmOffsetIsDisplay(s_gcm2d.dst_offset)) {
           static int n = 0;
           if (n < 6) { n++;
               printf("[NV3089] display resolve: src off=0x%08X %ux%u -> dst 0x%08X %ux%u%c",
@@ -1186,9 +1716,8 @@ static void nv3089_blit(void)
       extern int rsx_d3d12_blit_from_surface(u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32);
       const u32 ff = s_nv3089.fmt & 0xFF;
       const int sl = (s_nv3089.src_dma != 0xFEED0001u), dl = (s_gcm2d.dst_dma != 0xFEED0001u);
-      const u32 l2w = (s_nv309e.fmt >> 16) & 0xFF, l2h = (s_nv309e.fmt >> 24) & 0xFF;
-      const int swz = ff == 3 && s_nv309e.active && s_nv309e.offset && (1u << l2w) == out_w && (1u << l2h) == out_h;
-      if (sl && dl && !swz && (ff == 3 || ff == 7 || ff == 8 || ff == 0xD) &&
+      const int swz = nv3089_dst_swizzled(out_w, out_h);
+      if (legacy_hooks && !mir && sl && dl && !swz && (ff == 3 || ff == 4 || ff == 7) &&
           !cellGcmOffsetIsDisplay(s_gcm2d.dst_offset))
           rsx_d3d12_blit_from_surface(s_nv3089.in_off, s_nv3089.in_sz & 0xFFFF, s_nv3089.in_sz >> 16, in_pitch,
                                       s_nv3089.in_uv, s_nv3089.ds_dx, s_nv3089.dt_dy,
@@ -1213,7 +1742,7 @@ static void nv3089_blit(void)
       } }
     /* A copy out of a surface the live renderer drew exists only on the GPU;
      * mirror 1:1 blits there too (the guest-memory copy below still runs). */
-    if (s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
+    if (legacy_hooks && !mir && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
         rsx_live_draw_enabled()) {
         const u32 u0 = (s_nv3089.in_uv & 0xFFFF) >> 4, v0 = (s_nv3089.in_uv >> 16) >> 4;
         const int sl = (s_nv3089.src_dma != 0xFEED0001u);
@@ -1222,7 +1751,7 @@ static void nv3089_blit(void)
                            dl ? 0u : 1u, s_gcm2d.dst_offset + (s_nv3089.out_pt >> 16) * dst_pitch
                                          + (s_nv3089.out_pt & 0xFFFF) * 4u, dst_pitch,
                            out_w, out_h);
-    } else if (rsx_live_draw_enabled()) {
+    } else if (legacy_hooks && !mir && rsx_live_draw_enabled()) {
         /* Scaled: a resolve. Copy it on the GPU into the display buffer; fall
          * back to presenting the source when that cannot be done. */
         const u32 sl = s_nv3089.src_dma != 0xFEED0001u ? 0u : 1u;
@@ -1255,28 +1784,93 @@ static void nv3089_blit(void)
        * where a minified surface should be, and the shell that samples the
        * pyramid draws untextured. NV309E_BLIT=0 disables. */
       if (en < 0) { const char* e = getenv("NV309E_BLIT"); en = e ? atoi(e) : 1; }
-      if (en && f == 3 && s_nv309e.active && s_nv309e.offset &&
-          (1u << l2w) == out_w && (1u << l2h) == out_h) {
+      if (en && nv3089_dst_swizzled(out_w, out_h) &&
+          (f == 3 || f == 4 || f == 7)) {
+        /* RPCS3 nv3089.cpp swizzled_copy_2: the swizzle size is the output
+         * size rounded up to powers of two (the NV309E log2 fields are not
+         * used), and the image lands at out_x/out_y of an out_w-wide linear
+         * pitch from the NV309E offset. */
+        const u32 sw_w = nv3089_next_pow2(out_w), sw_h = nv3089_next_pow2(out_h);
+        for (l2w = 0; (1u << l2w) < sw_w; l2w++) {}
+        for (l2h = 0; (1u << l2h) < sw_h; l2h++) {}
+        const u32 sbpp_s = (f == 7) ? 2u : 4u;
+        const u32 dbpp_s = ((s_nv309e.fmt & 0xFFFF) == 4u /* R5G6B5 */) ? 2u : 4u;
+        const int dl = (s_nv309e.dma != 0xFEED0001u);
+        const u32 dloc = dl ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+        const u32 doff = s_nv309e.offset + out_x * dbpp_s + out_y * out_w * dbpp_s;
         int sl = (s_nv3089.src_dma != 0xFEED0001u);
-        u32 src2 = cellGcmResolveLocated(sl, s_nv3089.in_off);
-        u32 dst2 = cellGcmResolveLocated(1, s_nv309e.offset);
+        u32 src2 = gcm_dma_ea(s_nv3089.src_dma, s_nv3089.in_off);
+        u32 dst2 = gcm_dma_ea(s_nv309e.dma, doff);
+        if (!src2 || !dst2) return;
         u32 u0b = s_nv3089.in_uv & 0xFFFF, v0b = s_nv3089.in_uv >> 16;
-        nv3089_engine_read(in_pitch, out_w, out_h);
-        /* Copy words verbatim through raw pointers rather than vm_read32/
-         * vm_write32: this moves ~500k pixels per blit and several blits run per
-         * frame, and the two byte swaps would cancel anyway. */
+        const u32 ccx = s_nv3089.clip_pt & 0xFFFF, ccy = s_nv3089.clip_pt >> 16;
+        const int whole = !ccx && !ccy && (s_nv3089.clip_sz & 0xFFFF) >= out_w &&
+                          (s_nv3089.clip_sz >> 16) >= out_h;
+        /* The engine keeps the copy on the GPU when the source is a surface
+         * newer than guest memory (no readback stall). */
+        if (!mir && sbpp_s == 4 && dbpp_s == 4 && whole && !out_x && !out_y &&
+            sw_w == out_w && sw_h == out_h && rsx_draw_engine_enabled() &&
+            rsx_draw_engine_blit_swizzled(sl ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
+                                          s_nv3089.in_off, in_pitch,
+                                          (u32)(nv3089_origin(u0b) >> 20),
+                                          (u32)(nv3089_origin(v0b) >> 20),
+                                          s_nv3089.ds_dx, s_nv3089.dt_dy, dloc, doff,
+                                          out_w, out_h,
+                                          ((s_nv3089.in_fmt >> 24) & 0xFFu) == 1u))
+            return;
+        if (sbpp_s == 4) nv3089_engine_read(in_pitch, 0, 0, out_w, out_h);
+        if (rsx_draw_engine_enabled())
+            rsx_draw_engine_range_read(dloc, doff, sw_w * sw_h * dbpp_s);
+        /* The clip rectangle of the scaled image lands at the swizzle origin
+         * (RPCS3 swizzled_copy_1 + clip_image). NV3089_DSTCLIP=1: the whole
+         * output. */
+        nv3089_geom sg = { 0, 0, out_w, out_h, 0, 0 };
+        if (!nv3089_dstclip_legacy()) {
+            const u32 csz = ((s_nv3089.clip_sz >> 16) ? (s_nv3089.clip_sz & 0xFFFF0000u) : (out_h << 16)) |
+                            ((s_nv3089.clip_sz & 0xFFFF) ? (s_nv3089.clip_sz & 0xFFFFu) : out_w);
+            if (!nv3089_geom_calc(s_nv3089.out_pt, s_nv3089.out_sz, s_nv3089.clip_pt, csz, 0, &sg)) return;
+        }
+        /* RPCS3 nv3089.cpp:470-530 swizzled_copy_2 swizzles and writes the whole
+         * sw_w x sw_h block: the clipped image sits at its origin in a buffer
+         * that is zero elsewhere (swizzled_copy_1's temp3 and pad_texture's
+         * sw_temp, Utils/image_utils.hpp:14), so every texel outside the clip
+         * rectangle -- including the pow2 padding -- is written as zero.
+         * Raw pointers rather than vm_read32/vm_write32: this moves ~500k
+         * pixels per blit and several blits run per frame. */
         { extern u8* vm_base;
-          const u8* sbase = vm_base + src2;
           u8* dbase = vm_base + dst2;
-          for (u32 y = 0; y < out_h; y++) {
-              u64 sv = nv3089_origin(v0b) + (u64)y * s_nv3089.dt_dy;
-              const u8* srow = sbase + (u32)(sv >> 20) * in_pitch;
-              for (u32 x = 0; x < out_w; x++) {
-                  u64 su = nv3089_origin(u0b) + (u64)x * s_nv3089.ds_dx;
-                  memcpy(dbase + (u64)nv309e_swz(x, y, l2w, l2h) * 4,
-                         srow + (u32)(su >> 20) * 4, 4);
+          const int foh = nv3089_foh();
+          const u32 in_w = s_nv3089.in_sz & 0xFFFF, in_h = s_nv3089.in_sz >> 16;
+          const u32 ox = (u32)(nv3089_origin(u0b) >> 20), oy = (u32)(nv3089_origin(v0b) >> 20);
+          for (u32 y = 0; y < sw_h; y++) {
+              nv3089_tap ty = { 0, 0, 0 };
+              u32 sy0 = 0, sy1 = 0;
+              if (y < sg.h) {
+                  ty = nv3089_tap_at(sg.iy0 + y, s_nv3089.dt_dy, in_h, foh);
+                  sy0 = nv3089_src_coord(oy, ty.t0, s_nv3089.flip_y);
+                  sy1 = nv3089_src_coord(oy, ty.t1, s_nv3089.flip_y);
+              }
+              for (u32 x = 0; x < sw_w; x++) {
+                  u8* dp = dbase + (u64)nv309e_swz(x, y, l2w, l2h) * dbpp_s;
+                  if (y >= sg.h || x >= sg.w) { memset(dp, 0, dbpp_s); continue; }
+                  const nv3089_tap tx = nv3089_tap_at(sg.ix0 + x, s_nv3089.ds_dx, in_w, foh);
+                  const u32 c = nv3089_sample(src2, in_pitch, sbpp_s,
+                                              nv3089_src_coord(ox, tx.t0, s_nv3089.flip_x),
+                                              nv3089_src_coord(ox, tx.t1, s_nv3089.flip_x), tx.w,
+                                              sy0, sy1, ty.w);
+                  if (dbpp_s == 4) {
+                      dp[0] = (u8)(c >> 24); dp[1] = (u8)(c >> 16); dp[2] = (u8)(c >> 8); dp[3] = (u8)c;
+                  } else {                    /* -> R5G6B5 (big-endian) */
+                      const u16 p = nv3089_argb_to_r5g6b5(c);
+                      dp[0] = (u8)(p >> 8); dp[1] = (u8)p;
+                  }
               }
           } }
+        /* Textures sampled from here are rehashed, any engine record of a
+         * swizzled copy there is dropped, and the surfaces it overlapped stop
+         * owning those bytes (RPCS3: no write_barrier on this path). */
+        if (rsx_draw_engine_enabled())
+            rsx_draw_engine_range_cpu_wrote(dloc, doff, sw_w * sw_h * dbpp_s);
         { static int _n = 0; static int cap = -1;
           if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
           if (cap && _n < cap) { _n++;
@@ -1292,8 +1886,8 @@ static void nv3089_blit(void)
      * sampled blended texture in the frame. Skipping those left every one of
      * those textures empty. Same 4-byte pixel layout as the formats already
      * handled. */
-    if (f != 3 /* A8R8G8B8 (scale-format enum) */ &&
-        f != 7 /* A8R8G8B8 */ && f != 8 /* X8R8G8B8 */ && f != 0xD /* A8B8G8R8 */) {
+    if (f != 3 /* A8R8G8B8 (scale-format enum) */ && f != 4 /* X8R8G8B8: read as A8R8G8B8 (RPCS3) */ &&
+        f != 7 /* R5G6B5 */) {   /* Y8 / X8B8G8R8 are rejected in nv3089_image_in */
         /* Log the GEOMETRY of a skipped blit, not just the format: a full-screen
          * copy from the scene surface to a registered display buffer is the
          * composite this title needs, and is worth telling apart from some
@@ -1311,27 +1905,75 @@ static void nv3089_blit(void)
     }
     int src_local = (s_nv3089.src_dma != 0xFEED0001u);
     int dst_local = (s_gcm2d.dst_dma  != 0xFEED0001u);
-    u32 src = cellGcmResolveLocated(src_local, s_nv3089.in_off);
-    u32 dst = cellGcmResolveLocated(dst_local, s_gcm2d.dst_offset);
+    u32 src = gcm_dma_ea(s_nv3089.src_dma, s_nv3089.in_off);
+    u32 dst = gcm_dma_ea(s_gcm2d.dst_dma, s_gcm2d.dst_offset);
+    if (!src || !dst) return;
     u32 u0 = s_nv3089.in_uv & 0xFFFF, v0 = s_nv3089.in_uv >> 16;   /* 12.4 start */
-    /* Clip to SET_CLIP_POINT/SIZE (destination coordinates). A title tiling a
-     * resolve in 512x512 blocks relies on it to stop at the surface edge:
-     * Tornado Outbreak's bottom band is 512 rows tall with 208 left in the
-     * display buffer, and writing all 512 ran on into the VRAM after it --
-     * where its full-screen quad's vertices were staged, so the quad drew with
-     * all-zero positions. A zero clip size means unclipped. */
-    u32 cx0 = s_nv3089.clip_pt & 0xFFFF, cy0 = s_nv3089.clip_pt >> 16;
-    u32 cx1 = (s_nv3089.clip_sz & 0xFFFF) ? cx0 + (s_nv3089.clip_sz & 0xFFFF) : 0xFFFFFFFFu;
-    u32 cy1 = (s_nv3089.clip_sz >> 16)    ? cy0 + (s_nv3089.clip_sz >> 16)    : 0xFFFFFFFFu;
+    /* Destination rectangle and the scaled-image texel it starts at: RPCS3
+     * geometry (nv3089_geom_calc), or with NV3089_DSTCLIP=1 the old
+     * absolute-destination clip. A title tiling a resolve in 512x512 blocks
+     * relies on the clip to stop at the surface edge: Tornado Outbreak's
+     * bottom band is 512 rows tall with 208 left in the display buffer, and
+     * writing all 512 ran on into the VRAM after it -- where its full-screen
+     * quad's vertices were staged. Both rules stop it there. A caller that
+     * bypasses nv3089_image_in (which NOPs a zero clip) gets the whole output. */
+    nv3089_geom gm;
+    { const u32 csz = ((s_nv3089.clip_sz >> 16) ? (s_nv3089.clip_sz & 0xFFFF0000u) : (s_nv3089.out_sz & 0xFFFF0000u)) |
+                      ((s_nv3089.clip_sz & 0xFFFF) ? (s_nv3089.clip_sz & 0xFFFFu) : (s_nv3089.out_sz & 0xFFFFu));
+      if (!nv3089_geom_calc(s_nv3089.out_pt, s_nv3089.out_sz, s_nv3089.clip_pt, csz,
+                            nv3089_dstclip_legacy(), &gm)) return; }
     /* Bytes per pixel from the SDK enums (CELL_GCM_TRANSFER_SCALE_FORMAT_*:
-     * 7 = R5G6B5, 8 = Y8 -- not 32-bit as they were once labelled). When the
-     * destination surface format agrees it is a plain copy of that width; a
-     * real format conversion keeps the old 4-byte copy rather than guess. */
-    u32 sbpp = (f == 7) ? 2u : (f == 8) ? 1u : 4u;
+     * 7 = R5G6B5). RPCS3 converts between R5G6B5 and A8R8G8B8 (its only
+     * destination formats). */
+    u32 sbpp = (f == 7) ? 2u : 4u;
     u32 dbpp = (s_gcm2d.color_fmt == 4u /* R5G6B5 */) ? 2u
              : (s_gcm2d.color_fmt == 1u /* Y8 */)     ? 1u : 4u;
+    const int conv = (sbpp == 2u && dbpp == 4u) || (sbpp == 4u && dbpp == 2u);
     u32 bpp = (sbpp == dbpp) ? sbpp : 4u;
-    if (bpp == 4) nv3089_engine_read(in_pitch, out_w, out_h);
+    if (conv) bpp = dbpp;
+    const u32 x0 = gm.x0, y0 = gm.y0, x1 = gm.x0 + gm.w, y1 = gm.y0 + gm.h;
+    /* RPCS3's blit engine: a copy between two engine colour surfaces runs on
+     * the GPU, and guest memory catches up only when something reads it. */
+    if (sbpp == dbpp && (bpp == 4 || bpp == 2) && rsx_draw_engine_enabled()) {
+        /* Mirrored (RPCS3 apply_pixel_transforms + flipped blit area): the
+         * start texel is the one output 0 reads, nv3089_src_coord's o - t. */
+        const u32 offx = (u32)(((u64)gm.ix0 * s_nv3089.ds_dx) >> 20);
+        const u32 offy = (u32)(((u64)gm.iy0 * s_nv3089.dt_dy) >> 20);
+        const u32 ox = (u32)(nv3089_origin(u0) >> 20), oy = (u32)(nv3089_origin(v0) >> 20);
+        const u32 bsx = s_nv3089.flip_x ? (ox >= offx ? ox - offx : 0xFFFFFFFFu)
+                                        : (u32)((nv3089_origin(u0) + (u64)gm.ix0 * s_nv3089.ds_dx) >> 20);
+        const u32 bsy = s_nv3089.flip_y ? (oy >= offy ? oy - offy : 0xFFFFFFFFu)
+                                        : (u32)((nv3089_origin(v0) + (u64)gm.iy0 * s_nv3089.dt_dy) >> 20);
+        const int linear = ((s_nv3089.in_fmt >> 24) & 0xFFu) == 1u;   /* FOH */
+        if (bsx != 0xFFFFFFFFu && bsy != 0xFFFFFFFFu &&
+            rsx_draw_engine_blit_flip(src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
+                                      s_nv3089.in_off, in_pitch, bsx, bsy,
+                                      s_nv3089.ds_dx, s_nv3089.dt_dy,
+                                      dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
+                                      s_gcm2d.dst_offset, dst_pitch, x0, y0,
+                                      gm.w, gm.h, linear, s_nv3089.in_sz, bpp,
+                                      (s_nv3089.flip_x ? 1u : 0u) | (s_nv3089.flip_y ? 2u : 0u)))
+            return;
+    }
+    if (sbpp == 4) nv3089_engine_read(in_pitch, gm.ix0, gm.iy0, gm.w, gm.h);
+    /* RPCS3 nv3089.cpp:634-683: into a bound MAIN tile the scaled image is
+     * produced linearly and stored with tile_texel_data32/16. */
+    u32 t_base = 0, t_lo = 0, t_len = 0, t_pix = 0;
+    u8* t_save = NULL;
+    const CellGcmTileInfo* t_reg = (!dst_local && (bpp == 4 || bpp == 2))
+        ? gcm_tiled_region(dst, dst_pitch * gm.h, &t_base) : NULL;
+    if (t_reg) {
+        extern u8* vm_base;
+        t_pix = dst + out_y * dst_pitch + out_x * bpp;
+        const u64 w0 = (u64)dst + (u64)y0 * dst_pitch + (u64)x0 * bpp;
+        const u64 w1 = w0 + (u64)(gm.h - 1u) * dst_pitch + (u64)gm.w * bpp;
+        const u64 l1 = (u64)t_pix + (u64)(gm.h - 1u) * t_reg->pitch + (u64)gm.w * bpp;
+        const u64 lo = w0 < t_pix ? w0 : t_pix, hi = w1 > l1 ? w1 : l1;
+        if (hi - lo <= 0x4000000u && hi <= 0x100000000ull && (t_save = (u8*)malloc((size_t)(hi - lo)))) {
+            t_lo = (u32)lo; t_len = (u32)(hi - lo);
+            memcpy(t_save, vm_base + t_lo, t_len);
+        } else t_reg = NULL;
+    }
     /* NV3089_ROWCOPY (default 1): an unscaled blit copies a row at a time.
      * The per-pixel loop pays a vm_read32 and a vm_write32 per pixel -- the
      * bounds and null-store checks, the store hooks, a reservation lookup and
@@ -1341,52 +1983,427 @@ static void nv3089_blit(void)
      * per-pixel copy, which is what the PPU store watches see. */
     static int rowcopy = -1;
     if (rowcopy < 0) { const char* e = getenv("NV3089_ROWCOPY"); rowcopy = e ? atoi(e) : 1; }
-    if (rowcopy && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
+    if (rowcopy && !conv && !mir && s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u) {
         /* the source start in whole texels: IMAGE_IN_POINT is 12.4 */
-        const u32 sx0 = (u32)(nv3089_origin(u0) >> 20), sy0 = (u32)(nv3089_origin(v0) >> 20);
-        u32 xa = 0, xb = out_w;                       /* destination x range inside the clip */
-        if (out_x < cx0) xa = cx0 - out_x;
-        if ((u64)out_x + xb > cx1) xb = cx1 > out_x ? cx1 - out_x : 0;
-        if (xa < xb) {
-            const u32 n = (xb - xa) * bpp;
-            for (u32 y = 0; y < out_h; y++) {
-                const u32 dy = out_y + y;
-                if (dy < cy0 || dy >= cy1) continue;
-                const u64 sa = (u64)src + (u64)(sy0 + y) * in_pitch + (u64)(sx0 + xa) * bpp;
-                const u64 da = (u64)dst + (u64)dy * dst_pitch + (u64)(out_x + xa) * bpp;
-                if (sa + n > 0x100000000ull || da + n > 0x100000000ull) continue;
-                gcm_row_copy((u32)da, (u32)sa, n);
+        const u32 sx0 = (u32)(nv3089_origin(u0) >> 20) + gm.ix0;
+        const u32 sy0 = (u32)(nv3089_origin(v0) >> 20) + gm.iy0;
+        const u32 n = gm.w * bpp;
+        for (u32 y = 0; y < gm.h; y++) {
+            const u64 sa = (u64)src + (u64)(sy0 + y) * in_pitch + (u64)sx0 * bpp;
+            const u64 da = (u64)dst + (u64)(y0 + y) * dst_pitch + (u64)x0 * bpp;
+            if (sa + n > 0x100000000ull || da + n > 0x100000000ull) continue;
+            gcm_row_copy((u32)da, (u32)sa, n);
+        }
+    } else if (dbpp == 2 || dbpp == 4) {
+        /* Texel-centre point or FOH bilinear sampling (nv3089_tap_at), mirrored
+         * for a negative scale; R5G6B5 is filtered at 8 bits per channel. */
+        const int foh = nv3089_foh();
+        const u32 in_w = s_nv3089.in_sz & 0xFFFF, in_h = s_nv3089.in_sz >> 16;
+        const u32 ox = (u32)(nv3089_origin(u0) >> 20), oy = (u32)(nv3089_origin(v0) >> 20);
+        for (u32 y = 0; y < gm.h; y++) {
+            const nv3089_tap ty = nv3089_tap_at(gm.iy0 + y, s_nv3089.dt_dy, in_h, foh);
+            const u32 sy0 = nv3089_src_coord(oy, ty.t0, s_nv3089.flip_y);
+            const u32 sy1 = nv3089_src_coord(oy, ty.t1, s_nv3089.flip_y);
+            for (u32 x = 0; x < gm.w; x++) {
+                const nv3089_tap tx = nv3089_tap_at(gm.ix0 + x, s_nv3089.ds_dx, in_w, foh);
+                const u32 c = nv3089_sample(src, in_pitch, sbpp,
+                                            nv3089_src_coord(ox, tx.t0, s_nv3089.flip_x),
+                                            nv3089_src_coord(ox, tx.t1, s_nv3089.flip_x), tx.w,
+                                            sy0, sy1, ty.w);
+                const u32 d = dst + (y0 + y) * dst_pitch + (x0 + x) * dbpp;
+                if (dbpp == 4) vm_write32(d, c);
+                else           vm_write16(d, nv3089_argb_to_r5g6b5(c));
             }
         }
     } else
-    for (u32 y = 0; y < out_h; y++) {
-        u32 dy = out_y + y;
-        if (dy < cy0 || dy >= cy1) continue;
-        u64 sv = nv3089_origin(v0) + (u64)y * s_nv3089.dt_dy;
+    for (u32 y = 0; y < gm.h; y++) {
+        const u32 dy = y0 + y;
+        u64 sv = nv3089_origin(v0) + (u64)(gm.iy0 + y) * s_nv3089.dt_dy;
         u32 sy = (u32)(sv >> 20);
-        for (u32 x = 0; x < out_w; x++) {
-            u32 dx = out_x + x;
-            if (dx < cx0 || dx >= cx1) continue;
-            u64 su = nv3089_origin(u0) + (u64)x * s_nv3089.ds_dx;
+        for (u32 x = 0; x < gm.w; x++) {
+            const u32 dx = x0 + x;
+            u64 su = nv3089_origin(u0) + (u64)(gm.ix0 + x) * s_nv3089.ds_dx;
             u32 sx = (u32)(su >> 20);
-            u32 s = src + sy * in_pitch + sx * bpp;
+            u32 s = src + sy * in_pitch + sx * (conv ? sbpp : bpp);
             u32 d = dst + dy * dst_pitch + dx * bpp;
-            if (bpp == 4)      vm_write32(d, vm_read32(s));
+            if (conv) {
+                if (sbpp == 2) vm_write32(d, nv3089_r5g6b5_to_argb(vm_read16(s)));
+                else           vm_write16(d, nv3089_argb_to_r5g6b5(vm_read32(s)));
+            }
+            else if (bpp == 4) vm_write32(d, vm_read32(s));
             else if (bpp == 2) vm_write16(d, vm_read16(s));
             else               vm_write8(d, vm_read8(s));
         }
     }
-    if (bpp == 4) {
-        const u32 x0 = out_x > cx0 ? out_x : cx0, y0 = out_y > cy0 ? out_y : cy0;
-        const u32 x1 = (out_x + out_w < cx1) ? out_x + out_w : cx1;
-        const u32 y1 = (out_y + out_h < cy1) ? out_y + out_h : cy1;
-        nv3089_engine_wrote(dst_pitch, x0, y0, x1, y1);
+    if (t_reg) {
+        extern u8* vm_base;
+        u8* lin = (u8*)malloc(t_len);
+        if (lin) {
+            memcpy(lin, vm_base + t_lo, t_len);
+            memcpy(vm_base + t_lo, t_save, t_len);
+            gcm_tile_texel_data(t_pix, lin + (t_pix - t_lo), bpp, t_base, dst - t_base, t_reg->size,
+                                t_reg->bank, t_reg->pitch, gm.w, gm.h);
+            free(lin);
+        }
+        free(t_save);
     }
+    if (bpp == 4) nv3089_engine_wrote(dst_pitch, x0, y0, x1, y1);
+    /* Cached textures over the written rows are re-hashed before their next
+     * use (RPCS3's write barrier on the blit destination). */
+    if (rsx_draw_engine_enabled())
+        rsx_draw_engine_textures_wrote(dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
+                                       s_gcm2d.dst_offset + y0 * dst_pitch + x0 * bpp,
+                                       (gm.h - 1u) * dst_pitch + gm.w * bpp);
     { static int _n = 0; static int cap = -1;
       if (cap < 0) { const char* e = getenv("NV3089_DBG"); cap = e ? atoi(e) : 0; }
       if (cap && _n < cap) { _n++;
         printf("[NV3089] %ux%u fmt=0x%X src=0x%08X(pitch %u) -> dst=0x%08X(pitch %u) at %u,%u\n",
                out_w, out_h, f, src, in_pitch, dst, dst_pitch, out_x, out_y); } }
+}
+
+/* NV3089 IMAGE_IN trigger, with RPCS3's decode_transfer_registers checks in
+ * front of the copy (nv3089.cpp): only SRCCOPY is implemented (anything else
+ * is logged and dropped; NV3089_ANY_OP=1 copies anyway), a zero clip size is
+ * a NOP, the source start is a whole texel (CENTER origin: -0.5 then floor;
+ * a downscale snaps it to the scaled grid), and a 1:1 copy of an image onto
+ * itself is a NOP. */
+/* RPCS3 nv3089.cpp decode_transfer_registers validation: a non-SRCCOPY
+ * operation, an unknown source / destination format or an unmapped
+ * destination / source recovers the FIFO; an unknown context surface is a
+ * NOP. GCM_NV3089_VALIDATE=0 restores the old skip-and-continue. */
+static int s_nv3089_recover;
+static int nv3089_validate_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_NV3089_VALIDATE"); on = !(e && atoi(e) == 0); }
+    return on;
+}
+
+static int nv3089_invalid(const char* what, u32 v)
+{
+    static u32 n = 0;
+    if (n++ < 8) fprintf(stderr, "[NV3089] %s (0x%X): FIFO recover (as RPCS3)%c", what, v, 10);
+    s_nv3089_recover = gcm_fifo_recover_on();
+    return 1;
+}
+
+/* 1 = drop the blit (recover pending if s_nv3089_recover is set) */
+static int nv3089_validate(void)
+{
+    if (!nv3089_validate_on()) return 0;
+    if (s_nv3089.op_written && s_nv3089.op != 3u && !(getenv("NV3089_ANY_OP") && getenv("NV3089_ANY_OP")[0] == '1'))
+        return nv3089_invalid("operation is not SRCCOPY", s_nv3089.op);
+    const u32 sf = s_nv3089.fmt;
+    if (sf < 1u || sf > 0xDu) return nv3089_invalid("unknown src color format", sf);
+    const u32 surf = s_nv3089.dst_surf;
+    if (surf && surf != NV3089_CTX_SURFACE2D && surf != NV3089_CTX_SWIZZLE2D) {
+        static u32 n = 0;
+        if (n++ < 8) fprintf(stderr, "[NV3089] unknown context surface 0x%X: NOP (as RPCS3)%c", surf, 10);
+        return 1;
+    }
+    const int swz = surf == NV3089_CTX_SWIZZLE2D;
+    const u32 df = swz ? (s_nv309e.fmt & 0xFFFFu) : s_gcm2d.color_fmt;
+    if (df != 4u && df != 0xAu && df != 0xBu)
+        return nv3089_invalid(swz ? "unknown NV309E dst color format" : "unknown NV3062 dst color format", df);
+    if (!(swz ? gcm_dma_ea(s_nv309e.dma, s_nv309e.offset) : gcm_dma_ea(s_gcm2d.dst_dma, s_gcm2d.dst_offset)))
+        return nv3089_invalid("unmapped dst", swz ? s_nv309e.offset : s_gcm2d.dst_offset);
+    if (!gcm_dma_ea(s_nv3089.src_dma, s_nv3089.in_off))
+        return nv3089_invalid("unmapped src", s_nv3089.in_off);
+    return 0;
+}
+
+static void nv3089_image_in(void)
+{
+    if (!nv3089_validate_on() && s_nv3089.op_written && s_nv3089.op != 3u) {
+        static int any = -1;
+        if (any < 0) { const char* e = getenv("NV3089_ANY_OP"); any = e && e[0] == '1'; }
+        static int _w = 0;
+        if (PS3_LOG_FIRST(_w, 4))
+            printf("[NV3089] operation %u is not SRCCOPY: %s%c", s_nv3089.op,
+                   any ? "copied anyway" : "skipped", 10);
+        if (!any) return;
+    }
+    /* RPCS3 nv3089.cpp:305-317: source formats other than A8R8G8B8, X8R8G8B8
+     * (read as A8R8G8B8) and R5G6B5 are unsupported there (fmt::throw_exception,
+     * which stops emulation). Y8 and X8B8G8R8 used to be copied as 32-bit
+     * ARGB here (wrong width / swapped R and B); drop them instead. */
+    { const u32 sf = s_nv3089.fmt & 0xFF;
+      if (sf == 8u || sf == 0xDu) {
+          static int _w = 0;
+          if (!_w) { _w = 1;
+              fprintf(stderr, "[NV3089] source format 0x%X (%s) unsupported (as RPCS3), blit dropped%c",
+                      sf, sf == 8u ? "Y8" : "X8B8G8R8", 10); }
+          return;
+      } }
+    const u32 out_w = s_nv3089.out_sz & 0xFFFF, out_h = s_nv3089.out_sz >> 16;
+    u32 clip_w = s_nv3089.clip_sz & 0xFFFF, clip_h = s_nv3089.clip_sz >> 16;
+    if (clip_w > out_w) clip_w = out_w;
+    if (clip_h > out_h) clip_h = out_h;
+    if (!clip_w || !clip_h || !s_nv3089.ds_dx || !s_nv3089.dt_dy) return;
+    if (nv3089_validate()) return;
+    /* DS_DX / DT_DY are signed 11.20 fixed point (RPCS3 rsx_decode.h:2052
+     * decode_fxp<11,20>); a negative step mirrors the blit (nv3089.cpp:590).
+     * Scaling and validation use the magnitude. */
+    const s32 sdx = (s32)s_nv3089.ds_dx, sdy = (s32)s_nv3089.dt_dy;
+    const u32 adx = sdx < 0 ? (u32)(-(s64)sdx) : (u32)sdx;
+    const u32 ady = sdy < 0 ? (u32)(-(s64)sdy) : (u32)sdy;
+    /* RPCS3: an empty input region throws (treated as a NOP here), and a
+     * scale that maps the input to zero output pixels is ignored
+     * (nv3089.cpp:320 convert_w = |scale_x| * in_w). */
+    { const u32 in_w = s_nv3089.in_sz & 0xFFFF, in_h = s_nv3089.in_sz >> 16;
+      if (!in_w || !in_h) return;
+      if ((u64)in_w * 0x100000u < adx || (u64)in_h * 0x100000u < ady) return; }
+
+    const u32 saved_uv = s_nv3089.in_uv;
+    const int center = ((s_nv3089.in_fmt >> 16) & 0xFFu) == 1u;
+    u32 ix = (saved_uv & 0xFFFF) >> 4, iy = (saved_uv >> 16) >> 4;
+    if (center) {
+        /* floor(max(v, 0.5) - 0.5) on 12.4: (v - 8) >> 4, clamped at 0 */
+        ix = (saved_uv & 0xFFFF) > 8u ? ((saved_uv & 0xFFFF) - 8u) >> 4 : 0u;
+        iy = (saved_uv >> 16) > 8u ? ((saved_uv >> 16) - 8u) >> 4 : 0u;
+    }
+    /* RPCS3 nv3089.cpp:161-172 subpixel snap with the signed scale:
+     * in = floor(in * scale) / scale (floor without libm). */
+    const float scale_x = 1048576.0f / (float)sdx;
+    const float scale_y = 1048576.0f / (float)sdy;
+    if (scale_x < 1.0f) { const float v = (float)ix * scale_x; s32 fl = (s32)v; if ((float)fl > v) fl--;
+                          ix = (u32)((float)fl / scale_x); }
+    if (scale_y < 1.0f) { const float v = (float)iy * scale_y; s32 fl = (s32)v; if ((float)fl > v) fl--;
+                          iy = (u32)((float)fl / scale_y); }
+    ix &= 0xFFFu; iy &= 0xFFFu;
+
+    if (s_nv3089.ds_dx == 0x100000u && s_nv3089.dt_dy == 0x100000u &&
+        (s_nv3089.in_sz & 0xFFFF) == clip_w && (s_nv3089.in_sz >> 16) == clip_h) {
+        const int swz = nv3089_dst_swizzled(out_w, out_h);
+        const u32 sbpp = (s_nv3089.fmt & 0xFF) == 7 ? 2u : 4u;
+        const u32 dbpp = (swz ? (s_nv309e.fmt & 0xFFFF) : s_gcm2d.color_fmt) == 4u ? 2u : 4u;
+        u32 ip = s_nv3089.in_fmt & 0xFFFF, op = swz ? 0u : (s_gcm2d.pitch >> 16);
+        if (!ip) ip = sbpp * (s_nv3089.in_sz & 0xFFFF);
+        if (!op) op = dbpp * out_w;
+        if (ip == op && gcm_dma_ea(s_nv3089.src_dma, s_nv3089.in_off) ==
+                        (swz ? gcm_dma_ea(s_nv309e.dma, s_nv309e.offset)
+                             : gcm_dma_ea(s_gcm2d.dst_dma, s_gcm2d.dst_offset)))
+            return;
+    }
+    s_nv3089.in_uv = (iy << 20) | (ix << 4);
+    s_nv3089.ds_dx = adx; s_nv3089.dt_dy = ady;
+    s_nv3089.flip_x = sdx < 0; s_nv3089.flip_y = sdy < 0;
+    nv3089_blit();
+    s_nv3089.ds_dx = (u32)sdx; s_nv3089.dt_dy = (u32)sdy;
+    s_nv3089.flip_x = s_nv3089.flip_y = 0;
+    s_nv3089.in_uv = saved_uv;
+}
+
+/* NV0039 "memory to memory format": the linear buffer copy libgcm's
+ * cellGcmSetTransferData / cellGcmSetTransferImage emit. Registers (RPCS3
+ * gcm_enums.h NV0039_*): 0x0184/0x0188 source/destination DMA, 0x030C/0x0310
+ * offsets, 0x0314/0x0318 signed pitches, 0x031C line length (bytes), 0x0320
+ * line count, 0x0324 format (input stride [7:0], output stride [15:8]) and
+ * 0x0328 BUFFER_NOTIFY, the trigger. Semantics follow RPCS3's
+ * nv0039::buffer_notify, including the byte-stride gather and the
+ * overlapping-range double copy. */
+static struct {
+    u32 in_dma, out_dma, in_off, out_off, len, count, fmt;
+    s32 in_pitch, out_pitch;
+} s_nv0039 = { 0xFEED0001u, 0xFEED0000u };   /* rsx_methods.cpp:1211-1212 init */
+
+static void gcm_zc_label_sync(void);
+
+static void nv0039_copy(void)
+{
+    const u32 len = s_nv0039.len, count = s_nv0039.count;
+    const u32 in_fmt = s_nv0039.fmt & 0xFFu, out_fmt = (s_nv0039.fmt >> 8) & 0xFFu;
+    if (!len || !count || !in_fmt || in_fmt > 4 || !out_fmt || out_fmt > 4) return;
+    /* RPCS3 nv0039.cpp:106 buffer_notify -> thread::read_barrier: ZCULL
+     * reports still queued land before the copy reads them (a title copies its
+     * report area). GCM_NV0039_ZSYNC=0 skips it. */
+    { static int zs = -1;
+      if (zs < 0) { const char* e = getenv("GCM_NV0039_ZSYNC"); zs = !(e && atoi(e) == 0); }
+      if (zs) gcm_zc_label_sync(); }
+    const s32 in_pitch = s_nv0039.in_pitch, out_pitch = s_nv0039.out_pitch;
+    const int src_local = (s_nv0039.in_dma != 0xFEED0001u);
+    const int dst_local = (s_nv0039.out_dma != 0xFEED0001u);
+    const u32 src = gcm_dma_ea(s_nv0039.in_dma, s_nv0039.in_off);
+    const u32 dst = gcm_dma_ea(s_nv0039.out_dma, s_nv0039.out_off);
+    if (!src || !dst || src == 0xFFFFFFFFu || dst == 0xFFFFFFFFu) return;
+    const u32 in_w = len * in_fmt, out_w = len * out_fmt;
+    /* With a negative pitch the rows run downwards in memory: the touched
+     * range starts at the last row. */
+    const s64 in_span = (s64)in_pitch * (s64)(count - 1), out_span = (s64)out_pitch * (s64)(count - 1);
+    const u32 read_len = (u32)((in_span < 0 ? -in_span : in_span) + in_w);
+    const u32 write_len = (u32)((out_span < 0 ? -out_span : out_span) + out_w);
+    const u32 read_off = s_nv0039.in_off + (u32)(in_span < 0 ? in_span : 0);
+    const u32 write_off = s_nv0039.out_off + (u32)(out_span < 0 ? out_span : 0);
+    const u32 src_lo = src + (u32)(in_span < 0 ? in_span : 0);
+    const u32 dst_lo = dst + (u32)(out_span < 0 ? out_span : 0);
+    if (rsx_draw_engine_enabled()) {
+        rsx_draw_engine_range_read(src_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
+                                   read_off, read_len);
+        rsx_draw_engine_range_will_write(dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
+                                         write_off, write_len);
+    }
+    extern u8* vm_base;
+    u8* d = vm_base + dst;
+    const u8* s = vm_base + src;
+    if (in_fmt > 1 || out_fmt > 1) {
+        for (u32 r = 0; r < count; r++)
+            for (u32 c = 0; c < len; c++)
+                d[(s64)r * out_pitch + (s64)c * out_fmt] = s[(s64)r * in_pitch + (s64)c * in_fmt];
+    } else {
+        const int overlap = src_local == dst_local &&
+            (u64)src_lo < (u64)dst_lo + write_len && (u64)dst_lo < (u64)src_lo + read_len;
+        const int block = (u32)in_pitch == in_w && (u32)out_pitch == out_w;
+        if (block) memmove(d, s, read_len);
+        else if (!overlap)
+            for (u32 r = 0; r < count; r++)
+                memcpy(d + (s64)r * out_pitch, s + (s64)r * in_pitch, len);
+        else {
+            u8* tmp = (u8*)malloc((size_t)len * count);
+            if (!tmp) return;
+            for (u32 r = 0; r < count; r++) memcpy(tmp + (size_t)r * len, s + (s64)r * in_pitch, len);
+            for (u32 r = 0; r < count; r++) memcpy(d + (s64)r * out_pitch, tmp + (size_t)r * len, len);
+            free(tmp);
+        }
+    }
+    if (rsx_draw_engine_enabled())
+        rsx_draw_engine_range_wrote(dst_local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN,
+                                    write_off, write_len);
+    { static int _n = 0; static int cap = -1;
+      if (cap < 0) { const char* e = getenv("NV0039_DBG"); cap = e ? atoi(e) : 0; }
+      if (cap && _n < cap) { _n++;
+        printf("[NV0039] %ux%u fmt=0x%X src=0x%08X(pitch %d) -> dst=0x%08X(pitch %d)%c",
+               len, count, s_nv0039.fmt, src, in_pitch, dst, out_pitch, 10); } }
+}
+
+static void nv0039_method(u32 method, u32 data)
+{
+    switch (method) {
+    case 0x0184: s_nv0039.in_dma    = data; return;
+    case 0x0188: s_nv0039.out_dma   = data; return;
+    case 0x030C: s_nv0039.in_off    = data; return;
+    case 0x0310: s_nv0039.out_off   = data; return;
+    case 0x0314: s_nv0039.in_pitch  = (s32)data; return;
+    case 0x0318: s_nv0039.out_pitch = (s32)data; return;
+    case 0x031C: s_nv0039.len       = data; return;
+    case 0x0320: s_nv0039.count     = data; return;
+    case 0x0324: s_nv0039.fmt       = data; return;
+    case 0x0328: nv0039_copy(); return;
+    }
+}
+
+/* Which object subchannel 1 drives. libgcm binds NV0039 there (RPCS3 maps
+ * subchannel 1 to NV0039 outright), but some titles bind NV4097 to it
+ * (Twisted Metal, Yakuza Dead Souls) and SET_OBJECT is not always seen. The
+ * NV0039 methods alias NV4097 blend/colour-mask state (0x030C..0x0328), so
+ * routing them as 3D corrupts it. A SET_OBJECT matching subchannel 0's
+ * handle decides 3D, a different one NV0039. Without one, any method outside
+ * NV0039's set makes the subchannel 3D for good, replaying the NV0039-range
+ * words held meanwhile; BUFFER_NOTIFY (0x0328) makes it NV0039 for good. */
+static u32 s_subch_handle[8];
+static int s_sub1_class;                  /* 0 unknown, 1 NV4097, 2 NV0039 */
+static u32 s_sub1_held[12], s_sub1_held_mask;
+
+static int nv0039_method_index(u32 m)
+{
+    if (m == 0x0184) return 0;
+    if (m == 0x0188) return 1;
+    if (m >= 0x030C && m <= 0x0328) return 2 + (int)((m - 0x030C) >> 2);
+    return -1;
+}
+
+static void gcm_note_set_object(u32 subch, u32 handle)
+{
+    if (subch >= 8) return;
+    s_subch_handle[subch] = handle;
+    if (s_subch_handle[0] && s_subch_handle[1])
+        s_sub1_class = (s_subch_handle[1] == s_subch_handle[0]) ? 1 : 2;
+}
+
+/* 1 when the method on subchannel 1 is NV0039's, 0 when it is NV4097's. */
+static int gcm_sub1_is_nv0039(rsx_state* st, u32 m)
+{
+    if (s_sub1_class == 1) return 0;
+    if (s_sub1_class == 2) return 1;
+    const int idx = nv0039_method_index(m);
+    if (idx < 0) {
+        s_sub1_class = 1;
+        fprintf(stderr, "[gcm] subchannel 1 carries NV4097 (method 0x%04X)%c", m, 10);
+        for (int i = 0; i < 12; i++)
+            if (s_sub1_held_mask & (1u << i)) {
+                const u32 hm = i == 0 ? 0x0184u : i == 1 ? 0x0188u : 0x030Cu + (u32)(i - 2) * 4u;
+                rsx_process_method(st, hm, s_sub1_held[i]);
+                if (rsx_draw_engine_enabled()) rsx_draw_engine_method(hm, s_sub1_held[i]);
+            }
+        s_sub1_held_mask = 0;
+        return 0;
+    }
+    if (m == 0x0328) {
+        s_sub1_class = 2;
+        s_sub1_held_mask = 0;
+        fprintf(stderr, "[gcm] subchannel 1 carries NV0039%c", 10);
+    }
+    return 1;
+}
+
+static void gcm_sub1_nv0039(u32 m, u32 data)
+{
+    if (s_sub1_class == 0) {
+        const int idx = nv0039_method_index(m);
+        if (idx >= 0) { s_sub1_held[idx] = data; s_sub1_held_mask |= 1u << idx; }
+    }
+    nv0039_method(m, data);
+}
+
+/* RPCS3 nv308a.cpp color(): A8R8G8B8 -> R5G6B5 is (c*32)/255 per channel,
+ * truncated to 16 bits (so a full-intensity channel carries into the next
+ * field exactly as the hardware path RPCS3 models). */
+static u16 nv308a_to_r5g6b5(u32 data)
+{
+    const u32 r = (((data >> 16) & 0xFFu) * 32u) / 255u;
+    const u32 g = (((data >> 8) & 0xFFu) * 64u) / 255u;
+    const u32 b = ((data & 0xFFu) * 32u) / 255u;
+    return (u16)((r << 11) | (g << 5) | b);
+}
+
+/* NV308A writes guest memory behind the draw engine's back. RPCS3 sees every
+ * such store through its memory-protection write barrier, so a texture or
+ * surface over the destination is refreshed before its next use. Coalesce the
+ * per-word writes of a method block and report them once. */
+static struct { int pending, px4; u32 loc, off, len; } s_nv308a_dirty;
+
+static void nv308a_flush_writes(void)
+{
+    if (!s_nv308a_dirty.pending) return;
+    s_nv308a_dirty.pending = 0;
+    if (!rsx_draw_engine_enabled()) return;
+    const u32 loc = s_nv308a_dirty.loc, off = s_nv308a_dirty.off, len = s_nv308a_dirty.len;
+    rsx_draw_engine_textures_wrote(loc, off, len);
+    /* One row of 32-bit pixels: push exactly those into an engine surface
+     * over them (whole-row reloads would clobber GPU-only pixels beside it). */
+    if (s_nv308a_dirty.px4 && len >= 4u)
+        rsx_draw_engine_guest_wrote(loc, off, len, len / 4u, 1u);
+}
+
+static void nv308a_note_write(int local, u32 off, u32 len)
+{
+    const u32 loc = local ? RSX_LOCATION_LOCAL : RSX_LOCATION_MAIN;
+    const int px4 = len == 4u;
+    if (s_nv308a_dirty.pending && s_nv308a_dirty.loc == loc && s_nv308a_dirty.px4 == px4 &&
+        off >= s_nv308a_dirty.off && off <= s_nv308a_dirty.off + s_nv308a_dirty.len) {
+        const u32 end = off + len, cur = s_nv308a_dirty.off + s_nv308a_dirty.len;
+        if (end > cur) s_nv308a_dirty.len = end - s_nv308a_dirty.off;
+        return;
+    }
+    nv308a_flush_writes();
+    s_nv308a_dirty.pending = 1; s_nv308a_dirty.px4 = px4;
+    s_nv308a_dirty.loc = loc; s_nv308a_dirty.off = off; s_nv308a_dirty.len = len;
+}
+
+static int gcm_2d_strict_subch(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_2D_STRICT_SUBCH"); on = !(e && atoi(e) == 0); }
+    return on;
 }
 
 static void gcm_2d_method(u32 subch, u32 method, u32 data)
@@ -1419,9 +2436,18 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
      * not tracked): demosaic's SDK emits dest-surface on sub 3 and image-from-
      * CPU on sub 5 (cellGcmSetInlineTransfer: 0x4630C / 0xCA304 / 0xA400
      * headers); other versions use the classic 2 / 4. Accept both. */
+    const int strict = gcm_2d_strict_subch();
+    if (strict && (subch == 2 || subch == 7)) {
+        static int n = 0; if (PS3_LOG_FIRST(n, 8))
+            printf("[GCM2D] subch %u method 0x%04X dropped (no 2D object there in RPCS3)%c", subch, method, 10);
+        return;
+    }
     if (subch == 2 || subch == 3) {         /* NV3062 context surface 2D */
         switch (method) {
-        case 0x0184: case 0x0188: s_gcm2d.dst_dma = data; return;
+        /* RPCS3 gcm_enums.h:768-769: IMAGE_SOURCE (0x0184) and IMAGE_DESTIN
+         * (0x0188) are separate; only DESTIN locates the output (nv3089.cpp:103). */
+        case 0x0184: s_gcm2d.src_dma = data; return;
+        case 0x0188: s_gcm2d.dst_dma = data; return;
         case 0x0300: s_gcm2d.color_fmt  = data; return;
         case 0x0304: s_gcm2d.pitch      = data; return;
         case 0x030C: s_gcm2d.dst_offset = data; return;
@@ -1429,8 +2455,17 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         return;
     }
     if (subch == 4 || subch == 5) {         /* NV308A image-from-CPU, or NV309E */
-        /* NV309E swizzled-surface state. SET_FORMAT (0x0300) does not exist on
-         * NV308A, so seeing it identifies the object bound here. */
+        /* Dispatch by the object bound with SET_OBJECT (RPCS3 binds by class;
+         * NV308A_SET_COLOR_FORMAT is also 0x0300, gcm_enums.h:~794). With the
+         * libgcm NV309E (0x31337A73) or NV308A (0x31337808, rsx_methods.cpp:535)
+         * handle bound, that decides; otherwise SET_FORMAT (0x0300) identifies
+         * NV309E as before. */
+        const u32 h = s_subch_handle[subch];
+        const int bound = h == NV3089_CTX_SWIZZLE2D || h == 0x31337808u;
+        const int is309e = strict ? subch == 4u
+                         : bound ? h == NV3089_CTX_SWIZZLE2D
+                                 : (method == 0x0300 || (s_nv309e.active && s_nv309e.subch == (int)subch));
+        if (method == 0x0300 && !is309e) return;   /* NV308A colour format: RPCS3 nv308a.cpp uses NV3062's */
         if (method == 0x0300) { s_nv309e.fmt = data; s_nv309e.active = 1;
                                 s_nv309e.subch = (int)subch;
             { static int _n = 0; if (PS3_LOG_FIRST(_n, 4))
@@ -1438,29 +2473,43 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
                        1u << ((data >> 16) & 0xFF), 1u << ((data >> 24) & 0xFF),
                        data & 0xFFFF, 10); }
             return; }
-        if (method == 0x0304 && s_nv309e.active && s_nv309e.subch == (int)subch) {
+        if (method == 0x0304 && is309e) {
             s_nv309e.offset = data; return; }
+        if (method == 0x0184 && is309e) {
+            s_nv309e.dma = data; return; }    /* SET_CONTEXT_DMA_IMAGE */
+        if (strict && is309e) return;
         switch (method) {
         case 0x0304: s_gcm2d.point    = data; return;
         case 0x0308: s_gcm2d.size_out = data; return;
         case 0x030C: return;                /* SIZE_IN */
         }
-        if (method >= 0x0400 && method <= 0x07FC) {
+        /* RPCS3 RSXFIFO.cpp:~911 / nv308a.cpp:16: NV308A_COLOR spans 0x700
+         * methods (0x0400..0x1FFC), index = (method - 0x400) >> 2. */
+        if (method >= 0x0400 && method <= 0x1FFC) {
             /* COLOR data word: write into the destination surface. Inline
              * transfers use format Y32 (4 bytes/px, one row per point.y).
              * DMA 0xFEED0000 = local memory, 0xFEED0001 = main memory. */
             u32 idx = (method - 0x0400) >> 2;
+            /* RPCS3 nv308a.cpp: words past SIZE_OUT.x are dropped. */
+            if (idx >= (s_gcm2d.size_out & 0xFFFF)) return;
             u32 px  = (s_gcm2d.point & 0xFFFF) + idx;
             u32 py  = s_gcm2d.point >> 16;
             u32 dst_pitch = s_gcm2d.pitch >> 16;
             int local = (s_gcm2d.dst_dma != 0xFEED0001u);
-            u32 base = cellGcmResolveLocated(local, s_gcm2d.dst_offset);
+            u32 base = gcm_dma_ea(s_gcm2d.dst_dma, s_gcm2d.dst_offset);
+            if (!base) return;
             { static int _it = 0;
               if (PS3_LOG_FIRST(_it, 6))
                   printf("[GCM2D] inline write dst=0x%08X (off=0x%X dma=0x%X pt=%u,%u pitch=%u) = 0x%08X\n",
                          base + py * dst_pitch + px * 4, s_gcm2d.dst_offset,
                          s_gcm2d.dst_dma, px, py, dst_pitch, data); }
+            if (s_gcm2d.color_fmt == 4u) {     /* R5G6B5 destination: 2 bytes */
+                vm_write16(base + py * dst_pitch + px * 2, nv308a_to_r5g6b5(data));
+                nv308a_note_write(local, s_gcm2d.dst_offset + py * dst_pitch + px * 2, 2);
+                return;
+            }
             vm_write32(base + py * dst_pitch + px * 4, data);
+            nv308a_note_write(local, s_gcm2d.dst_offset + py * dst_pitch + px * 4, 4);
             return;
         }
         return;
@@ -1480,7 +2529,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         case 0x0184: s_nv3089.src_dma   = data; return;
         case 0x0198: s_nv3089.dst_surf  = data; return;
         case 0x0300: s_nv3089.fmt       = data; return;
-        case 0x0304: s_nv3089.op        = data; return;
+        case 0x0304: s_nv3089.op        = data; s_nv3089.op_written = 1; return;
         case 0x0308: s_nv3089.clip_pt   = data; return;
         case 0x030C: s_nv3089.clip_sz   = data; return;
         case 0x0310: s_nv3089.out_pt    = data; return;
@@ -1490,7 +2539,7 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         case 0x0400: s_nv3089.in_sz     = data; return;
         case 0x0404: s_nv3089.in_fmt    = data; return;
         case 0x0408: s_nv3089.in_off    = data; return;
-        case 0x040C: s_nv3089.in_uv     = data; nv3089_blit(); return;
+        case 0x040C: s_nv3089.in_uv     = data; nv3089_image_in(); return;
         }
         return;
     }
@@ -1612,6 +2661,8 @@ void gcm_forget_spu_blocks(void)
 
 void gcm_note_spu_put(u32 ea, u32 size)
 {
+    /* Before the pushbuffer filters: any SPU write may be a texture's bytes. */
+    if (!s_r2rsx) rsx_draw_engine_note_guest_write(ea, size);
     if (!size || size > 0x40000u) return;
     u32 room = 0;
     u32 io = gcm_ea2io_range(ea, &room);
@@ -1657,8 +2708,25 @@ static u32 gcm_spu_block_for_put(u32 put)
  *
  * Dropping DRAWS on a resync is survivable: a frame is lost. Dropping a FENCE
  * is not, it deadlocks the title. Sweep the skipped range first. */
+/* Skip-ahead triggers (jump-park after the park grace, circling, stuck-get,
+ * unmapped get / branch, recover-storm): a per-kind count, logged on the first
+ * and every 256th, so it shows whether they fire in play. */
+static void gcm_skip_ahead_note(const char* why)
+{
+    static const char* kinds[8]; static u32 counts[8]; static u32 total;
+    int k = 0;
+    for (; k < 8 && kinds[k]; k++) if (strcmp(kinds[k], why) == 0) break;
+    if (k == 8) k = 7;
+    else if (!kinds[k]) kinds[k] = why;
+    const u32 c = ++counts[k];
+    total++;
+    if (c == 1 || (c & 255u) == 0)
+        fprintf(stderr, "[skip-ahead] %s x%u (all kinds %u)\n", why, c, total);
+}
+
 static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
 {
+    gcm_skip_ahead_note(why);
     static int n = 0;
     if (PS3_LOG_FIRST(n, 8))
         fprintf(stderr, "[cellGcmSys] FIFO resync (%s) 0x%08X -> put 0x%08X\n",
@@ -1698,6 +2766,96 @@ static void gcm_fifo_resync_why(const char* why, u32* getoff, u32 put)
                     " 0x%08X..0x%08X\n", rescued, from, land); }
     }
     *getoff = land;
+}
+
+/* RPCS3 thread::recover_fifo (RSXThread.cpp:1740-1780): back to the restore
+ * point with the CALL return saved there, 2 ms for the producer to finish
+ * writing, and the draw in flight discarded. RPCS3 throws when 20 recoveries
+ * fall inside ~2 s ("Dead FIFO commands queue"); a port cannot stop, so that
+ * case resyncs to put instead. */
+static void gcm_fifo_recover(const char* what, rsx_state* st, u32 put)
+{
+    static unsigned long long hist[20]; static int hn = 0, hi = 0;
+    extern unsigned long long ps3_ms_now(void);
+    const unsigned long long now = ps3_ms_now();
+    { static int n = 0; if (PS3_LOG_FIRST(n, 16))
+        fprintf(stderr, "[cellGcmSys] FIFO recover (%s) at get 0x%08X -> restore 0x%08X\n",
+                what, s_fifo_getoff, s_fifo_restore); }
+    int dead = s_fifo_restore == 0xFFFFFFFFu;
+    if (hn == 20) {
+        if (now - hist[hi] < 2000u) dead = 1;
+        hi = (hi + 1) % 20; hn--;
+    }
+    if (st && st->in_begin_end) {
+        st->in_begin_end = 0;
+        if (rsx_draw_engine_enabled()) rsx_draw_engine_method(RSX_DSP_DISCARD_DRAW, 0);
+    }
+    if (dead) {
+        hn = 0; hi = 0;
+        s_fifo_calloff = GCM_CALL_NONE;
+        gcm_fifo_resync_why("recover-storm", &s_fifo_getoff, put);
+        s_fifo_restore = 0xFFFFFFFFu; s_fifo_sync_req = 1;
+        return;
+    }
+    s_fifo_getoff = s_fifo_restore;
+    s_fifo_calloff = s_fifo_saved_ret;
+#ifdef _WIN32
+    Sleep(2);
+#endif
+    hist[(hi + hn) % 20] = now;
+    hn++;
+}
+
+/* GCM_SEMA_ADDR=0: NV406E semaphores always index the label window, with no
+ * address checks (the old walker). */
+static int gcm_sema_addr_on(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("GCM_SEMA_ADDR"); on = !(e && atoi(e) == 0); }
+    return on;
+}
+/* RPCS3 rsx_utils.cpp:224-345 get_address for the NV406E semaphore context
+ * DMA (0x60): the semaphore handles index the label block (0x1000 bytes), the
+ * device handles the device area, anything else as a 2D DMA. 0 = invalid. */
+static u32 gcm_sema406e_ea(u32 off)
+{
+    if (!gcm_sema_addr_on()) return GCM_LABEL_GUEST_BASE + (off & 0xFFFFu);
+    switch (s_sema406e_ctx) {
+    case 0x66606660u: case 0x66616661u:
+        return off < CELL_GCM_MAX_LABEL_COUNT * GCM_LABEL_STRIDE ? GCM_LABEL_GUEST_BASE + off : 0;
+    case 0x56616660u: case 0x56616661u:
+        return off < 0x100000u ? R2RSX_DEVICE_EA + off : 0;
+    default:
+        return gcm_dma_ea(s_sema406e_ctx, off);
+    }
+}
+/* GCM_SEMA_ACQUIRE_MS=<ms>: the acquire bound, RPCS3's driver_recovery_timeout
+ * (1000000 us by default; 0 = wait for ever). */
+static unsigned gcm_sema_acquire_ms(void)
+{
+    static int ms = -1;
+    if (ms < 0) { const char* t = getenv("GCM_SEMA_ACQUIRE_MS"); ms = (t && *t) ? atoi(t) : 1000; if (ms < 0) ms = 0; }
+    return (unsigned)ms;
+}
+/* Does an unsatisfied ACQUIRE at this offset block the walker? Yes, as on the
+ * hardware (nv406e.cpp:57-107), unless GCM_SEMA_ACQUIRE=0. The exception is
+ * Resistance's flip pacing: the flip waits for label 68 (offset 0x440), which
+ * the vblank handler raises every 2nd vblank -- the 30 fps cap PORT_FPS
+ * replaces with its own limiter (project/stubs.cpp port_fps_init). Blocking
+ * there would pin the game back to 30 fps, so that acquire only blocks under
+ * PORT_FPS=orig. GCM_SEMA_ACQUIRE=2 blocks it too. */
+static int gcm_sema_acquire_blocks(u32 off)
+{
+    static int blk = -1, pace_blocks = 0;
+    if (blk < 0) {
+        const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = (e && *e) ? atoi(e) : 1;
+        const char* f = getenv("PORT_FPS");
+        pace_blocks = blk >= 2 || (f && (!strcmp(f, "orig") || !strcmp(f, "original") || !strcmp(f, "off") ||
+                                         !strcmp(f, "ORIG") || !strcmp(f, "Orig")));
+    }
+    if (!blk) return 0;
+    if (off == 0x440u && !pace_blocks) return 0;
+    return 1;
 }
 
 static void gcm_fifo_dump_around(u32 getoff)
@@ -1924,6 +3082,7 @@ void cellGcm_rsx_process_fifo(void)
     if (s_r2rsx) return;                     /* RPCS3's FIFO thread owns get */
     const uint64_t ft_t0 = PS3_FT_ON() ? ps3_ft_now() : 0;
     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+    rsx_draw_engine_wcb_service();
     gcm_rsx_process_fifo_unlocked();
     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
     if (ft_t0) {
@@ -1979,70 +3138,989 @@ int fifo_mhist_report(char* buf, int cap, int n, double secs)
     return len;
 }
 
-/* v140: what the FIFO walker does after rsx_process_method for the three
- * methods it also handles itself (reference fences, report DMA, GET_REPORT).
- * Shared by the per-word walk and the quick block walk. */
+/* ---------------------------------------------------------------------------
+ * ZCULL reports and conditional rendering: RPCS3's ZCULL_control
+ * (RSXZCULL.cpp) and conditional_render_eval, run on the FIFO walker, with
+ * RPCS3's settings "Accurate ZCULL stats" on, "Relaxed ZCULL Sync" off and
+ * occlusion queries enabled.
+ *
+ * GET_REPORT does not write when it is issued. ZPASS_PIXEL_CNT ends the
+ * running occlusion query and queues the write; the queue retires in order as
+ * host queries complete (gcm_zc_update, every walker pass, flushing the GPU
+ * when the head is older than 300 us), and a label release forces it
+ * (gcm_zc_sync), so the CPU never sees a label before the reports issued
+ * ahead of it. The 16-byte report is big-endian {u64 timestamp, u32 value,
+ * u32 0}, time-stamped when it retires. Host queries come from the draw
+ * engine's backend (rsx_draw_engine_occlusion_*); without one every query
+ * reports "visible", like RPCS3's null provider.
+ *
+ * PS3RECOMP_ZCULL_REPORTS=0   the old immediate write (ZPASS 0xFFFF)
+ * PS3RECOMP_ZCULL_QUERIES=0   no host queries: every ZPASS query is visible
+ * PS3RECOMP_ZCULL_PRECISE=0   ZPASS writes 0xFFFF for any hit (Accurate ZCULL stats off)
+ * PS3RECOMP_ZCULL_RELAXED=1   labels do not wait for reports (Relaxed ZCULL Sync on)
+ * PS3RECOMP_ZCULL_CRITICAL=n  2 (default) labels wait only once the guest touched a
+ *                             report page (RPCS3 page guard); 1 always; 0 never
+ * PS3RECOMP_COND_RENDER=0     SET_RENDER_ENABLE ignored, every draw runs
+ * -------------------------------------------------------------------------*/
+#define ZC_QUERIES     2048u
+#define ZC_WRITES      4096u
+#define ZC_STATS       8192u
+#define ZC_SAFE_DEPTH  1792u
+#define ZC_TICK_US     100u
+#define ZC_DELAY_US    300u
+
+typedef struct {
+    u64 result, ts_us;
+    u32 draws, sync_tag;
+    u8  active, pending, host, have;
+} gcm_zc_query;
+
+typedef struct {
+    int q;                       /* query index, -1 = none          */
+    u32 sink, type, tag;         /* sink 0 = not claimed yet         */
+    int forwarder;
+} gcm_zc_write;
+
+static struct {
+    int  inited, on, queries, precise, relaxed, cond;
+    int  zcull_en, zpass_en, stats_en, surface_active, host_active;
+    int  cur;
+    u32  zeta_off;
+    u32  zeta_dma, surf_fmt;     /* 0x198 / 0x208, for the surface-active test */
+    int  strict_active, surf_dirty;
+    /* RSXGraphEngine get_framebuffer_layout inputs (depth_buffer_unused) */
+    int  depth_use, fb_ctx, contested;
+    u32  depth_test, depth_mask, depth_func, stencil_test, stencil_mask, two_sided;
+    u32  bounds_test, bounds_min, bounds_max, zpitch, scissor_h;
+    u32  surf_reg[(0x2C0u - 0x180u) >> 2];
+    u32  timer, sync_tag;
+    u64  next_tick_us;
+    gcm_zc_query q[ZC_QUERIES];
+    u32  free_q[ZC_QUERIES], nfree;
+    gcm_zc_write w[ZC_WRITES];
+    u32  wh, wn;
+    struct { u64 result; u32 flags; } stat[ZC_STATS];
+    u32  stat_tag;
+    /* conditional rendering */
+    int  cr_enabled, cr_failed, cr_pending, skip_clause;
+    u32  cr_addr;
+    volatile LONG sync_req;      /* an HLE read wants the queue flushed */
+} s_zc;
+
+static int gcm_zc_env(const char* n, int def)
+{
+    const char* e = getenv(n);
+    return (e && *e) ? atoi(e) : def;
+}
+
+static void gcm_zcp_init(void);
+
+static void gcm_zc_init(void)
+{
+    if (s_zc.inited) return;
+    s_zc.inited   = 1;
+    s_zc.on       = gcm_zc_env("PS3RECOMP_ZCULL_REPORTS", 1) != 0;
+    s_zc.queries  = gcm_zc_env("PS3RECOMP_ZCULL_QUERIES", 1) != 0;
+    s_zc.precise  = gcm_zc_env("PS3RECOMP_ZCULL_PRECISE", 1) != 0;
+    s_zc.relaxed  = gcm_zc_env("PS3RECOMP_ZCULL_RELAXED", 0) != 0;
+    s_zc.cond     = gcm_zc_env("PS3RECOMP_COND_RENDER", 1) != 0;
+    s_zc.zcull_en = 1;           /* NV4097_SET_ZCULL_EN resets to 3 */
+    s_zc.cur      = -1;
+    /* GCM_ZC_STRICT_ACTIVE=0: the old offset-only surface-active test,
+     * recomputed on every zpass/stats/enable change. */
+    s_zc.strict_active = gcm_zc_env("GCM_ZC_STRICT_ACTIVE", 1) != 0;
+    s_zc.zeta_dma = 0xFEED0000u; /* rsx_methods.cpp init: CONTEXT_DMA_ZETA */
+    s_zc.surf_fmt = 0x121u;      /* rsx_methods.cpp init: SURFACE_FORMAT */
+    s_zc.surf_dirty = 1;
+    /* GCM_ZC_DEPTH_USE=0: zeta always counts as bound (no clear/draw context). */
+    s_zc.depth_use = gcm_zc_env("GCM_ZC_DEPTH_USE", 1) != 0;
+    s_zc.fb_ctx = -1;
+    s_zc.depth_mask = 1; s_zc.depth_func = 0x201u; s_zc.stencil_mask = 0xFFu;
+    s_zc.bounds_max = 0x3F800000u; s_zc.zpitch = 64; s_zc.scissor_h = 4096u << 16;
+    s_zc.surf_reg[(0x198u - 0x180u) >> 2] = 0xFEED0000u;
+    s_zc.surf_reg[(0x208u - 0x180u) >> 2] = 0x121u;
+    s_zc.surf_reg[(0x22Cu - 0x180u) >> 2] = 64u;
+    gcm_zcp_init();
+    for (u32 i = ZC_QUERIES; i-- > 0;) s_zc.free_q[s_zc.nfree++] = i;
+    fprintf(stderr, "[zcull] reports %s, host queries %s, %s, %s sync, conditional render %s%c",
+            s_zc.on ? "deferred" : "immediate", s_zc.queries ? "on" : "off",
+            s_zc.precise ? "precise" : "binary", s_zc.relaxed ? "relaxed" : "strict",
+            s_zc.cond ? "on" : "off", 10);
+}
+
+static u64 gcm_zc_now_us(void) { return get_timestamp_ns() / 1000u; }
+
+/* ---- critical reports: RPCS3 on_report_enqueued / on_report_completed /
+ * on_access_violation / disable_optimizations. A queued report's page is
+ * made inaccessible; while the guest never touches it the reports are not
+ * critical and labels do not wait for them. The first guest access to a page
+ * with reports in flight makes its location (local / main) critical for
+ * good, unguards it and asks for a sync (pipe_flush_interrupt). The walker's
+ * own report accesses open the page around the access (RPCS3 writes through
+ * an unguarded mapping).
+ * PS3RECOMP_ZCULL_CRITICAL=2 guard pages (RPCS3), 1 always critical, 0 never. */
+#define ZCP_PAGES 256u
+
+typedef struct { u32 page, refs; int prot; } gcm_zcp_page;
+
+static struct {
+    CRITICAL_SECTION cs;
+    int  mode, cs_ready, accessed[2];
+    gcm_zcp_page pg[2][ZCP_PAGES];
+    u32  npg[2];
+    volatile LONG critical;
+    PVOID veh;
+} s_zcp;
+
+static int gcm_zcp_loc(u32 a)
+{
+    const int local = (a >= s_config.localAddress && a - s_config.localAddress < s_config.localSize) ||
+                      (a >= GCM_REPORT_GUEST_BASE && a - GCM_REPORT_GUEST_BASE < CELL_GCM_MAX_REPORT_COUNT * 16u);
+    return local ? 0 : 1;
+}
+
+static int gcm_zcp_prot(u32 page, int noaccess)
+{
+    /* Through the shared guard registry: a page a WCB surface also guards
+     * stays guarded when the report side lifts its own. */
+    return rsx_page_guard_set(page, 1u, noaccess);
+}
+
+static gcm_zcp_page* gcm_zcp_find(int loc, u32 page)
+{
+    for (u32 i = 0; i < s_zcp.npg[loc]; i++)
+        if (s_zcp.pg[loc][i].page == page) return &s_zcp.pg[loc][i];
+    return NULL;
+}
+
+static void gcm_zcp_erase(int loc, gcm_zcp_page* p)
+{
+    *p = s_zcp.pg[loc][--s_zcp.npg[loc]];
+}
+
+/* Under cs. */
+static void gcm_zcp_disable(int loc)
+{
+    if (!s_zcp.accessed[loc])
+        fprintf(stderr, "[zcull] reports area (%s) accessed: ZCULL optimizations disabled%c",
+                loc ? "main" : "local", 10);
+    s_zcp.accessed[loc] = 1;
+    for (u32 i = 0; i < s_zcp.npg[loc]; i++) {
+        gcm_zcp_page* p = &s_zcp.pg[loc][i];
+        if (p->prot) gcm_zcp_prot(p->page, 0);
+        s_zcp.critical += (LONG)p->refs;
+    }
+    s_zcp.npg[loc] = 0;
+}
+
+static LONG WINAPI gcm_zcp_veh(EXCEPTION_POINTERS* ep)
+{
+    const EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    if (er->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || er->NumberParameters < 2)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const uintptr_t a = (uintptr_t)er->ExceptionInformation[1];
+    if (a < (uintptr_t)vm_base || (u64)(a - (uintptr_t)vm_base) > 0xFFFFFFFFull)
+        return EXCEPTION_CONTINUE_SEARCH;
+    const u32 page = (u32)(a - (uintptr_t)vm_base) & ~(VM_PAGE_SIZE - 1u);
+    int handled = 0, flush = 0;
+    EnterCriticalSection(&s_zcp.cs);
+    for (int loc = 0; loc < 2 && !handled; loc++) {
+        gcm_zcp_page* p = gcm_zcp_find(loc, page);
+        if (!p || !p->prot) continue;
+        handled = 1;
+        if (p->refs) { gcm_zcp_disable(loc); flush = 1; }       /* R/W to an active block */
+        else { gcm_zcp_prot(page, 0); gcm_zcp_erase(loc, p); }  /* stale block            */
+    }
+    if (!handled) {
+        /* Unguarded by the walker between the fault and here: retry. */
+        MEMORY_BASIC_INFORMATION mbi;
+        if (VirtualQuery(vm_base + page, &mbi, sizeof mbi) && mbi.State == MEM_COMMIT &&
+            mbi.Protect == PAGE_READWRITE) {
+            for (int loc = 0; loc < 2; loc++)
+                if (s_zcp.accessed[loc] || s_zcp.npg[loc]) handled = 1;
+        }
+    }
+    LeaveCriticalSection(&s_zcp.cs);
+    if (!handled) return EXCEPTION_CONTINUE_SEARCH;
+    if (flush) {
+        InterlockedExchange(&s_zc.sync_req, 1);
+        if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void gcm_zcp_init(void)
+{
+    s_zcp.mode = gcm_zc_env("PS3RECOMP_ZCULL_CRITICAL", 2);
+    InitializeCriticalSection(&s_zcp.cs);
+    s_zcp.cs_ready = 1;
+}
+
+static int gcm_zc_critical(void)
+{
+    if (s_zcp.mode == 1) return 1;
+    if (s_zcp.mode == 0) return 0;
+    return s_zcp.critical > 0;
+}
+
+static void gcm_zcp_enqueued(u32 sink)
+{
+    if (s_zcp.mode != 2 || !s_zcp.cs_ready) return;
+    const int loc = gcm_zcp_loc(sink);
+    const u32 page = sink & ~(VM_PAGE_SIZE - 1u);
+    EnterCriticalSection(&s_zcp.cs);
+    if (s_zcp.accessed[loc]) {
+        s_zcp.critical++;
+    } else {
+        gcm_zcp_page* p = gcm_zcp_find(loc, page);
+        if (!p && s_zcp.npg[loc] < ZCP_PAGES) {
+            p = &s_zcp.pg[loc][s_zcp.npg[loc]++];
+            p->page = page; p->refs = 0; p->prot = 0;
+        }
+        if (!p) {
+            gcm_zcp_disable(loc);
+            s_zcp.critical++;
+        } else {
+            p->refs++;
+            if (!p->prot) {
+                if (!s_zcp.veh) s_zcp.veh = AddVectoredExceptionHandler(1, gcm_zcp_veh);
+                if (s_zcp.veh && gcm_zcp_prot(page, 1)) p->prot = 1;
+                else gcm_zcp_disable(loc);       /* cannot guard it: the guest may be reading */
+            }
+        }
+    }
+    LeaveCriticalSection(&s_zcp.cs);
+}
+
+/* The walker's own report access (RPCS3's unguarded mapping). With
+ * `complete`, a queued report retires (on_report_completed) and the page is
+ * left open once nothing is in flight on it. store: 4 words, NULL = read. */
+/* The always-writable second view of guest memory (vm_sudo_base, set up by
+ * the host; RPCS3 g_sudo_addr). Report traffic goes through it so the guarded
+ * page never opens to the guest's threads, not even briefly. NULL (no host
+ * view, or RSX_ENG_SUDO=0): lift the guards around the access instead. */
+extern u8* vm_sudo_base __attribute__((weak));
+static u8* gcm_zcp_sudo(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_ENG_SUDO"); on = !(e && *e == '0'); }
+    return on && &vm_sudo_base && vm_base ? vm_sudo_base : NULL;
+}
+
+static u32 gcm_zcp_access(u32 addr, const u32* store, int complete)
+{
+    const int guard = s_zcp.mode == 2 && s_zcp.cs_ready;
+    u8* const sudo = guard ? gcm_zcp_sudo() : NULL;
+    gcm_zcp_page* p = NULL;
+    int loc = 0;
+    if (guard) {
+        EnterCriticalSection(&s_zcp.cs);
+        loc = gcm_zcp_loc(addr);
+        p = gcm_zcp_find(loc, addr & ~(VM_PAGE_SIZE - 1u));
+        if (complete) {
+            if (s_zcp.accessed[loc]) s_zcp.critical--;
+            else if (p && p->refs) p->refs--;
+        }
+        if (p && p->prot && !sudo) gcm_zcp_prot(p->page, 0);
+    }
+    u32 r = 0;
+    if (sudo) {
+        if (store) {
+            u32 raw[4];
+            for (u32 i = 0; i < 4u; i++) raw[i] = ps3_bswap32(store[i]);
+            if (spu_coh_is_reserved(addr)) {
+                spu_lockline_lock();
+                memcpy(sudo + addr, raw, sizeof raw);
+                spu_coh_notify_write(addr);
+                spu_lockline_unlock();
+            } else {
+                memcpy(sudo + addr, raw, sizeof raw);
+            }
+            if (g_resv_store_active > 0)
+                for (u32 i = 0; i < 4u; i++) ppu_resv_break_store(addr + i * 4u);
+        } else {
+            u32 raw;
+            memcpy(&raw, sudo + addr, sizeof raw);
+            r = ps3_bswap32(raw);
+        }
+    } else {
+        if (guard) rsx_page_guard_hold(addr & ~(VM_PAGE_SIZE - 1u), 1);   /* other owners' guards too */
+        if (store) { for (u32 i = 0; i < 4u; i++) vm_write32(addr + i * 4u, store[i]); }
+        else r = vm_read32(addr);
+        if (guard) rsx_page_guard_hold(addr & ~(VM_PAGE_SIZE - 1u), -1);
+    }
+    if (guard) {
+        if (p && p->prot) {
+            if (p->refs) { if (!sudo) gcm_zcp_prot(p->page, 1); }
+            else { if (sudo) gcm_zcp_prot(p->page, 0); gcm_zcp_erase(loc, p); }
+        }
+        LeaveCriticalSection(&s_zcp.cs);
+    }
+    return r;
+}
+
+/* Where a report offset lands for the bound report DMA (RPCS3 get_address):
+ * 0xBAD68000 = IO 0x0E000000 + off, 0x66626660 = the report area the
+ * cellGcmGetReportData* calls hand out, 0xFEED0000 = local memory,
+ * 0xFEED0001 = IO offset. 0 = nowhere the guest can read. */
+static u32 gcm_zc_sink(u32 off)
+{
+    u32 ea;
+    if (gcm_report_dma_ea(s_report_dma, off, &ea)) return ea;
+    switch (s_report_dma) {
+    case 0xFEED0000u: return cellGcmResolveLocated(1, off);
+    case 0xFEED0001u: return gcm_io2ea(off);
+    default:          return 0;
+    }
+}
+
+static void gcm_zc_store(u32 sink, u64 ts, u32 value, int complete)
+{
+    const u32 words[4] = { (u32)(ts >> 32), (u32)ts, value, 0u };
+    gcm_zcp_access(sink, words, complete);
+    if (sink >= GCM_REPORT_GUEST_BASE && sink < GCM_REPORT_GUEST_BASE + CELL_GCM_MAX_REPORT_COUNT * 16u) {
+        const u32 idx = (sink - GCM_REPORT_GUEST_BASE) / 16u;
+        s_report_data[idx].timestamp = ts;
+        s_report_data[idx].value = value;
+    }
+}
+
+/* ZCULL_control::write: the value a report type carries. */
+static void gcm_zc_write_mem(u32 sink, u32 type, u64 value64, int complete)
+{
+    u32 value = value64 > 0xFFFFFFFFull ? 0xFFFFFFFFu : (u32)value64;
+    switch (type) {
+    case 1u:                      /* ZPASS_PIXEL_CNT; resolution scale 100% */
+        if (value) value = s_zc.precise ? value : 0xFFFFu;
+        break;
+    case 5u:                      /* ZCULL_STATS3 */
+        value = (value || !s_zc.surface_active || !s_zc.stats_en) ? 0u : 0xFFFFu;
+        break;
+    default:                      /* ZCULL_STATS, STATS1, STATS2: not implemented */
+        value = (s_zc.surface_active && s_zc.stats_en) ? 0xFFFFFFFFu : 0u;
+        break;
+    }
+    gcm_zc_store(sink, gcm_report_timestamp(), value, complete);
+}
+
+/* ---- host queries ---- */
+static void gcm_zc_q_begin(int i)
+{
+    s_zc.q[i].host = s_zc.queries && rsx_draw_engine_enabled() &&
+                     rsx_draw_engine_occlusion_begin((u32)i);
+}
+static void gcm_zc_q_end(int i)
+{
+    if (s_zc.q[i].host) rsx_draw_engine_occlusion_end((u32)i);
+}
+static int gcm_zc_q_check(int i)
+{
+    gcm_zc_query* q = &s_zc.q[i];
+    if (!q->host || q->have) return 1;
+    u64 r = 0;
+    if (!rsx_draw_engine_occlusion_result((u32)i, 0, &r)) return 0;
+    q->result = r; q->have = 1;
+    return 1;
+}
+static void gcm_zc_q_read(int i)
+{
+    gcm_zc_query* q = &s_zc.q[i];
+    if (q->have) return;
+    u64 r = 0xFFFFu;              /* the null provider's "visible" */
+    if (q->host && !rsx_draw_engine_occlusion_result((u32)i, 1, &r)) r = 0xFFFFu;
+    q->result = r; q->have = 1;
+}
+static void gcm_zc_q_discard(int i)
+{
+    if (s_zc.q[i].host && !s_zc.q[i].have) rsx_draw_engine_occlusion_discard((u32)i);
+    s_zc.q[i].host = 0;
+}
+static void gcm_zc_q_free(int i)
+{
+    s_zc.q[i].pending = 0;
+    s_zc.q[i].active = 0;
+    s_zc.free_q[s_zc.nfree++] = (u32)i;
+}
+
+/* sync_hint(zcull_sync) for query `qi`: RPCS3's VKGSRender::on_sync_hint
+ * submits the command buffer when that query is still in it (no wait), and
+ * ZCULL_control::on_sync_hint raises m_sync_tag to the query's tag. */
+static void gcm_zc_kick(int qi)
+{
+    if (qi < 0) return;
+    if (s_zc.q[qi].host && rsx_draw_engine_enabled()) rsx_draw_engine_occlusion_kick((u32)qi);
+    if (s_zc.q[qi].sync_tag > s_zc.sync_tag) s_zc.sync_tag = s_zc.q[qi].sync_tag;
+}
+
+static gcm_zc_write* gcm_zc_w(u32 k) { return &s_zc.w[(s_zc.wh + k) % ZC_WRITES]; }
+
+static void gcm_zc_pop_front(u32 n)
+{
+    s_zc.wh = (s_zc.wh + n) % ZC_WRITES;
+    s_zc.wn -= n;
+}
+
+/* ZCULL_control::retire (CPU-evaluated conditional rendering reads memory). */
+static void gcm_zc_retire(const gcm_zc_write* w, u64 result)
+{
+    if (!w->forwarder)
+        gcm_zc_write_mem(w->sink, w->type, w->type == 1u ? s_zc.stat[w->tag].result : result, 1);
+}
+
+/* ZCULL_control::update. sync_addr: retire up to and including the write to
+ * that address, waiting for its queries. */
+static void gcm_zc_update(u32 sync_addr, int hint)
+{
+    if (!s_zc.wn) return;
+    const gcm_zc_write* front = gcm_zc_w(0);
+    if (!front->sink) return;
+    if (!sync_addr) {
+        if (hint || s_zc.wn >= ZC_SAFE_DEPTH) {
+            for (u32 k = s_zc.wn; k-- > 0;) {
+                const gcm_zc_write* w = gcm_zc_w(k);
+                if (w->q < 0) continue;
+                if (s_zc.q[w->q].draws && s_zc.q[w->q].sync_tag > s_zc.sync_tag) gcm_zc_kick(w->q);
+                break;
+            }
+        }
+        const u64 now = gcm_zc_now_us();
+        if (now < s_zc.next_tick_us) return;
+        s_zc.next_tick_us = now + ZC_TICK_US;
+        if (!s_zc.relaxed && gcm_zc_critical() && front->q >= 0 && s_zc.q[front->q].draws &&
+            s_zc.q[front->q].sync_tag > s_zc.sync_tag) {
+            if (now - s_zc.q[front->q].ts_us > ZC_DELAY_US) gcm_zc_kick(front->q);
+            return;
+        }
+    }
+    u32 processed = 0;
+    for (u32 k = 0; k < s_zc.wn; k++) {
+        gcm_zc_write* w = gcm_zc_w(k);
+        if (!w->sink) break;
+        const int force = sync_addr != 0;
+        if (force && w->sink == sync_addr && !w->forwarder) sync_addr = 0;
+        if (w->q >= 0) {
+            gcm_zc_query* q = &s_zc.q[w->q];
+            const int implemented = w->type == 1u || w->type == 5u;
+            const int have_result = s_zc.stat[w->tag].result && !s_zc.precise;
+            if (!implemented || !q->draws || have_result) gcm_zc_q_discard(w->q);
+            else if (force || gcm_zc_q_check(w->q)) {
+                gcm_zc_q_read(w->q);
+                s_zc.stat[w->tag].result += q->result;
+            } else break;
+            gcm_zc_q_free(w->q);
+            w->q = -1;
+        }
+        s_zc.stat[w->tag].flags = 0;
+        gcm_zc_retire(w, s_zc.stat[w->tag].result);
+        processed++;
+    }
+    gcm_zc_pop_front(processed);
+}
+
+/* ZCULL_control::sync: every claimed report is written now. */
+static void gcm_zc_sync_x(int force)
+{
+    if (!s_zc.wn) return;
+    if (!force && !gcm_zc_critical()) return;      /* nothing important queued up */
+    if (!force && s_zc.relaxed) { gcm_zc_update(0, 1); return; }
+    for (u32 k = s_zc.wn; k-- > 0;) {
+        const gcm_zc_write* w = gcm_zc_w(k);
+        if (w->sink && w->q >= 0 && s_zc.q[w->q].draws) {
+            if (s_zc.q[w->q].sync_tag > s_zc.sync_tag) gcm_zc_kick(w->q);
+            break;
+        }
+    }
+    u32 processed = 0;
+    for (u32 k = 0; k < s_zc.wn; k++) {
+        gcm_zc_write* w = gcm_zc_w(k);
+        if (!w->sink) break;
+        if (w->q >= 0) {
+            gcm_zc_query* q = &s_zc.q[w->q];
+            const int implemented = w->type == 1u || w->type == 5u;
+            const int have_result = s_zc.stat[w->tag].result && !s_zc.precise;
+            if (implemented && !have_result && q->draws) {
+                gcm_zc_q_read(w->q);
+                s_zc.stat[w->tag].result += q->result;
+            } else gcm_zc_q_discard(w->q);
+            gcm_zc_q_free(w->q);
+            w->q = -1;
+        }
+        gcm_zc_retire(w, s_zc.stat[w->tag].result);
+        processed++;
+    }
+    gcm_zc_pop_front(processed);
+    /* Release every statistics slot but the current one. */
+    const u32 cur = s_zc.stat_tag;
+    for (u32 i = (cur + ZC_STATS - 1u) % ZC_STATS; i != cur; i = (i + ZC_STATS - 1u) % ZC_STATS) {
+        if (!s_zc.stat[i].flags) break;
+        s_zc.stat[i].flags = 0;
+    }
+}
+
+/* ZCULL_control::sync (force: a full queue drains regardless). */
+static void gcm_zc_sync(void) { gcm_zc_sync_x(0); }
+
+static gcm_zc_write* gcm_zc_push(void)
+{
+    if (s_zc.wn >= ZC_WRITES) {
+        gcm_zc_sync_x(1);
+        if (s_zc.wn >= ZC_WRITES) return NULL;
+    }
+    gcm_zc_write* w = gcm_zc_w(s_zc.wn++);
+    w->q = -1; w->sink = 0; w->type = 0; w->tag = 0; w->forwarder = 0;
+    return w;
+}
+
+static int gcm_zc_alloc(void)
+{
+    for (int tries = 0; tries < 2 && !s_zc.nfree; tries++) {
+        s_zc.next_tick_us = 0;
+        if (s_zc.wn && gcm_zc_w(0)->sink) gcm_zc_update(gcm_zc_w(0)->sink, 0);
+        else gcm_zc_sync_x(1);
+    }
+    if (!s_zc.nfree) return -1;
+    const int i = (int)s_zc.free_q[--s_zc.nfree];
+    gcm_zc_query* q = &s_zc.q[i];
+    memset(q, 0, sizeof *q);
+    q->active = 1;
+    return i;
+}
+
+/* A query that ended with draws waits in the queue for a report to claim it. */
+static void gcm_zc_enqueue_current(void)
+{
+    const int i = s_zc.cur;
+    gcm_zc_q_end(i);
+    s_zc.q[i].active = 0;
+    s_zc.q[i].pending = 1;
+    s_zc.q[i].sync_tag = ++s_zc.timer;
+    s_zc.q[i].ts_us = gcm_zc_now_us();
+    gcm_zc_write* w = gcm_zc_push();
+    if (w) w->q = i;
+    else { gcm_zc_q_discard(i); gcm_zc_q_free(i); }
+}
+
+static void gcm_zc_set_active(int state)
+{
+    if (state == s_zc.host_active) return;
+    s_zc.host_active = state;
+    if (state) {
+        s_zc.cur = gcm_zc_alloc();
+        if (s_zc.cur >= 0) gcm_zc_q_begin(s_zc.cur);
+        return;
+    }
+    if (s_zc.cur >= 0) {
+        if (s_zc.q[s_zc.cur].draws) gcm_zc_enqueue_current();
+        else {
+            gcm_zc_q_end(s_zc.cur);
+            gcm_zc_q_discard(s_zc.cur);
+            gcm_zc_q_free(s_zc.cur);
+        }
+    }
+    s_zc.cur = -1;
+    gcm_zc_update(0, 0);
+}
+
+/* thread::check_zcull_status + ZCULL_control::check_state. */
+static void gcm_zc_check_state(void)
+{
+    if (!s_zc.strict_active) {
+        int active = 0;
+        for (u32 i = 0; i < CELL_GCM_MAX_ZCULL_COUNT; i++)
+            if (s_zcull[i].bound && s_zcull[i].offset == s_zc.zeta_off) { active = 1; break; }
+        s_zc.surface_active = active;
+    }
+    if (s_zc.host_active && !s_zc.zpass_en) gcm_zc_set_active(0);
+    else if (!s_zc.host_active && s_zc.zpass_en && s_zc.zcull_en) gcm_zc_set_active(1);
+}
+
+static int gcm_zc_stencil_on(void)
+{
+    return s_zc.stencil_test && ((s_zc.surf_fmt >> 5) & 7u) == 2u;
+}
+
+/* RSXGraphEngine.cpp get_framebuffer_layout: zeta_address = 0 for a colour-
+ * only clear, a draw that never touches depth/stencil memory, or a zeta pitch
+ * that cannot hold the clipped surface. ctx: 0 draw, 1 colour, 2 depth, 3 all. */
+static int gcm_zc_depth_unused(int ctx)
+{
+    if (ctx == 1) return 1;
+    if (ctx == 0 && !gcm_zc_stencil_on()) {
+        int unused = !s_zc.depth_test ||
+                     (!s_zc.depth_mask && (s_zc.depth_func == 0x200u || s_zc.depth_func == 0x207u));
+        if (unused && s_zc.bounds_test) {
+            float mn, mx;
+            memcpy(&mn, &s_zc.bounds_min, 4); memcpy(&mx, &s_zc.bounds_max, 4);
+            if (mn > 0.f || mx < 1.f) unused = 0;
+        }
+        if (unused) { s_zc.contested = 1; return 1; }
+    }
+    if (((s_zc.surf_fmt >> 8) & 0xFu) != 2u) {      /* not swizzled */
+        const u32 aa = (s_zc.surf_fmt >> 12) & 0xFu;
+        const u32 texel = ((((s_zc.surf_fmt >> 5) & 7u) == 1u) ? 2u : 4u) * (aa ? 2u : 1u);
+        u32 lim = s_zc.surf_reg[(0x200u - 0x180u) >> 2] >> 16;   /* clip width */
+        const u32 sc = s_zc.scissor_h, se = (sc & 0xFFFFu) + (sc >> 16);
+        if (se < lim) lim = se;
+        if (s_zc.zpitch < texel * lim && s_zc.zpitch <= 64u) return 1;
+    }
+    return 0;
+}
+
+/* RPCS3 RSXThread.cpp:1498-1531 check_zcull_status(framebuffer_swap), from
+ * graph_engine::bind_framebuffer: re-evaluated when the framebuffer context
+ * (clear / draw) changes or a surface register changed. It needs a bound
+ * region whose depth format and AA mode match the surface and whose local
+ * offset is the (used) zeta surface's local address. */
+static void gcm_zc_fb_swap(int ctx)
+{
+    if (!s_zc.strict_active) return;
+    if (s_zc.depth_use) {
+        if (ctx == s_zc.fb_ctx && !s_zc.surf_dirty) return;
+        s_zc.fb_ctx = ctx;
+        s_zc.contested = 0;
+    } else if (!s_zc.surf_dirty) return;
+    s_zc.surf_dirty = 0;
+    int active = 0;
+    const u32 zfmt = (s_zc.surf_fmt >> 5) & 7u, aa = (s_zc.surf_fmt >> 12) & 0xFu;
+    if (s_zc.zeta_dma != 0xFEED0001u && !(s_zc.depth_use && gcm_zc_depth_unused(ctx)))
+        for (u32 i = 0; i < CELL_GCM_MAX_ZCULL_COUNT; i++)
+            if (s_zcull[i].bound && s_zcull[i].zFormat == zfmt && s_zcull[i].aaFormat == aa &&
+                s_zcull[i].offset == s_zc.zeta_off) { active = 1; break; }
+    s_zc.surface_active = active;
+    gcm_zc_check_state();
+}
+
+/* ZCULL_control::read_report. */
+static void gcm_zc_read_report(u32 sink, u32 type)
+{
+    if (s_zc.cur >= 0 && type == 1u) {
+        gcm_zc_enqueue_current();
+        s_zc.cur = gcm_zc_alloc();
+        if (s_zc.cur >= 0) gcm_zc_q_begin(s_zc.cur);
+    } else {
+        if (!s_zc.wn) {
+            gcm_zc_write_mem(sink, type, s_zc.stat[s_zc.stat_tag].result, 0);
+            return;
+        }
+        if (!gcm_zc_push()) { gcm_zc_write_mem(sink, type, s_zc.stat[s_zc.stat_tag].result, 0); return; }
+    }
+    if (!s_zc.wn) return;
+    const u32 last = s_zc.wn - 1u;
+    s_zc.stat[s_zc.stat_tag].flags |= 1u;
+    int claimed = 0;
+    for (u32 k = s_zc.wn; k-- > 0;) {
+        gcm_zc_write* w = gcm_zc_w(k);
+        if (w->sink) break;
+        w->tag = s_zc.stat_tag;
+        w->sink = sink;
+        w->type = type;
+        /* Not the last in the chain: truncated queries forward their count
+         * to the last writer. */
+        w->forwarder = k != last;
+        if (k == last) claimed = 1;
+    }
+    if (claimed) gcm_zcp_enqueued(sink);
+    if (s_zc.stat[s_zc.stat_tag].result) gcm_zc_update(0, 0);
+}
+
+/* ZCULL_control::clear. */
+static void gcm_zc_clear(u32 type)
+{
+    if (!(type & 1u)) return;
+    if (s_zc.cur >= 0 && s_zc.q[s_zc.cur].active) {
+        gcm_zc_q_end(s_zc.cur);
+        gcm_zc_q_discard(s_zc.cur);
+        gcm_zc_q_free(s_zc.cur);
+        s_zc.cur = gcm_zc_alloc();
+        if (s_zc.cur >= 0) gcm_zc_q_begin(s_zc.cur);
+    }
+    while (s_zc.wn && !gcm_zc_w(s_zc.wn - 1u)->sink) {
+        gcm_zc_write* w = gcm_zc_w(s_zc.wn - 1u);
+        if (w->q >= 0) { gcm_zc_q_discard(w->q); gcm_zc_q_free(w->q); }
+        s_zc.wn--;
+    }
+    if (!s_zc.wn) s_zc.stat[s_zc.stat_tag].flags = 0;
+    if (s_zc.stat[s_zc.stat_tag].flags) s_zc.stat_tag = (s_zc.stat_tag + 1u) % ZC_STATS;
+    s_zc.stat[s_zc.stat_tag].result = 0;
+}
+
+static void gcm_zc_on_draw(void)
+{
+    if (s_zc.cur >= 0) {
+        s_zc.q[s_zc.cur].draws++;
+        s_zc.q[s_zc.cur].sync_tag = ++s_zc.timer;
+    }
+}
+
+/* thread::enable_conditional_rendering / disable_conditional_rendering. The
+ * evaluation is on the CPU: a report still queued forces the queue up to it
+ * (at the first draw that needs the answer); otherwise memory decides now. */
+static void gcm_zc_set_render_enable(u32 arg)
+{
+    const u32 mode = arg >> 24;
+    if (mode == 1u) { s_zc.cr_enabled = 0; s_zc.cr_failed = 0; s_zc.cr_pending = 0; return; }
+    if (mode != 2u) return;
+    const u32 sink = gcm_zc_sink(arg & 0xFFFFFFu);
+    if (!sink) { static int n = 0; if (PS3_LOG_FIRST(n, 4)) printf("[zcull] SET_RENDER_ENABLE 0x%08X: no address%c", arg, 10); return; }
+    s_zc.cr_enabled = 1;
+    s_zc.cr_failed = 0;
+    s_zc.cr_pending = 0;
+    s_zc.cr_addr = sink;
+    /* ZCULL_control::find_query */
+    int found = 0;
+    u32 stat_id = 0xFFFFFFFFu;
+    for (u32 k = s_zc.wn; k-- > 0;) {
+        const gcm_zc_write* w = gcm_zc_w(k);
+        if (stat_id != 0xFFFFFFFFu) {
+            if (w->tag != stat_id) {
+                if (found) break;
+                s_zc.cr_failed = 1;        /* stats cleared in between: the result is 0 */
+                return;
+            }
+            if (w->q >= 0 && s_zc.q[w->q].draws) found = 1;
+        } else if (w->sink == sink) {
+            if (w->q >= 0 && s_zc.q[w->q].draws) found = 1;
+            stat_id = w->tag;
+        }
+    }
+    if (found) { s_zc.cr_pending = 1; return; }
+    s_zc.cr_failed = gcm_zcp_access(sink + 8u, NULL, 0) == 0u;
+}
+
+static int gcm_zc_render_disabled(void)
+{
+    if (!s_zc.cond || !s_zc.cr_enabled) return 0;
+    if (s_zc.cr_pending) {
+        s_zc.cr_pending = 0;
+        gcm_zc_update(s_zc.cr_addr, 0);
+        s_zc.cr_failed = gcm_zcp_access(s_zc.cr_addr + 8u, NULL, 0) == 0u;
+    }
+    return s_zc.cr_failed;
+}
+
+/* Before a label write the CPU can see (NV406E release, back-end release):
+ * RPCS3 write_gcm_label -> thread::sync -> ZCULL_control::sync. */
+static void gcm_zc_label_sync(void)
+{
+    if (s_zc.on && s_zc.wn) gcm_zc_sync();
+}
+
+/* Walker pre-hook for an NV4097 method, ahead of the draw engine and
+ * rsx_process_method. 1 = drop the method (a draw conditional rendering
+ * skips). */
+static void gcm_zc_option(u32* field, u32 v)
+{
+    if (field) *field = v;
+    if (s_zc.contested && (s_zc.depth_test || gcm_zc_stencil_on())) s_zc.surf_dirty = 1;
+}
+
+static int gcm_zc_pre(u32 m, u32 v)
+{
+    gcm_zc_init();
+    if (!s_zc.on) return 0;
+    const u32 mm = m & 0x1FFCu;
+    if (s_zc.depth_use) {
+        if (mm >= 0x180u && mm < 0x2C0u) {
+            switch (mm) {
+            case 0x18Cu: case 0x194u: case 0x198u: case 0x1B4u: case 0x1B8u:
+            case 0x200u: case 0x204u: case 0x208u: case 0x20Cu: case 0x210u: case 0x214u:
+            case 0x218u: case 0x21Cu: case 0x220u: case 0x22Cu: case 0x280u: case 0x284u:
+            case 0x288u: case 0x28Cu: case 0x2B8u: {
+                u32* r = &s_zc.surf_reg[(mm - 0x180u) >> 2];
+                const u32 diff = mm == 0x208u ? ((*r ^ v) & 0xFFFFu) : (*r ^ v);
+                *r = v;
+                if (mm == 0x198u) s_zc.zeta_dma = v;
+                else if (mm == 0x208u) s_zc.surf_fmt = v;
+                else if (mm == 0x214u) s_zc.zeta_off = v;
+                else if (mm == 0x22Cu) s_zc.zpitch = v;
+                if (diff) { s_zc.surf_dirty = 1; s_zc.contested = 0; }
+                return 0;
+            }
+            default: break;
+            }
+        }
+        switch (mm) {
+        case 0x0328u: gcm_zc_option(&s_zc.stencil_test, v); return 0;
+        case 0x032Cu: gcm_zc_option(&s_zc.stencil_mask, v); return 0;
+        case 0x0348u: gcm_zc_option(&s_zc.two_sided, v); return 0;
+        case 0x033Cu: case 0x0340u: case 0x0344u: case 0x034Cu:
+        case 0x035Cu: case 0x0360u: case 0x0364u: gcm_zc_option(NULL, v); return 0;
+        case 0x0A6Cu: gcm_zc_option(&s_zc.depth_func, v); return 0;
+        case 0x0A70u: gcm_zc_option(&s_zc.depth_mask, v); return 0;
+        case 0x0A74u: gcm_zc_option(&s_zc.depth_test, v); return 0;
+        case 0x0380u: s_zc.bounds_test = v; return 0;
+        case 0x0384u: s_zc.bounds_min = v; return 0;
+        case 0x0388u: s_zc.bounds_max = v; return 0;
+        case 0x08C0u: s_zc.scissor_h = v; return 0;
+        case 0x1D94u: {
+            /* RSXCoreRenderer clear: stencil bit dropped with a zero stencil
+             * mask; no bits = no framebuffer bind. */
+            u32 a = v;
+            if (!s_zc.stencil_mask) a &= ~2u;
+            if (!(a & 0xF3u)) return 0;
+            gcm_zc_fb_swap(((a & 0xF0u) ? 1 : 0) | ((a & 3u) ? 2 : 0));
+            return 0;
+        }
+        default: break;
+        }
+    }
+    switch (mm) {
+    case 0x0198u: s_zc.zeta_dma = v; s_zc.surf_dirty = 1; return 0;
+    case 0x0208u: s_zc.surf_fmt = v; s_zc.surf_dirty = 1; return 0;
+    case 0x0214u: s_zc.zeta_off = v; s_zc.surf_dirty = 1; return 0;
+    case 0x1D94u: gcm_zc_fb_swap(3); return 0;
+    case 0x1808u:
+        if (v) {
+            gcm_zc_fb_swap(0);
+            s_zc.skip_clause = gcm_zc_render_disabled();
+            return s_zc.skip_clause;
+        }
+        if (s_zc.skip_clause) { s_zc.skip_clause = 0; return 1; }
+        gcm_zc_on_draw();
+        return 0;
+    case 0x1814u: case 0x1818u: case 0x181Cu: case 0x1820u: case 0x1824u:
+        return s_zc.skip_clause;
+    case 0x1D70u:
+        gcm_zc_label_sync();
+        return 0;
+    default:
+        return 0;
+    }
+}
+
+/* Start of every walker pass: retire what has completed, and a flush an HLE
+ * report read asked for (RPCS3's pipe_flush_interrupt -> thread::sync). */
+static void gcm_zc_tick(void)
+{
+    if (!s_zc.inited || !s_zc.on) return;
+    if (InterlockedExchange(&s_zc.sync_req, 0)) gcm_zc_sync();
+    gcm_zc_update(0, 0);
+}
+
+/* A PPU thread reading a report through cellGcm. With guard pages (RPCS3)
+ * the read itself faults when it matters; with PS3RECOMP_ZCULL_CRITICAL=1
+ * ask the walker to retire the queue (without blocking, as RPCS3). */
+static void gcm_zc_hle_read(void)
+{
+    if (!s_zc.inited || !s_zc.on || !s_zc.wn || s_zcp.mode != 1) return;
+    InterlockedExchange(&s_zc.sync_req, 1);
+    if (s_gcm_kick_ev) SetEvent(s_gcm_kick_ev);
+}
+
+/* thread::flip: zpass/stats left running with nothing reading them would
+ * queue forever (RPCS3's Diablo III / Yakuza 5 workaround). */
+static void gcm_zc_on_flip(void)
+{
+    if (s_zc.inited && s_zc.on && s_zc.wn) gcm_zc_clear(1u | 2u);
+}
+
+static int gcm_flip_reset_enabled(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("RSX_FLIP_RESET"); on = !(e && *e == '0'); }
+    return on;
+}
+
+/* RPCS3 flip_command -> thread::reset: after the register reset
+ * (ZPASS_PIXEL_COUNT_ENABLE 0, RENDER_ENABLE 0x01000000), check_zcull_status
+ * and set_render_mode run from those values. */
+static void gcm_flip_state_reset_zc(void)
+{
+    if (!gcm_flip_reset_enabled()) return;
+    gcm_zc_init();
+    if (!s_zc.on) return;
+    s_zc.zpass_en = 0;
+    gcm_zc_check_state();
+    gcm_zc_set_render_enable(0x01000000u);
+}
+
+static int gcm_method_post_wanted(u32 m)
+{
+    switch (m) {
+    case 0x50u: case 0x1A8u: case 0x1800u:
+    case 0x17C8u: case 0x17CCu: case 0x1804u: case 0x1D84u: case 0x1E98u:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* v140: what the FIFO walker does after rsx_process_method for the methods
+ * it also handles itself (reference fences, report DMA, reports, ZCULL and
+ * conditional rendering state). Shared by the per-word walk and the quick
+ * block walk. */
 static void gcm_method_post(u32 m, u32 v_in)
 {
     extern u32 g_rsx_last_reference;
+    gcm_zc_init();
     /* NV406E_SET_REFERENCE: queue the fence value for PACED
      * publication (gcm_ref_publish below) instead of letting a
      * later fence in the same batch overwrite it. */
-    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
-    /* NV4097_GET_REPORT: (type << 24) | offset into the report
-     * area. Sample counts are not measured, so a ZPASS query
-     * reports "visible" -- the conservative answer; reading 0
-     * tells the title every queried object is occluded. */
+    if (m == 0x50) {
+        /* RPCS3 nv406e.cpp:14-22 set_reference: thread::sync() before ref is
+         * written -- queued ZCULL reports and pending reads land first.
+         * GCM_REF_SYNC=0 skips it. The paced queue stays: see
+         * gcm_ref_publish_one / the read-driven publication below, which an
+         * equality-waiter needs to see every value. */
+        static int rs = -1;
+        if (rs < 0) { const char* e = getenv("GCM_REF_SYNC"); rs = !(e && atoi(e) == 0); }
+        if (rs) {
+            gcm_zc_label_sync();
+            { extern void rsx_backend_flush_reads(void); rsx_backend_flush_reads(); }
+        }
+        gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+    }
     if (m == 0x1A8) s_report_dma = v_in;
+    if (s_zc.on) {
+        switch (m) {
+        case 0x17C8u: gcm_zc_clear(v_in); return;
+        case 0x17CCu: s_zc.zpass_en = v_in != 0; gcm_zc_check_state(); return;
+        case 0x1804u: s_zc.stats_en = v_in != 0; gcm_zc_check_state(); return;
+        case 0x1D84u: {
+            const int en = v_in != 0;
+            if (en != s_zc.zcull_en) { s_zc.zcull_en = en; gcm_zc_check_state(); }
+            return;
+        }
+        case 0x1E98u: gcm_zc_set_render_enable(v_in); return;
+        default: break;
+        }
+    }
+    /* NV4097_GET_REPORT: (type << 24) | offset into the report area. */
     if (m == 0x1800) {
-        const u32 v = v_in, off = v & 0xFFFFFFu, idx = off / 16u;
-        const u32 val = (v >> 24) == 1u ? 0xFFFFu : 0u;
-        const u64 ts = gcm_report_timestamp();
-        const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
-        { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
-        { static unsigned long long tc[8]; tc[(v >> 24) & 7]++;
-          if (tc[(v >> 24) & 7] == 1 || tc[(v >> 24) & 7] == 1000 || tc[(v >> 24) & 7] == 100000)
-              printf("[GET_REPORT] type=%u count=%llu off=0x%X%c", v >> 24, tc[(v >> 24) & 7], off, 10); }
-        /* Resistance port: where a report lands depends on the report DMA
-         * object (RPCS3 get_address): FEED0001 = IO offset, BAD68000 =
-         * IO offset 0x0E000000 + off, 66626660 = the report area the
-         * cellGcmGetReportData* calls hand out, FEED0000 = local memory.
-         * Reports used to go to a HOST array the guest could not read. */
-        { static u32 seen[16]; static int ns = 0; const u32 key = (s_report_dma & 0xFFFFFFF0u) | (v >> 24);
+        const u32 v = v_in, off = v & 0xFFFFFFu, idx = off / 16u, type = v >> 24;
+        { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", type, off, s_report_dma, 10); }
+        { static u32 seen[16]; static int ns = 0; const u32 key = (s_report_dma & 0xFFFFFFF0u) | type;
           int f = 0; for (int q = 0; q < ns; q++) if (seen[q] == key) f = 1;
           if (!f && ns < 16) { seen[ns++] = key;
-              printf("[GET_REPORT] first type=%u with dma=0x%08X (off=0x%X)%c", v >> 24, s_report_dma, off, 10); } }
-        if (s_report_dma == 0xBAD68000u || s_report_dma == 0x66626660u || s_report_dma == 0xFEED0000u) {
-            u32 rea = 0;
-            if (s_report_dma == 0xBAD68000u) rea = gcm_io2ea(0x0E000000u + off);
-            else if (s_report_dma == 0x66626660u) rea = (off < 0x100000u) ? GCM_REPORT_GUEST_BASE + off : 0;
-            else rea = cellGcmResolveLocated(1, off);
-            if (rea) {
-                vm_write32(rea, (u32)(ts >> 32));
-                vm_write32(rea + 4u, (u32)ts);
-                vm_write32(rea + 8u, val);
-                vm_write32(rea + 12u, 0u);
+              printf("[GET_REPORT] first type=%u with dma=0x%08X (off=0x%X)%c", type, s_report_dma, off, 10); } }
+        const u32 sink = gcm_zc_sink(off);
+        if (!sink) {
+            { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] offset 0x%X (dma 0x%08X) has no address%c", off, s_report_dma, 10); }
+            /* RPCS3 get_report: no address, nothing written. GCM_REPORT_NOSINK_STORE=1: old store. */
+            static int nss = -1;
+            if (nss < 0) { const char* e = getenv("GCM_REPORT_NOSINK_STORE"); nss = e && atoi(e) != 0; }
+            if (nss && idx < CELL_GCM_MAX_REPORT_COUNT) {
+                s_report_data[idx].timestamp = gcm_report_timestamp();
+                s_report_data[idx].value = type == 1u ? 0xFFFFu : 0u;
             }
-            if (idx < CELL_GCM_MAX_REPORT_COUNT) { s_report_data[idx].timestamp = ts; s_report_data[idx].value = val; }
-        } else
-        if (main_mem) {
-            /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
-            const u32 rea = gcm_io2ea(off);
-            if (rea) {
-                vm_write32(rea, (u32)(ts >> 32));
-                vm_write32(rea + 4u, (u32)ts);
-                vm_write32(rea + 8u, val);
-                vm_write32(rea + 12u, 0u);
-            } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
-        } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
-            s_report_data[idx].timestamp = ts;
-            s_report_data[idx].value = val;
+            return;
         }
+        if (!s_zc.on) {
+            /* The old immediate write: ZPASS "visible", the rest 0. */
+            gcm_zc_store(sink, gcm_report_timestamp(), type == 1u ? 0xFFFFu : 0u, 0);
+            return;
+        }
+        if (type >= 1u && type <= 5u) { gcm_zc_read_report(sink, type); return; }
+        /* Bad type: RPCS3 stamps the time and padding, value untouched. */
+        const u64 ts = gcm_report_timestamp();
+        const u32 words[4] = { (u32)(ts >> 32), (u32)ts, gcm_zcp_access(sink + 8u, NULL, 0), 0u };
+        gcm_zcp_access(sink, words, 0);
     }
 }
 
 static void gcm_rsx_process_fifo_unlocked(void)
 {
+    gcm_zc_tick();
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
       _n++;
@@ -2181,6 +4259,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             s_fifo_getoff, put);
             }
             s_fifo_getoff = put;
+            gcm_skip_ahead_note("unmapped-get");
             /* Whatever the walker had not reached is gone, and so are the flips
              * queued in it: none of them will ever be executed, so do not let a
              * flip wait on them. */
@@ -2189,6 +4268,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
             break;
         }
         u32 w = vm_read32(ea);
+        /* RSXThread.cpp:886-891: note a rollback address at a command boundary. */
+        if (s_fifo_sync_req && !s_state.in_begin_end) {
+            s_fifo_restore = s_fifo_getoff; s_fifo_saved_ret = s_fifo_calloff; s_fifo_sync_req = 0; }
         /* Only remember offsets BELOW put -- those are positions in the
          * ring the title is writing. A park in another region is where the
          * walker gave up, not how far it got through the ring. */
@@ -2236,6 +4318,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * frame split across 4 presents, layout flashing/zooming). */
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
             s_fifo_getoff += 4;
+            /* RPCS3 flip_command: thread::reset before the flip. */
+            gcm_flip_state_reset_zc();
+            if (rsx_draw_engine_enabled()) rsx_draw_engine_method(0xFEACu, w & 7u);
+            gcm_zc_on_flip();
             /* Count the flip WORDS the title actually writes into the FIFO,
              * separately from the presents that result. When a title stops
              * appearing on screen the first question is which side stopped:
@@ -2249,6 +4335,15 @@ static void gcm_rsx_process_fifo_unlocked(void)
                           flips, 10); }
             if (PS3_FT_ON()) { const uint64_t t = ps3_ft_now();
                                ps3_ft_span(PS3_FT_FLIP_FIFO, 0, w & 7u, 0, t, t); }
+            /* RPCS3 rsx_methods.cpp flip_command: executing the flip clears
+             * the 16-byte label 1 slot -- what cellGcmSetWaitFlip's
+             * SEMAPHORE_ACQUIRE(0x10, 0) waits on. GCM_FLIP_KEEP_LABEL1=1
+             * restores the old behaviour. */
+            { static int keep = -1;
+              if (keep < 0) keep = getenv("GCM_FLIP_KEEP_LABEL1") ? 1 : 0;
+              if (!keep)
+                  for (u32 q = 0; q < 16u; q += 4u)
+                      vm_write32(GCM_LABEL_GUEST_BASE + GCM_LABEL_STRIDE + q, 0u); }
             if ((w & 0xFFFFFF00u) == GCM_FLIP_MARKER) {
                 /* Queued by _cellGcmSetFlipCommand, which already did the
                  * guest-visible half of the request. */
@@ -2280,7 +4375,18 @@ static void gcm_rsx_process_fifo_unlocked(void)
             continue;
         }
 
-        if (type == 1) {                       /* JUMP: 0x20000000 | offset */
+        /* RPCS3 RSXFIFO.cpp:487-503 / 777-780: a word with any of the
+         * non-method bits (0xA0030003) set must be an old JUMP, a new JUMP
+         * (0x00000001 | offset), a CALL or a RET; anything else is a desync
+         * and recovers. The FEAD flip words above are this port's own. */
+        int is_jump = (type == 1), is_ret = (w == 0x00020000u);
+        if (gcm_fifo_recover_on()) {
+            is_jump = (w & 0xE0000003u) == 0x20000000u || (w & 0xE0000003u) == 1u;
+            is_ret  = (w & 0xFFFF0003u) == 0x00020000u;
+            if ((w & 0xA0030003u) && !is_jump && !is_ret && (w & 3u) != 2u) {
+                s_fifo_rec_why = "malformed command"; goto fifo_recover; }
+        }
+        if (is_jump) {                         /* JUMP: 0x20000000 | offset, or offset | 1 */
             { static int _rd = -1; if (_rd < 0) _rd = getenv("GCM_RECDBG") ? 1 : 0;
               if (_rd) fprintf(stderr, "[JMP] %08X -> %08X (put=%08X)\n",
                                s_fifo_getoff, w & 0x1FFFFFFCu, put); }
@@ -2326,6 +4432,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   }
                   why = "parked";
                   s_park_pass = 1;
+                  s_fifo_sync_req = 1;         /* RSXFIFO.cpp:798 */
                   break;
               }
               if (tgt < s_fifo_getoff) s_fifo_back_jumps++;
@@ -2339,15 +4446,25 @@ static void gcm_rsx_process_fifo_unlocked(void)
             continue;
         }
         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
+            /* RSXFIFO.cpp:814-818: only one call level -- CALL inside a
+             * subroutine recovers. */
+            if (s_fifo_calloff != GCM_CALL_NONE && gcm_fifo_recover_on()) {
+                s_fifo_rec_why = "CALL inside a subroutine"; goto fifo_recover; }
             { u32 tgt = w & 0x1FFFFFFCu;
               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
               s_fifo_calloff = s_fifo_getoff + 4;
               s_fifo_getoff  = tgt; }
             continue;
         }
-        if (w == 0x00020000u) {                /* RET */
+        if (is_ret) {                          /* RET */
+            /* RSXFIFO.cpp:830-833: RET without CALL recovers. */
+            if (s_fifo_calloff == GCM_CALL_NONE) {
+                if (gcm_fifo_recover_on()) { s_fifo_rec_why = "RET without CALL"; goto fifo_recover; }
+                s_fifo_getoff = 0;
+                continue;
+            }
             s_fifo_getoff = s_fifo_calloff;
-            s_fifo_calloff = 0;
+            s_fifo_calloff = GCM_CALL_NONE;
             continue;
         }
         if (type == 0 || type == 2) {          /* method (incrementing / NI) */
@@ -2386,13 +4503,13 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * while it waits. Semaphore offsets index the same label window
              * cellGcmGetLabelAddress hands out. */
             if (subch == 0 && (method == 0x64u || method == 0x68u || method == 0x6Cu)) {
-                int sem_blocked = 0;
+                int sem_blocked = 0, sem_recover = 0;
                 for (u32 i = 0; i < count; i++) {
                     u32 dea = gcm_io2ea(s_fifo_getoff + 4 + i * 4);
                     if (!dea) break;
                     u32 m = (type == 0) ? method + i * 4 : method;
                     u32 v = vm_read32(dea);
-                    u32 la = GCM_LABEL_GUEST_BASE + (s_sema_offset & 0xFFFFu);
+                    u32 la = gcm_sema406e_ea(s_sema_offset);
                     { static int sn = 0; if (getenv("GCM_RECDBG") && PS3_LOG_FIRST(sn, 12))
                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
                     /* PS3_FTRACE: an acquire this walker sat on is satisfied now. */
@@ -2410,8 +4527,33 @@ static void gcm_rsx_process_fifo_unlocked(void)
                             printf("[SEMA-ACQ] %llu acquires, %llu not yet satisfied when reached%c", nacq, nmiss, 10);
                     }
                     if (m == 0x64u)      s_sema_offset = v;
+                    else if (m == 0x6Cu && (s_sema_offset & 3u)) {
+                        /* RPCS3 nv406e.cpp:117-121 semaphore_release: an
+                         * unaligned semaphore is ignored. */
+                    }
                     else if (m == 0x6Cu) {
-                        { extern void rsx_backend_flush_reads(void); rsx_backend_flush_reads(); }   /* v180 */
+                        /* nv406e.cpp:123-147 (GCM_SEMA_ADDR=0 restores the old
+                         * label-window-only release): every release but the
+                         * flip semaphore's requests a sync point; an address
+                         * outside the label region recovers; device+0x30 never
+                         * gets 0. */
+                        if (gcm_sema_addr_on()) {
+                            if (!(s_sema_offset == 0x10u && s_sema406e_ctx == 0x66616661u)) s_fifo_sync_req = 1;
+                            if (!la || (la >> 28) != (GCM_LABEL_GUEST_BASE >> 28)) {
+                                s_fifo_rec_why = "NV406E semaphore unexpected address";
+                                sem_recover = 1; break;
+                            }
+                            if (la == R2RSX_DEVICE_EA + 0x30u && !v) v = 1;
+                        }
+                        /* RPCS3 semaphore_release -> write_gcm_label -> sync
+                         * (nv47_sync.hpp:14-50): queued ZCULL reports land
+                         * before the label does -- except for the flip
+                         * semaphores, and a write of the value already there. */
+                        if (!gcm_sema_addr_on() ||
+                            (la != GCM_LABEL_GUEST_BASE + 0x10u && la != R2RSX_DEVICE_EA + 0x30u && vm_read32(la) != v)) {
+                            gcm_zc_label_sync();
+                            { extern void rsx_backend_flush_reads(void); rsx_backend_flush_reads(); }   /* v180 */
+                        }
                         /* The RSX has fetched past a RELEASE before its
                          * semaphore write lands, so a guest that sees the
                          * label must also see `get` past the command. `get`
@@ -2428,36 +4570,46 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         { static int rn = 0; if (s_sema_offset != 0x400u && PS3_LOG_FIRST(rn, 40))   /* TEMP */
                             fprintf(stderr, "[SEMA-REL] get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); }
                     }
-                    else if (m == 0x68u && vm_read32(la) != v) {
-            /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
-             * the hardware does. Off by default: a title whose label nothing
-             * ever writes would wedge the drain permanently, and RELEASE on
-             * its own is the half that unblocks a waiting guest. */
-            static int blk = -1; static unsigned blk_ms;
-            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0;
-                           const char* t = getenv("GCM_SEMA_ACQUIRE_MS"); blk_ms = t ? (unsigned)atoi(t) : 0; }
-            if (blk) {
-                /* GCM_SEMA_ACQUIRE_MS=<ms>: a bounded wait. The hardware waits
-                 * for ever; an emulated producer that never comes (a boot-time
-                 * label nobody services yet) would wedge the drain, so after
-                 * <ms> on the same acquire it is consumed and said so. inFAMOUS 2
-                 * acquires a label its SPU lighting writes each frame: waiting
-                 * here is what orders the RSX's sampling after that write. */
-                static u32 b_off, b_val; static unsigned long long b_t0;
-                extern unsigned long long ps3_ms_now(void);
-                const unsigned long long now = ps3_ms_now();
-                if (!b_t0 || b_off != s_sema_offset || b_val != v) { b_off = s_sema_offset; b_val = v; b_t0 = now; }
-                if (!blk_ms || now - b_t0 < blk_ms) {
-                    if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
-                    sem_blocked = 1; break;
+                    else if (m == 0x68u) {
+                        /* nv406e.cpp:26: every acquire requests a sync point. */
+                        if (gcm_fifo_recover_on()) s_fifo_sync_req = 1;
+                        if (la && vm_read32(la) != v && gcm_sema_acquire_blocks(s_sema_offset)) {
+                            /* RPCS3 nv406e.cpp:57-107: ACQUIRE blocks until the
+                             * label matches, bounded by driver_recovery_timeout
+                             * (1 s): then it logs and carries on. Here a blocked
+                             * acquire stops the pass without consuming the
+                             * method and the next pass re-reads it. inFAMOUS 2
+                             * acquires a label its SPU lighting writes each
+                             * frame: waiting here orders the RSX's sampling after
+                             * that write. GCM_SEMA_ACQUIRE=0 never blocks;
+                             * GCM_SEMA_ACQUIRE_MS=<ms> sets the bound (0 = wait
+                             * for ever, as the hardware). */
+                            static u32 b_off, b_val, b_get; static unsigned long long b_t0, b_last;
+                            extern unsigned long long ps3_ms_now(void);
+                            const unsigned long long now = ps3_ms_now();
+                            const unsigned blk_ms = gcm_sema_acquire_ms();
+                            if (!b_t0 || b_off != s_sema_offset || b_val != v || b_get != s_fifo_getoff) {
+                                b_off = s_sema_offset; b_val = v; b_get = s_fifo_getoff; b_t0 = now; }
+                            /* nv406e.cpp:78-84: a gap over 20 ms between polls
+                             * (host stall) is not counted. GCM_SEMA_GAP_EXCLUDE=0 counts it. */
+                            { static int gx = -1;
+                              if (gx < 0) { const char* e = getenv("GCM_SEMA_GAP_EXCLUDE"); gx = !(e && atoi(e) == 0); }
+                              if (gx && b_last && now - b_last > 20u && b_t0 < now) {
+                                  const unsigned long long gap = now - b_last;
+                                  b_t0 = b_t0 + gap > now ? now : b_t0 + gap; }
+                              b_last = now; }
+                            if (!blk_ms || now - b_t0 < blk_ms) {
+                                if (PS3_FT_ON() && !s_ft_sema_t0) s_ft_sema_t0 = ps3_ft_now();
+                                sem_blocked = 1; break;
+                            }
+                            { static int tn; if (PS3_LOG_FIRST(tn, 12))
+                                fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X timed out after %u ms (label 0x%08X)\n",
+                                        s_sema_offset, v, blk_ms, vm_read32(la)); }
+                            b_t0 = 0;
+                        }
+                    }
                 }
-                { static int tn; if (PS3_LOG_FIRST(tn, 12))
-                    fprintf(stderr, "[SEMA] acquire off=0x%X == 0x%08X gave up after %u ms (label 0x%08X)\n",
-                            s_sema_offset, v, blk_ms, vm_read32(la)); }
-                b_t0 = 0;
-            }
-        }
-                }
+                if (sem_recover) goto fifo_recover;
                 if (sem_blocked) { s_sema_blocked_pass = 1; break; }
                 s_fifo_getoff += 4 + count * 4;
                 continue;
@@ -2495,7 +4647,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
               extern volatile int g_port_trace_left;
               extern volatile long g_fifo_mhist_on;
               if (g_fifo_mhist_on) fifo_mhist_note(subch, method, type, count);
-              if (fast && count && (subch == 0 || (subch == 1 && s1q)) && g_port_trace_left <= 0) {
+              if (fast && count && (subch == 0 || (subch == 1 && s1q && s_sub1_class == 1)) && g_port_trace_left <= 0) {
                   const u32 io0 = s_fifo_getoff + 4, io1 = s_fifo_getoff + count * 4;
                   const u32 dea = gcm_io2ea(io0);
                   if (dea && (io0 >> 20) == (io1 >> 20)) {
@@ -2518,8 +4670,11 @@ static void gcm_rsx_process_fifo_unlocked(void)
                                   const u32 mi = (m & 0x1FFCu) >> 2;
                                   if (!qseen[mi]) { qseen[mi] = 1;
                                       printf("[mfirst] subch=%u m=0x%04X = 0x%08X%c", subch, m & 0x1FFCu, v, 10); }
+                                  if (gcm_method_invalid(m, v)) goto fifo_recover;
+                                  if (gcm_zc_pre(m, v)) continue;
+                                  if (gcm_walk_check(m, v)) goto fifo_recover;
                                   rsx_process_method(&s_state, m, v);
-                                  if (m == 0x50u || m == 0x1A8u || m == 0x1800u) gcm_method_post(m, v);
+                                  if (gcm_method_post_wanted(m)) gcm_method_post(m, v);
                               }
                           }
                           s_fifo_getoff += 4 + count * 4;
@@ -2658,11 +4813,49 @@ static void gcm_rsx_process_fifo_unlocked(void)
 
                 /* And into the platform-neutral register-file draw engine,
                  * which is the macOS path under PS3RECOMP_RSX_ENGINE=dispatch.
-                 * It wants the raw method with its subchannel bits for the
-                 * same reason the live engine does, and masks them itself. */
+                 * Only NV4097 methods (and the driver methods, which it
+                 * decodes with their subchannel bits) go there: the 2D
+                 * objects' registers (NV0039, NV3062, NV309E, NV3089) alias
+                 * NV4097 alpha/blend/colour-mask state once the subchannel
+                 * is masked off. */
+                const u32 mfull = (subch << 13) | m;
+                if (m == 0) gcm_note_set_object(subch, vm_read32(dea));
+                const int is3d = subch == 0 ||
+                    (subch == 1 && !s1_2d && !gcm_sub1_is_nv0039(&s_state, m));
+                if (gcm_method_invalid(is3d ? m : mfull, vm_read32(dea))) goto fifo_recover;
+                /* ZCULL / conditional rendering (RPCS3): a draw whose
+                 * condition failed never reaches either consumer. */
+                const int zdrop = is3d && gcm_zc_pre(m, vm_read32(dea));
+                if (is3d && !zdrop && gcm_walk_check(m, vm_read32(dea))) goto fifo_recover;
+                if (mfull == 0xFEACu) gcm_flip_state_reset_zc();
+                /* GCM_WATCH_M=<method hex>: every write of that method, with
+                 * the subchannel and whether the draw engine receives it. */
+                { static int wm = -2; static u32 prev = 0xDEADBEEFu, nt = 0;
+                  static u32 tv[16][2]; static u32 tc[16]; static u32 ntv = 0;
+                  if (wm == -2) { const char* e = getenv("GCM_WATCH_M");
+                                  wm = e ? (int)strtoul(e, NULL, 16) : -1; }
+                  if (wm >= 0 && (m & 0x1FFCu) == (u32)wm) {
+                      const u32 v = vm_read32(dea);
+                      if (v != prev) {
+                          u32 k = 0;
+                          for (; k < ntv; k++) if (tv[k][0] == prev && tv[k][1] == v) break;
+                          if (k == ntv && ntv < 16) { tv[ntv][0] = prev; tv[ntv][1] = v; tc[ntv] = 0; ntv++; }
+                          if (k < 16) tc[k]++;
+                          prev = v;
+                          if (++nt % 5000 == 0) {
+                              fprintf(stderr, "[mwatch] after %u transitions:", nt);
+                              for (u32 i = 0; i < ntv; i++)
+                                  fprintf(stderr, " %08X->%08X x%u", tv[i][0], tv[i][1], tc[i]);
+                              fprintf(stderr, "\n");
+                              ntv = 0;
+                          }
+                      } } }
                 { static int eng = -1;
                   if (eng < 0) eng = rsx_draw_engine_enabled();
-                  if (eng) rsx_draw_engine_method((subch << 13) | m, vm_read32(dea)); }
+                  /* 0xFEB0 is the dispatcher's discard-draw pseudo-method
+                   * (RSX_DSP_DISCARD_DRAW): never from the guest. */
+                  if (eng && !zdrop && (is3d || mfull >= 0xE000u) && mfull != RSX_DSP_DISCARD_DRAW)
+                      rsx_draw_engine_method(mfull, vm_read32(dea)); }
 
                 /* RSX_LIVE_FEED_DBG=1: what the FIFO actually carries. Counted
                  * for any run, live engine or not, so the method stream and the
@@ -2684,24 +4877,41 @@ static void gcm_rsx_process_fifo_unlocked(void)
                  * FIFO word; the standard 11-bit extraction (w & 0x1FFC)
                  * truncates them.  Reconstruct the full address the same way
                  * the draw-engine call above does. */
-                { const u32 mfull = (subch << 13) | m;
-                if (mfull == 0xEB00u || mfull == 0xEB04u) {
+                { if (mfull == 0xEB00u || mfull == 0xEB04u) {
                     cellGcmQueueUserCommand(vm_read32(dea));
                 } else if (mfull == 0xE920u || mfull == 0xE924u) {
+                    gcm_zc_on_flip();
                     cellGcmSetFlipCommand(vm_read32(dea) & 7u);
-                } else if (subch == 0 || (subch == 1 && !s1_2d)) {
-                    rsx_process_method(&s_state, m, vm_read32(dea));
-                    if (m == 0x50u || m == 0x1A8u || m == 0x1800u) gcm_method_post(m, vm_read32(dea));
-                } else
+                } else if (is3d) {
+                    if (!zdrop) {
+                        rsx_process_method(&s_state, m, vm_read32(dea));
+                        if (gcm_method_post_wanted(m)) gcm_method_post(m, vm_read32(dea));
+                    }
+                } else if (subch == 1 && !s1_2d) {
+                    gcm_sub1_nv0039(m, vm_read32(dea));
+                } else {
+                    s_nv3089_recover = 0;
                     gcm_2d_method(subch, m, vm_read32(dea));
+                    if (s_nv3089_recover) {
+                        s_nv3089_recover = 0;
+                        s_fifo_rec_why = "NV3089 invalid blit";
+                        goto fifo_recover;
+                    }
+                }
                 }
             }
+            nv308a_flush_writes();
             s_fifo_getoff += 4 + count * 4;
             continue;
         }
         { static int _uw = 0; if (PS3_LOG_FIRST(_uw, 16) && getenv("RTT_DUMP"))
             fprintf(stderr, "[FIFOUW] unknown word 0x%08X at getoff 0x%X\n", w, s_fifo_getoff); }
         s_fifo_getoff += 4;                    /* unknown word: skip */
+        continue;
+    fifo_recover:
+        gcm_fifo_recover(s_fifo_rec_why, &s_state, put);
+        why = "recover";
+        break;
     }
 
     /* Walker watchdog. Everything above recovers from a *recognised* stall --
@@ -3028,6 +5238,8 @@ static void gcm_r2rsx_emit(u32 ctx, const u32* words, u32 n)
 }
 
 /* NID: 0xDC09357E */
+static int gcm_hle_validate(void);
+
 s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
                             u32 width, u32 height)
 {
@@ -3035,7 +5247,7 @@ s32 cellGcmSetDisplayBuffer(u32 bufferId, u32 offset, u32 pitch,
            bufferId, offset, pitch, width, height);
 
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
-        return CELL_GCM_ERROR_INVALID_VALUE;
+        return gcm_hle_validate() ? CELL_GCM_ERROR_FAILURE : CELL_GCM_ERROR_INVALID_VALUE;
     if (s_r2rsx) r2rsx_set_display_buffer(bufferId, offset, pitch, width, height);
 
     s_display_buffers[bufferId].offset = offset;
@@ -3549,14 +5761,14 @@ s32 cellGcmMapMainMemory(u32 ea, u32 size, u32* offset)
         printf("[cellGcmSys] MapMainMemory REFUSED: offset out-param is NULL\n");
         return CELL_GCM_ERROR_INVALID_VALUE;
     }
-    /* Size and EA must both be 1MB aligned. */
+    /* Size and EA must both be 1MB aligned (RPCS3: CELL_GCM_ERROR_FAILURE). */
     if (size == 0 || (size & 0xFFFFF) != 0) {
         printf("[cellGcmSys] MapMainMemory REFUSED: size 0x%X is not a non-zero multiple of 1MB\n", size);
-        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+        return gcm_hle_validate() ? CELL_GCM_ERROR_FAILURE : CELL_GCM_ERROR_INVALID_ALIGNMENT;
     }
     if ((ea & 0xFFFFF) != 0) {
         printf("[cellGcmSys] MapMainMemory REFUSED: ea 0x%08X is not 1MB aligned\n", ea);
-        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+        return gcm_hle_validate() ? CELL_GCM_ERROR_FAILURE : CELL_GCM_ERROR_INVALID_ALIGNMENT;
     }
 
     /* Before cellGcmInit there is no IO page table to map into (the reference
@@ -3605,11 +5817,11 @@ s32 cellGcmMapEaIoAddress(u32 ea, u32 io, u32 size)
 
     if ((ea & 0xFFFFF) != 0 || (io & 0xFFFFF) != 0) {
         printf("[cellGcmSys] MapEaIoAddress REFUSED: ea 0x%08X / io 0x%08X not 1MB aligned\n", ea, io);
-        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+        return gcm_hle_validate() ? CELL_GCM_ERROR_FAILURE : CELL_GCM_ERROR_INVALID_ALIGNMENT;
     }
     if (size == 0 || (size & 0xFFFFF) != 0) {
         printf("[cellGcmSys] MapEaIoAddress REFUSED: size 0x%X is not a non-zero multiple of 1MB\n", size);
-        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+        return gcm_hle_validate() ? CELL_GCM_ERROR_FAILURE : CELL_GCM_ERROR_INVALID_ALIGNMENT;
     }
     if (find_mapping_by_ea(ea) != NULL) {
         printf("[cellGcmSys] MapEaIoAddress REFUSED: ea 0x%08X is already mapped\n", ea);
@@ -3644,7 +5856,7 @@ s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags)
     if (flags != CELL_GCM_IOMAP_FLAG_STRICT_ORDERING)
         return CELL_GCM_ERROR_INVALID_VALUE;
     if ((ea | io | size) & 0xFFFFFu || !size)
-        return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+        return gcm_hle_validate() ? CELL_GCM_ERROR_FAILURE : CELL_GCM_ERROR_INVALID_ALIGNMENT;
     const u64 ea_end = (u64)ea + size;
     const u64 io_end = (u64)io + size;
     /* The HLE models the standard 256 MiB RSX IO aperture. Widen sums before
@@ -3667,7 +5879,8 @@ s32 cellGcmMapEaIoAddressWithFlags(u32 ea, u32 io, u32 size, u32 flags)
 /* NID: 0xDB23E867 (disambiguation by context) */
 s32 cellGcmUnmapEaIoAddress(u32 ea)
 {
-    IoMapping* mapping = find_mapping_by_ea(ea);
+    /* RPCS3 cellGcmUnmapEaIoAddress: ea >> 20, the low 20 bits ignored. */
+    IoMapping* mapping = find_mapping_by_ea(gcm_hle_validate() ? (ea & ~0xFFFFFu) : ea);
     if (!mapping)
         return CELL_GCM_ERROR_FAILURE;
 
@@ -3829,6 +6042,7 @@ u32 cellGcmGetReport(u32 type, u32 index)
       if (n++ < 8 || (n % 2000) == 0) printf("[cellGcmSys] GetReport(type=%u, index=%u) -> %u%c", type, index,
                           index < CELL_GCM_MAX_REPORT_COUNT ? s_report_data[index].value : 0u, 10); }
     if (index >= CELL_GCM_MAX_REPORT_COUNT) return 0;
+    gcm_zc_hle_read();
     return vm_read32(GCM_REPORT_GUEST_BASE + index * 16u + 8u);
 }
 
@@ -3856,6 +6070,8 @@ u64 cellGcmGetTimeStamp(u32 index)
 /* RPCS3 mode: mirror a tile / zcull slot into rsx::thread (cellGcmSetTile etc.). */
 static void gcm_r2rsx_tile(u8 i)
 {
+    rsx_draw_engine_set_tile(i, s_tiles[i].tile & 1u, s_tiles[i].offset, s_tiles[i].size,
+                             s_tiles[i].pitch, s_tiles[i].format, s_tiles[i].bank, s_tiles[i].bound);
     if (!s_r2rsx) return;
     r2rsx_set_tile(i, s_tiles[i].tile & 1u, s_tiles[i].offset, s_tiles[i].size, s_tiles[i].pitch,
                    s_tiles[i].format, s_tiles[i].base, s_tiles[i].bank, s_tiles[i].bound);
@@ -3868,6 +6084,33 @@ static void gcm_r2rsx_zcull(u8 i)
                     s_zcull[i].sFunc, s_zcull[i].sRef, s_zcull[i].sMask, s_zcull[i].bound);
 }
 
+static int gcm_env_on(const char* name)
+{
+    const char* e = getenv(name);
+    return !(e && e[0] == '0');
+}
+
+/* GCM_HLE_VALIDATE=0: the old unchecked SetTile / SetDisplayBuffer / map paths. */
+static int gcm_hle_validate(void)
+{
+    static int v = -1;
+    if (v < 0) v = gcm_env_on("GCM_HLE_VALIDATE");
+    return v;
+}
+
+/* GcmTileInfo::pack (RPCS3 GCM.h) into the guest tiles array. */
+static void gcm_tile_mirror(u8 i)
+{
+    if (!s_tiles_guest_ea || !gcm_hle_validate()) return;
+    const CellGcmTileInfo* t = &s_tiles[i];
+    const u32 loc = t->tile & 1u, size = t->size ? t->size : 0x10000u;
+    const u32 ea = s_tiles_guest_ea + 16u * i;
+    vm_write32(ea + 0, (loc + 1u) | (t->bank << 4) | ((t->offset / 0x10000u) << 16) | (loc << 31));
+    vm_write32(ea + 4, ((t->offset + size - 1u) / 0x10000u) << 16 | (loc << 31));
+    vm_write32(ea + 8, (t->pitch / 0x100u) << 8);
+    vm_write32(ea + 12, t->base | ((t->base + ((size - 1u) / 0x10000u)) << 13) | (t->format << 26) | (1u << 30));
+}
+
 /* NID: 0x0B4B62D5 */
 s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
                    u32 pitch, u8 comp, u16 base, u8 bank)
@@ -3875,8 +6118,15 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
     if (index >= CELL_GCM_MAX_TILE_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] SetTile(index=%u, loc=%u, offset=0x%X, size=0x%X, pitch=%u)\n",
-           index, location, offset, size, pitch);
+    printf("[cellGcmSys] SetTile(index=%u, loc=%u, offset=0x%X, size=0x%X, pitch=%u, comp=%u)\n",
+           index, location, offset, size, pitch, comp);
+
+    /* RPCS3 cellGcmSys.cpp:1376-1418. */
+    if (gcm_hle_validate()) {
+        if (base >= 2048 || bank >= 4) return CELL_GCM_ERROR_INVALID_VALUE;
+        if ((offset & 0xFFFFu) || (size & 0xFFFFu) || (pitch & 0xFFu)) return CELL_GCM_ERROR_INVALID_ALIGNMENT;
+        if (location >= 2 || (comp != 0 && (comp < 7 || comp > 12))) return CELL_GCM_ERROR_INVALID_ENUM;
+    }
 
     s_tiles[index].offset = offset;
     s_tiles[index].size   = size;
@@ -3889,12 +6139,72 @@ s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
     /* Build tile register value (simplified) */
     s_tiles[index].tile  = (location << 0) | (pitch << 8);
     s_tiles[index].limit = offset + size - 1;
-    if (s_r2rsx) { s_tiles[index].bound = pitch > 0; gcm_r2rsx_tile(index); }
+    /* RPCS3 cellGcmSetTile: tile.bound = (pitch > 0). */
+    s_tiles[index].bound = pitch > 0;
+    gcm_tile_mirror(index);
+    gcm_r2rsx_tile(index);
 
     return CELL_OK;
 }
 
-/* NID: 0x06EDEA25 */
+/* GCM_ZCULL_BIND=0: the old walker-mode SetZcull (region stored unbound
+ * unless r2rsx) and the one-argument BindZcull. */
+static int gcm_zcull_bind_on(void)
+{
+    static int v = -1;
+    if (v < 0) v = gcm_env_on("GCM_ZCULL_BIND");
+    return v;
+}
+
+/* RPCS3 cellGcmSetZcull / cellGcmBindZcull: GcmZcullInfo::pack, then
+ * sys_rsx_context_attribute(0x301) (sys_rsx.cpp:1081-1141) validates and
+ * unpacks the region into rsx::thread::zculls[] with bound = (status1 != 0),
+ * i.e. always bound. */
+static s32 gcm_zcull_store(u8 index, u32 offset, u32 width, u32 height, u32 cullStart, u32 zFormat,
+                           u32 aaFormat, u32 zcullDir, u32 zcullFormat, u32 sFunc, u32 sRef, u32 sMask)
+{
+    if (index >= CELL_GCM_MAX_ZCULL_COUNT) return CELL_GCM_ERROR_INVALID_VALUE;
+    const u32 region  = 1u | (zFormat << 4) | (aaFormat << 8);
+    const u32 size    = ((width >> 6) << 22) | ((height >> 6) << 6);
+    const u32 start   = cullStart & ~0xFFFu;
+    const u32 status0 = (zcullDir << 1) | (zcullFormat << 2) | ((sFunc & 0xFu) << 12) | (sRef << 16) | (sMask << 24);
+    const u32 status1 = 0x2000u | (0x20u << 16);
+    const u32 w = (size >> 22) << 6, h = ((size & 0xFFFFu) >> 6) << 6, off = offset & 0x0FFFFFFFu;
+    const u64 len = (u64)w * h;
+    if (!len || (u64)start + len - 1u > 0xFFFFFFFFull || (u64)start + len - 1u >= (3ull << 20) ||
+        off >= s_config.localSize) {
+        printf("[cellGcmSys] zcull %u: cull range invalid (start=0x%X %ux%u offset=0x%X)%c", index, start, w, h, off, 10);
+        return CELL_EINVAL;
+    }
+    CellGcmZcullInfo* z = &s_zcull[index];
+    z->zFormat = (region >> 4) & 0xFu;
+    z->aaFormat = (region >> 8) & 0xFu;
+    z->width = w;
+    z->height = h;
+    z->cullStart = start;
+    z->offset = off;
+    z->zcullDir = (status0 >> 1) & 1u;
+    z->zcullFormat = (status0 >> 2) & 0x3FFu;
+    z->sFunc = (status0 >> 12) & 0xFu;
+    z->sRef = (status0 >> 16) & 0xFFu;
+    z->sMask = (status0 >> 24) & 0xFFu;
+    z->bound = 1;
+    s_zc.surf_dirty = 1;
+    if (s_zculls_guest_ea) {
+        const u32 ea = s_zculls_guest_ea + 24u * index;
+        vm_write32(ea + 0, region);
+        vm_write32(ea + 4, size);
+        vm_write32(ea + 8, start);
+        vm_write32(ea + 12, offset);
+        vm_write32(ea + 16, status0);
+        vm_write32(ea + 20, status1);
+    }
+    gcm_r2rsx_zcull(index);
+    return CELL_OK;
+}
+
+/* NID: 0xD34A420D. Twelve arguments: the last four come off the guest stack
+ * (hle_gcm_set_zcull). */
 s32 cellGcmSetZcull(u8 index, u32 offset, u32 width, u32 height,
                     u32 cullStart, u32 zFormat, u32 aaFormat,
                     u32 zcullDir, u32 zcullFormat,
@@ -3905,6 +6215,10 @@ s32 cellGcmSetZcull(u8 index, u32 offset, u32 width, u32 height,
 
     printf("[cellGcmSys] SetZcull(index=%u, offset=0x%X, %ux%u)\n",
            index, offset, width, height);
+
+    if (gcm_zcull_bind_on())
+        return gcm_zcull_store(index, offset, width, height, cullStart, zFormat, aaFormat,
+                               zcullDir, zcullFormat, sFunc, sRef, sMask);
 
     s_zcull[index].offset      = offset;
     s_zcull[index].width       = width;
@@ -3935,14 +6249,22 @@ s32 cellGcmBindTile(u8 index)
     return CELL_OK;
 }
 
-/* NID: 0x1F61F9D3 */
-s32 cellGcmBindZcull(u8 index)
+/* NID: 0x9DC04436. RPCS3 cellGcmSys.cpp:328-366: the same twelve arguments
+ * as SetZcull, with an error code. */
+s32 cellGcmBindZcull(u8 index, u32 offset, u32 width, u32 height,
+                     u32 cullStart, u32 zFormat, u32 aaFormat,
+                     u32 zcullDir, u32 zcullFormat,
+                     u32 sFunc, u32 sRef, u32 sMask)
 {
     if (index >= CELL_GCM_MAX_ZCULL_COUNT)
         return CELL_GCM_ERROR_INVALID_VALUE;
 
-    printf("[cellGcmSys] BindZcull(index=%u)\n", index);
+    printf("[cellGcmSys] BindZcull(index=%u, offset=0x%X, %ux%u)\n", index, offset, width, height);
+    if (gcm_zcull_bind_on())
+        return gcm_zcull_store(index, offset, width, height, cullStart, zFormat, aaFormat,
+                               zcullDir, zcullFormat, sFunc, sRef, sMask);
     s_zcull[index].bound = 1;
+    s_zc.surf_dirty = 1;
     gcm_r2rsx_zcull(index);
     return CELL_OK;
 }
@@ -3967,8 +6289,49 @@ s32 cellGcmUnbindZcull(u8 index)
 
     printf("[cellGcmSys] UnbindZcull(index=%u)\n", index);
     s_zcull[index].bound = 0;
+    s_zc.surf_dirty = 1;
     gcm_r2rsx_zcull(index);
     return CELL_OK;
+}
+
+/* SetZcull / BindZcull take twelve arguments; the generic HLE adapter passes
+ * r3..r10 only, so the ninth onwards (zcullFormat, sFunc, sRef, sMask) are
+ * read from the guest parameter save area at sp+112. */
+static u32 gcm_ctx_arg(ppu_context* ctx, u32 n)
+{
+    return n <= 8u ? (u32)ctx->gpr[2u + n] : vm_read32((u32)ctx->gpr[1] + 112u + 8u * (n - 9u) + 4u);
+}
+static void hle_gcm_set_zcull(ppu_context* ctx)
+{
+    ctx->gpr[3] = (u64)(s64)cellGcmSetZcull((u8)gcm_ctx_arg(ctx, 1), gcm_ctx_arg(ctx, 2), gcm_ctx_arg(ctx, 3),
+        gcm_ctx_arg(ctx, 4), gcm_ctx_arg(ctx, 5), gcm_ctx_arg(ctx, 6), gcm_ctx_arg(ctx, 7), gcm_ctx_arg(ctx, 8),
+        gcm_ctx_arg(ctx, 9), gcm_ctx_arg(ctx, 10), gcm_ctx_arg(ctx, 11), gcm_ctx_arg(ctx, 12));
+}
+static void hle_gcm_bind_zcull(ppu_context* ctx)
+{
+    ctx->gpr[3] = (u64)(s64)cellGcmBindZcull((u8)gcm_ctx_arg(ctx, 1), gcm_ctx_arg(ctx, 2), gcm_ctx_arg(ctx, 3),
+        gcm_ctx_arg(ctx, 4), gcm_ctx_arg(ctx, 5), gcm_ctx_arg(ctx, 6), gcm_ctx_arg(ctx, 7), gcm_ctx_arg(ctx, 8),
+        gcm_ctx_arg(ctx, 9), gcm_ctx_arg(ctx, 10), gcm_ctx_arg(ctx, 11), gcm_ctx_arg(ctx, 12));
+}
+
+/* ps3_hle_register_ctx lives in the PPU runtime; unit tests that link
+ * cellGcmSys.c alone get the no-op fallback. */
+void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
+void gcm_hle_register_ctx_none(uint32_t nid, const char* name, void (*fn)(ppu_context*))
+{
+    (void)nid; (void)name; (void)fn;
+}
+#if defined(_MSC_VER)
+#pragma comment(linker, "/alternatename:ps3_hle_register_ctx=gcm_hle_register_ctx_none")
+#endif
+
+static void gcm_register_ctx_handlers(void)
+{
+    static int done = 0;
+    if (done || !gcm_zcull_bind_on()) return;
+    done = 1;
+    ps3_hle_register_ctx(0xD34A420Du, "cellGcmSetZcull", hle_gcm_set_zcull);
+    ps3_hle_register_ctx(0x9DC04436u, "cellGcmBindZcull", hle_gcm_bind_zcull);
 }
 
 /* ---------------------------------------------------------------------------
@@ -4181,7 +6544,7 @@ void cellGcmTerminate(void)
     memset(s_tiles, 0, sizeof(s_tiles));
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
-    s_report_dma = 0xFEED0000u;
+    s_report_dma = gcm_report_dma_init();
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
@@ -4247,9 +6610,11 @@ u32 cellGcmGetVBlankCount(void)
     return s_vblank_count++;
 }
 
-/* Return tile info for a given index */
+/* RPCS3 cellGcmGetTileInfo / cellGcmGetZcullInfo take no argument and return
+ * the guest arrays SetTile / SetZcull fill. */
 CellGcmTileInfo* cellGcmGetTileInfo(u8 index)
 {
+    if (s_tiles_guest_ea && gcm_hle_validate()) return (CellGcmTileInfo*)(uintptr_t)s_tiles_guest_ea;
     if (index >= CELL_GCM_MAX_TILE_COUNT) {
         printf("[cellGcmSys] WARNING: GetTileInfo index %u out of range\n", index);
         return NULL;
@@ -4257,9 +6622,9 @@ CellGcmTileInfo* cellGcmGetTileInfo(u8 index)
     return &s_tiles[index];
 }
 
-/* Return zcull info for a given index */
 CellGcmZcullInfo* cellGcmGetZcullInfo(u8 index)
 {
+    if (s_zculls_guest_ea && gcm_hle_validate()) return (CellGcmZcullInfo*)(uintptr_t)s_zculls_guest_ea;
     if (index >= CELL_GCM_MAX_ZCULL_COUNT) {
         printf("[cellGcmSys] WARNING: GetZcullInfo index %u out of range\n", index);
         return NULL;
@@ -4411,6 +6776,7 @@ s32 cellGcmSetInvalidateTile(u8 index)
 
     s_tiles[index].bound = 0;
     memset(&s_tiles[index], 0, sizeof(CellGcmTileInfo));
+    rsx_draw_engine_set_tile(index, 0, 0, 0, 0, 0, 0, 0);
     return CELL_OK;
 }
 
@@ -4446,6 +6812,7 @@ u32 cellGcmGetReportDataLocation(u32 index, u32 location)
         return 0;
     { static int n = 0; if (n < 4 && ++n) printf("[cellGcmSys] GetReportDataLocation(%u, %u)%c", index, location, 10); }
     const u32 ea = gcm_report_ea(index, location);
+    gcm_zc_hle_read();
     return ea ? vm_read32(ea + 8u) : 0u;
 }
 
@@ -4556,5 +6923,6 @@ void cellGcm_syscall_set_fifo(u32 put, u32 get)
     vm_write32(GCM_CONTROL_GUEST_ADDR + 0, put);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, get);
     s_fifo_getoff  = get;
-    s_fifo_calloff = 0;
+    s_fifo_calloff = GCM_CALL_NONE;
+    s_fifo_restore = 0xFFFFFFFFu; s_fifo_saved_ret = GCM_CALL_NONE; s_fifo_sync_req = 1;
 }

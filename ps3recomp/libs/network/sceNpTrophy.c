@@ -54,6 +54,10 @@ static void trophy_adopt_gamedata_root(void)
         snprintf(s_storage_path, sizeof(s_storage_path), "%s/trophies", env);
 }
 
+/* Set by the port (project/r3_trophies.cpp): called after each unlock with the
+ * context's unlock flags; returns a platinum trophy id to award now, or -1. */
+int (*volatile g_trophy_unlock_hook)(const char* comm_id, int trophy_id, const u8* unlocked, u32 count) = 0;
+
 /* Per-context data */
 typedef struct {
     int                      in_use;
@@ -516,11 +520,22 @@ s32 sceNpTrophyUnlockTrophy(SceNpTrophyContext context,
     /* Save immediately */
     trophy_save(&s_contexts[context]);
 
-    /* Check if all non-platinum trophies are unlocked -> platinum */
-    if (platinumId) {
-        vm_write32((u32)(uintptr_t)platinumId, (u32)SCE_NP_TROPHY_INVALID_TROPHY_ID);
-        /* Simplified: don't auto-award platinum without grade info */
+    /* The port's hook (records / shows the unlock) knows the trophy grades:
+     * it returns the platinum id once every trophy it belongs to is unlocked. */
+    s32 plat = SCE_NP_TROPHY_INVALID_TROPHY_ID;
+    if (g_trophy_unlock_hook) {
+        const int p = g_trophy_unlock_hook(s_contexts[context].commId.data, (int)trophyId,
+                                           s_contexts[context].unlocked, s_contexts[context].total_trophies);
+        if (p >= 0 && (u32)p < s_contexts[context].total_trophies && !s_contexts[context].unlocked[p]) {
+            s_contexts[context].unlocked[p] = 1;
+            s_contexts[context].unlock_time[p] = (u64)time(NULL);
+            trophy_save(&s_contexts[context]);
+            plat = p;
+            printf("[sceNpTrophy] platinum #%d unlocked\n", p);
+        }
     }
+    if (platinumId)
+        vm_write32((u32)(uintptr_t)platinumId, (u32)plat);
 
     return CELL_OK;
 }

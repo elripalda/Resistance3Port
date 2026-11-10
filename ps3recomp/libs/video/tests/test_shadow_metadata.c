@@ -11,9 +11,14 @@ int main(void){u8 uc[512]={0};char old[65536],now[65536];rsx_fp_shadow_desc d[16
  for(u32 f=0;f<8;f++){rsx_fp_shadow_desc_from_texture(d,0xB0,2,0,1,0x01010000,f<<28,0x80000000);CHECK(d[0].enabled==(f>0&&f<7),"eight activation controls");}
  rsx_fp_shadow_desc_from_texture(d,0xB0,2,0,1,0x01010000,3u<<28,0x80000004);CHECK(!d[0].enabled,"alpha-kill bypass");rsx_fp_shadow_desc_from_texture(d,0xA5,2,0,1,0x01010000,3u<<28,0x80000000);CHECK(!d[0].enabled,"ordinary color bypass");rsx_fp_shadow_desc_from_texture(d,0xB0,2,0,1,0x01010000,3u<<28,0);CHECK(!d[0].enabled,"disabled unit bypass");
  const u32 bad[6][6]={{0xB1,2,0,1,0x01010000,3},{0xB3,2,0,1,0x01010000,3},{0xB0,2,1,1,0x01010000,3},{0xB0,1,0,1,0x01010000,3},{0xB0,2,0,2,0x01010000,3},{0xB0,2,0,1,0x01010000,8}};
- for(int i=0;i<6;i++){rsx_fp_shadow_desc_from_texture(d,bad[i][0],bad[i][1],bad[i][2],bad[i][3],bad[i][4],bad[i][5]<<28,0x80000000);CHECK(d[0].enabled==2,"unsupported metadata flagged");CHECK(rsx_fp_decompile_buffered_shadow_ex(uc,16,64,0,d,now,sizeof now,&nc)<0,"unsupported active translation rejected");}
+ /* T2-01 (RPCS3 parity; RSX_FP_SHADOW_EXT=0 restores the old reject contract):
+  * float depth, cube units and any mip count compare; 1D units and a zfunc
+  * past ALWAYS have no RPCS3 compare form and sample as plain textures. Every
+  * layout still translates. */
+ const u8 want[6]={1,1,1,0,1,0};
+ for(int i=0;i<6;i++){rsx_fp_shadow_desc_from_texture(d,bad[i][0],bad[i][1],bad[i][2],bad[i][3],bad[i][4],bad[i][5]<<28,0x80000000);CHECK(d[0].enabled==want[i],"RPCS3 compare activation per layout");CHECK(rsx_fp_decompile_buffered_shadow_ex(uc,16,64,0,d,now,sizeof now,&nc)>0,"every layout translates");}
  const u32 ops[5]={0x19,0x2F,0x31,0x33,0x34};rsx_fp_shadow_desc_from_texture(d,0xB0,2,0,1,0x01010000,3u<<28,0x80000000);
- for(int i=0;i<5;i++){rsx_test_fp_instr(uc,RSX_TEST_FP_OPC(ops[i])|RSX_TEST_FP_MASK_XYZW|RSX_TEST_FP_INSRC_TC0|RSX_TEST_FP_END,RSX_TEST_FP_SRC_INPUT|RSX_TEST_FP_SWZ_IDENT);CHECK(rsx_fp_texture_units(uc,16)==1,"unsupported texture fetch still participates in activation");CHECK(rsx_fp_decompile_buffered_shadow_ex(uc,16,64,0,d,now,sizeof now,&nc)<0,"unsupported fetch rejected");}
+ for(int i=0;i<5;i++){rsx_test_fp_instr(uc,RSX_TEST_FP_OPC(ops[i])|RSX_TEST_FP_MASK_XYZW|RSX_TEST_FP_INSRC_TC0|RSX_TEST_FP_END,RSX_TEST_FP_SRC_INPUT|RSX_TEST_FP_SWZ_IDENT);CHECK(rsx_fp_texture_units(uc,16)==1,"unsupported texture fetch still participates in activation");CHECK(rsx_fp_decompile_buffered_shadow_ex(uc,16,64,0,d,now,sizeof now,&nc)>0,"RPCS3 compares on every fetch opcode");}
  for(u32 u=0;u<16;u++){rsx_test_fp_instr(uc+u*16,RSX_TEST_FP_OPC(0x17)|RSX_TEST_FP_TEXU(u)|RSX_TEST_FP_MASK_XYZW|RSX_TEST_FP_INSRC_TC0|(u==15?RSX_TEST_FP_END:0),RSX_TEST_FP_SRC_INPUT|RSX_TEST_FP_SWZ_IDENT);rsx_fp_shadow_desc_from_texture(&d[u],0xB0,2,0,1,0x02020000,3u<<28,0x80000000);}
  CHECK(rsx_fp_texture_units(uc,256)==65535,"all sixteen unit mask");CHECK(rsx_fp_decompile_buffered_shadow_ex(uc,256,64,0,d,now,sizeof now,&nc)>0&&strstr(now,"_rsx_shadow_cmp15"),"bounded output supports sixteen comparison helpers");
  printf("shadow metadata: %d checks, %d failures\n",checks,failures);return failures?1:0;}

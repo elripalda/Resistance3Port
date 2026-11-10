@@ -291,6 +291,8 @@ void cellGcmSetVBlankHandler(CellGcmVBlankHandler handler);
  * title-screen state machine from the VBlank handler. */
 void cellGcmTickVBlank(void);
 void cellGcmTickFlip(void);
+/* RPCS3 frame-limited flip completion; call often from the drain thread. */
+int cellGcm_flip_pace_poll(long long now_us, long long period_us);
 
 /* NID: 0xF9BFCDA3 */
 void cellGcmSetSecondVHandler(CellGcmSecondVHandler handler);
@@ -344,7 +346,7 @@ u64 cellGcmGetTimeStamp(u32 index);
 s32 cellGcmSetTile(u8 index, u8 location, u32 offset, u32 size,
                    u32 pitch, u8 comp, u16 base, u8 bank);
 
-/* NID: 0x06EDEA25 */
+/* NID: 0xD34A420D */
 s32 cellGcmSetZcull(u8 index, u32 offset, u32 width, u32 height,
                     u32 cullStart, u32 zFormat, u32 aaFormat,
                     u32 zcullDir, u32 zcullFormat,
@@ -353,8 +355,11 @@ s32 cellGcmSetZcull(u8 index, u32 offset, u32 width, u32 height,
 /* NID: 0x2BB1F1E5 */
 s32 cellGcmBindTile(u8 index);
 
-/* NID: 0x1F61F9D3 */
-s32 cellGcmBindZcull(u8 index);
+/* NID: 0x9DC04436 */
+s32 cellGcmBindZcull(u8 index, u32 offset, u32 width, u32 height,
+                     u32 cullStart, u32 zFormat, u32 aaFormat,
+                     u32 zcullDir, u32 zcullFormat,
+                     u32 sFunc, u32 sRef, u32 sMask);
 
 /* NID: 0x75843042 */
 s32 cellGcmUnbindTile(u8 index);

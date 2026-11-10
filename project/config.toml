@@ -96,6 +96,17 @@ scale_factor = 1
 #
 # Recognised names: "wasapi", "sdl", "null"
 backend = "auto"
+#
+# Stutter on CPU-limited PCs: the log prints one "[audio] output: ..." line at
+# start and "[audio] underruns N in last 10 s ..." every 10 s while anything
+# goes wrong (once a minute otherwise). Environment toggles:
+#   PORT_AUDIO_BUFFER_MS=150     host buffer target (default 100, 150 below
+#                                12 logical CPUs; 20..500)
+#   PORT_AUDIO_STRETCH=0         no time stretch when the buffer runs low
+#   PORT_AUDIO_STRETCH_MIN=0.70  slowest stretch tempo (0.5..1.0)
+#   PORT_AUDIO_LATE_WAIT_MS=22   wait for a late game block (0 = never, max 40)
+#   PORT_AUDIO_MMCSS=0           no MMCSS "Pro Audio" on the mixer thread
+#   PORT_AUDIO_LOG=0             no [audio] health lines
 
 # Sample rate (PS3 native is 48000)
 sample_rate = 48000

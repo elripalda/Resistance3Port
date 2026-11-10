@@ -265,7 +265,7 @@ Video:
   Vblank NTSC Fixup: false
   Vblank Rate: 60
   Vulkan:
-    Adapter: NVIDIA GeForce RTX 5070
+    Adapter: ""
     Asynchronous Queue Scheduler: Safe
     Asynchronous Texture Streaming: false
     Exclusive Fullscreen Mode: Automatic

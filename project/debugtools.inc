@@ -1219,6 +1219,7 @@ static DWORD WINAPI debug_console(LPVOID param)
  * SPU register files to logs\freeze_<n>.txt, start a fresh copy of this
  * program with the same command line, environment and console, and end this
  * one -- so a freeze costs a restart, not a person at the keyboard. */
+extern "C" volatile int g_r2pc_paused;   /* r3_pcport.cpp: paused on purpose (not a freeze) */
 static DWORD WINAPI freeze_relauncher(LPVOID)
 {
     const char* e = getenv("FREEZE_RELAUNCH");
@@ -1232,7 +1233,7 @@ static DWORD WINAPI freeze_relauncher(LPVOID)
     for (;;) {
         Sleep(1000);
         const unsigned f = cellGcm_flip_request_count();
-        if (f != last || f < 200) { last = f; still = 0; continue; }
+        if (f != last || f < 200 || g_r2pc_paused) { last = f; still = 0; continue; }
         if (++still < secs) continue;
         static int n = 0;
         { char fn[64]; snprintf(fn, sizeof fn, "logs\\freeze_%lu_%d.txt", (unsigned long)GetTickCount(), n++);

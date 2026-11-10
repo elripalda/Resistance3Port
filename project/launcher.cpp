@@ -34,12 +34,17 @@ namespace Gdiplus { using std::min; using std::max; }
 #include <vector>
 #include <functional>
 
+#include "r2_autoconfig.h"
+#include "r3_trophy_data.h"
+#include <shlobj.h>
+
 #ifdef _MSC_VER
 #pragma comment(lib, "gdiplus.lib")
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
+#pragma comment(lib, "ole32.lib")
 #endif
 
 using namespace Gdiplus;
@@ -48,16 +53,24 @@ using namespace Gdiplus;
 // Settings (settings.ini / settings.bat)
 // ===========================================================================
 struct Choice { const char* label; const char* value; };
+// Where a data-driven option (add_option) is listed. The built-in settings are placed by layout() itself.
+enum Section { SEC_NONE, SEC_GAME_QUALITY, SEC_RENDER_QUALITY, SEC_PC, SEC_INPUT };
 struct Setting {
     const char* key;      // settings.ini key
     const char* title;
     const char* help;     // shown in the help strip while hovered
     std::vector<Choice> choices;
     int def;
-    int sel;
+    int sel = 0;
+    // data-driven options only (add_option): settings.bat writes `set "env=value"` (nothing for ""),
+    const char* env = nullptr;
+    int section = SEC_NONE;
+    const char* only_renderer = nullptr;      // greyed out unless this renderer is selected ("rpcs3" / "vulkan")
+    const char* tier_val[4] = {};            // recommended value for the Low/Medium/High/Ultra tier (nullptr = def)
 };
 
-enum { S_DISPLAY, S_WINDOW, S_FPS, S_VSYNC, S_RES, S_FSR, S_UPSCALE, S_ANISO, S_FILTER, S_SHARPEN, S_COUNT };
+enum { S_DISPLAY, S_WINDOW, S_FPS, S_VSYNC, S_RES, S_FSR, S_UPSCALE, S_ANISO, S_FILTER, S_SHARPEN, S_RENDERER, S_CPU,
+       S_SHADER, S_COUNT };
 static std::vector<Setting> g_set = {
     { "display", "Display mode",
       "Borderless fills the screen and lets you Alt+Tab instantly. Exclusive fullscreen gives the game the "
@@ -70,12 +83,17 @@ static std::vector<Setting> g_set = {
         {"2560 x 1440", "2560x1440"}, {"3840 x 2160", "3840x2160"} }, 2 },
     { "fps", "Frame rate",
       "The PS3 game runs at 30 fps. 60 fps doubles how often the game updates and draws; the game measures "
-      "real time each frame, so it does not play faster. Needs about twice the CPU and GPU time.",
-      { {"30 fps  (PS3 original)", "30"}, {"60 fps", "60"} }, 1 },
+      "real time each frame, so it does not play faster. Needs about twice the CPU and GPU time. "
+      "120 / 144 / Match display / Uncapped go further (uncapped: as fast as the PC allows; "
+      "best with VSync Auto or Off and a G-Sync / FreeSync monitor).",
+      { {"30 fps  (PS3 original)", "30"}, {"60 fps", "60"}, {"120 fps", "120"}, {"144 fps", "144"},
+        {"Match display refresh", "refresh"}, {"Just under refresh  (G-Sync / FreeSync)", "vrr"}, {"Uncapped", "0"} }, 1 },
     { "vsync", "VSync",
       "Off is smoothest with a G-Sync / FreeSync monitor and has the lowest input lag. On removes tearing on "
-      "other screens. Adaptive syncs when the game keeps up and tears instead of stuttering when it doesn't.",
-      { {"Off", "0"}, {"On", "1"}, {"Adaptive", "adaptive"} }, 0 },
+      "other screens. Adaptive syncs when the game keeps up and tears instead of stuttering when it doesn't. "
+      "Auto uses On when the frame rate matches your display (a locked, even 60 on a 60 Hz screen) and "
+      "tear-free unthrottled presentation otherwise.",
+      { {"Off", "0"}, {"On", "1"}, {"Adaptive", "adaptive"}, {"Auto", "auto"} }, 0 },
     { "res", "Render resolution",
       "The resolution the game draws at. Higher is sharper (shadows too) but costs GPU time. "
       "Above your screen's resolution it acts as supersampling: 3840 x 2160 with DLAA on a 1080p screen "
@@ -106,66 +124,197 @@ static std::vector<Setting> g_set = {
       "Counteracts the softness of scaling and anti-aliasing. Off when the render resolution matches your "
       "screen and anti-aliasing is off.",
       { {"Off", "0"}, {"Low", "0.25"}, {"Medium", "0.5"}, {"High", "0.8"} }, 1 },
+    { "renderer", "Renderer",
+      "Compatible draws through RPCS3's PS3 graphics emulation - the most tested. Native Vulkan "
+      "(experimental) draws the game's graphics directly on your GPU, which is faster on weaker PCs "
+      "but may still show glitches.",
+      { {"Compatible  (RPCS3)", "rpcs3"}, {"Native Vulkan  (experimental)", "vulkan"} }, 0 },
+    { "cpu", "CPU profile",
+      "How the game uses your processor. Auto picks from your core count: Low trims busy-waiting and "
+      "helper threads for 4-core CPUs, Mid for 6-core CPUs, High changes nothing.",
+      { {"Auto", "auto"}, {"Low  (4 cores)", "low"}, {"Mid  (6 cores)", "mid"}, {"High  (8+ cores)", "high"} }, 0 },
+    { "shaders", "Shader compilation",
+      "How the Compatible renderer builds the GPU programs it needs. Asynchronous compiles them in the background: "
+      "no stutter, but an object can be missing for a moment the first time it appears. Synchronous waits for "
+      "each one (brief hitches the first time). Compiled shaders are kept, so either gets smoother as you play.",
+      { {"Asynchronous", "async"}, {"Asynchronous + interpreter  (experimental)", "interp"}, {"Synchronous", "sync"} }, 0 },
 };
 
-static char g_dir[MAX_PATH];
-static std::string g_hw_desc = "default settings";
-
-// Recommended defaults from the hardware: the strongest DXGI adapter (VRAM, vendor, RTX),
-// the primary screen and the physical core count. Sets each Setting's def.
-static void detect_hardware()
+// ---------------------------------------------------------------------------
+// Data-driven options: one call per environment switch, listed under their section on the Graphics page
+// and written to settings.bat as `set "ENV=value"` (a "" value writes nothing: the game's default).
+// tiers: the recommended value for Low / Medium / High / Ultra PCs (nullptr = the default choice).
+//
+//   add_option(SEC_GAME_QUALITY, "lod", "Level of detail", "Help text.", "R2_LOD",
+//              { {"Original", ""}, {"High", "1"}, {"Ultra", "2"} }, 0, { "", "", "1", "2" });
+//   add_option(SEC_RENDER_QUALITY, "shadowres", "Shadow resolution", "...", "RSX_SHADOW_RES",
+//              { {"Original", ""}, {"2x", "2"} }, 0, {}, "rpcs3");
+// ---------------------------------------------------------------------------
+[[maybe_unused]] static void add_option(int section, const char* key, const char* title, const char* help, const char* env,
+                       std::vector<Choice> choices, int def, std::vector<const char*> tiers = {},
+                       const char* only_renderer = nullptr)
 {
-    size_t vram = 0; UINT vendor = 0; char gpu[128] = "unknown GPU";
-    if (HMODULE dx = LoadLibraryA("dxgi.dll")) {
-        typedef HRESULT (WINAPI *CF)(REFIID, void**);
-        if (CF cf = (CF)(void*)GetProcAddress(dx, "CreateDXGIFactory1")) {
-            IDXGIFactory1* f = nullptr;
-            if (SUCCEEDED(cf(__uuidof(IDXGIFactory1), (void**)&f))) {
-                IDXGIAdapter1* a = nullptr;
-                for (UINT i = 0; f->EnumAdapters1(i, &a) != DXGI_ERROR_NOT_FOUND; i++) {
-                    DXGI_ADAPTER_DESC1 d; a->GetDesc1(&d); a->Release();
-                    if (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
-                    size_t mem = d.DedicatedVideoMemory;
-                    if (mem > vram || !vendor) {
-                        vram = mem; vendor = d.VendorId;
-                        WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, gpu, sizeof gpu, NULL, NULL);
-                    }
-                }
-                f->Release();
-            }
-        }
-    }
-    int cores = 0;
-    DWORD len = 0;
-    GetLogicalProcessorInformation(NULL, &len);
-    std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> lpi(len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) + 1);
-    if (len && GetLogicalProcessorInformation(lpi.data(), &len))
-        for (DWORD i = 0; i < len / sizeof lpi[0]; i++) cores += lpi[i].Relationship == RelationProcessorCore;
-    if (!cores) { SYSTEM_INFO si; GetSystemInfo(&si); cores = (int)si.dwNumberOfProcessors; }
-    const int sh = GetSystemMetrics(SM_CYSCREEN);
-    const double gb = vram / (1024.0 * 1024.0 * 1024.0);
-    const bool rtx = vendor == 0x10DE && strstr(gpu, "RTX");
+    Setting s{ key, title, help, std::move(choices), def };
+    s.env = env; s.section = section; s.only_renderer = only_renderer;
+    for (size_t i = 0; i < tiers.size() && i < 4; i++) s.tier_val[i] = tiers[i];
+    g_set.push_back(std::move(s));
+}
+static void register_options()
+{
+    // GRAPHICS QUALITY (game-side quality patches: LOD, shadows, FOV, post effects) and
+    // RENDERER QUALITY (renderer switches) are added here as they land.
+    add_option(SEC_GAME_QUALITY, "fov", "Field of view  (experimental)",
+               "Widens the view: the community \"Extended FOV\" patch for Resistance 3. Lower numbers show more "
+               "of the scene. Experimental: effects and shadows near the screen edges can be slightly off.",
+               "R2_PATCH_FOV_VALUE", { {"Original", ""}, {"Wider  (0.85)", "0.85"}, {"Widest  (0.7)", "0.7"} }, 0);
+}
+static const char* g_section_name[] = { "", "GRAPHICS QUALITY", "RENDERER QUALITY", "PC", "AIMING AND STICKS" };
 
-    auto pick = [](int s, const char* v) {
-        for (size_t i = 0; i < g_set[s].choices.size(); i++) if (!strcmp(g_set[s].choices[i].value, v)) g_set[s].def = (int)i;
-    };
-    // render resolution never above the screen, except RTX cards (DLSS Performance from 4K)
-    const char* screen_res = sh >= 2160 ? "3" : sh >= 1800 ? "2.5" : sh >= 1440 ? "2" : sh >= 1080 ? "1.5" : "1";
-    if (gb < 1.5) {              // integrated / very old: PS3 resolution, no extra AA cost, 30 fps
-        pick(S_RES, "1"); pick(S_FSR, "0"); pick(S_ANISO, "0"); pick(S_FPS, "30");
-    } else if (gb < 3.5) {       // GTX 750 Ti / 950 / 1050, RX 460 / 560 class
-        pick(S_RES, sh >= 1080 ? "1.5" : "1"); pick(S_FSR, "0"); pick(S_ANISO, "4");
-    } else if (rtx) {            // RTX: DLSS Performance from 4K (shipping default)
-        pick(S_RES, "3"); pick(S_FSR, "2"); pick(S_UPSCALE, "0.5"); pick(S_ANISO, "16");
-    } else if (gb < 7.0) {       // GTX 1060 / 1650 / RX 570-590 class
-        pick(S_RES, sh >= 1440 ? "2" : screen_res); pick(S_FSR, "1"); pick(S_UPSCALE, "0.667"); pick(S_ANISO, "8");
-    } else {
-        pick(S_RES, screen_res); pick(S_FSR, "1"); pick(S_UPSCALE, "1"); pick(S_ANISO, "16");
+// PC-port behaviour (Display page, "PC" section). Kept apart from register_options() (graphics).
+static BOOL CALLBACK pc_mon_enum(HMONITOR m, HDC, LPRECT, LPARAM lp)
+{
+    auto* out = (std::vector<Choice>*)lp;
+    MONITORINFOEXA mi; mi.cbSize = sizeof mi;
+    char label[96];
+    const int n = (int)out->size();               // 1-based: choice 0 is "Primary"
+    if (GetMonitorInfoA(m, &mi))
+        snprintf(label, sizeof label, "Monitor %d  (%ldx%ld%s)", n, mi.rcMonitor.right - mi.rcMonitor.left,
+                 mi.rcMonitor.bottom - mi.rcMonitor.top, (mi.dwFlags & MONITORINFOF_PRIMARY) ? ", primary" : "");
+    else snprintf(label, sizeof label, "Monitor %d", n);
+    char num[8]; snprintf(num, sizeof num, "%d", n);
+    out->push_back({ _strdup(label), _strdup(num) });
+    return TRUE;
+}
+static void register_pc_options()
+{
+    std::vector<Choice> mons = { {"Primary monitor", ""} };
+    EnumDisplayMonitors(NULL, NULL, pc_mon_enum, (LPARAM)&mons);
+    add_option(SEC_PC, "monitor", "Monitor",
+               "Which screen the game opens on (borderless fullscreen and windowed). Numbered in Windows' order.",
+               "RSX_MONITOR", std::move(mons), 0);
+    add_option(SEC_PC, "background", "When the game is in the background",
+               "What happens when you Alt+Tab away or click another window. Pause freezes the game and mutes it; "
+               "Mute keeps it running silently; Keep running changes nothing.",
+               "R2_BACKGROUND", { {"Pause and mute", ""}, {"Mute only", "mute"}, {"Keep running", "run"} }, 0);
+    add_option(SEC_PC, "skipintro", "Skip intro movies",
+               "Skips the studio logo video and the opening movie at start-up "
+               "(the game goes straight to the title screen).",
+               "SKIP_INTRO", { {"On", ""}, {"Off", "0"} }, 0);
+    add_option(SEC_PC, "menufps", "Frame rate in menus",
+               "Caps the frame rate whenever you are not in control of your character (menus, loading screens, "
+               "cutscenes) to save power and heat. Gameplay keeps the Frame rate setting.",
+               "PORT_MENU_FPS", { {"Same as in game", ""}, {"60 fps", "60"}, {"30 fps", "30"} }, 0);
+    add_option(SEC_PC, "padglyphs", "Controller button prompts",
+               "Which button names the game shows while you play with a controller. Auto shows PlayStation "
+               "symbols when a DualShock / DualSense is plugged in and Xbox buttons (A B X Y, LB RB...) otherwise. "
+               "With keyboard and mouse the prompts always show your keys. Keyboard keys shows your keys even "
+               "with a controller.",
+               "R2_PAD_GLYPHS", { {"Auto", ""}, {"Xbox", "xbox"}, {"PlayStation", "ps"}, {"Keyboard keys", "keys"} }, 0);
+    add_option(SEC_PC, "present", "Presentation mode",
+               "How finished frames reach the screen. Default follows VSync. Immediate (VRR) never waits - best with "
+               "G-Sync / FreeSync and an uncapped or Just under refresh frame rate. Mailbox shows the newest frame "
+               "without tearing. FIFO is classic VSync. Compatible renderer only.",
+               "R2_PRESENT", { {"Default  (follow VSync)", ""}, {"Immediate  (VRR / tearing)", "immediate"},
+                               {"Mailbox  (no tearing, low lag)", "mailbox"}, {"FIFO  (VSync)", "fifo"} }, 0, {}, "rpcs3");
+    add_option(SEC_PC, "overlay", "Performance overlay",
+               "Frame rate, frame time and GPU draw statistics in a corner of the game window. F3 shows or hides it "
+               "in game. Not visible in exclusive fullscreen.",
+               "R2_OVERLAY", { {"Off  (F3 shows it)", ""}, {"On at start", "1"}, {"Disabled  (F3 does nothing)", "0"} }, 0);
+    add_option(SEC_PC, "trophytoast", "Trophy notifications",
+               "A small notification in the corner of the game window when you earn a trophy. Trophies are always "
+               "recorded (see the Trophies page).",
+               "R2_TROPHY_TOAST", { {"On", ""}, {"Off", "0"} }, 0);
+    add_option(SEC_PC, "mods", "Mods folder",
+               "Loads replacement game files from the mods folder next to the game: mods\\<mod name>\\USRDIR\\... "
+               "replaces the same file under the game's PS3_GAME folder. The replaced files are listed in logs\\run.log.",
+               "R2_MODS", { {"Off", ""}, {"On", "1"} }, 0);
+}
+// Controls page, "AIMING AND STICKS"
+static void register_input_options()
+{
+    add_option(SEC_INPUT, "msensy", "Vertical mouse sensitivity",
+               "Up / down mouse speed relative to left / right (the Sensitivity slider above).",
+               "PAD_MOUSE_SENS_Y", { {"Same as horizontal", ""}, {"50%", "0.5"}, {"75%", "0.75"}, {"125%", "1.25"},
+                                     {"150%", "1.5"}, {"200%", "2"} }, 0);
+    add_option(SEC_INPUT, "adssens", "Aiming sensitivity",
+               "Mouse speed while aiming down the sights or through a scope, relative to the hip-fire speed "
+               "(on top of the game's own zoom slowdown).",
+               "R2_ADS_SENS", { {"Game default", ""}, {"50%", "0.5"}, {"75%", "0.75"}, {"125%", "1.25"}, {"150%", "1.5"} }, 0);
+    add_option(SEC_INPUT, "aimtoggle", "Aim mode",
+               "Hold: aim while the Aim key / left bumper is held (PS3 original). Toggle: press once to aim, again to "
+               "stop. Keyboard, mouse and controller.",
+               "PAD_AIM_TOGGLE", { {"Hold", ""}, {"Toggle", "1"} }, 0);
+    add_option(SEC_INPUT, "deadzone", "Stick deadzone",
+               "How far a controller stick must move before it counts. Smaller is more responsive; larger hides "
+               "stick drift. Default is the XInput standard, applied per axis.",
+               "PAD_DEADZONE", { {"Default", ""}, {"Small  (8%)", "0.08"}, {"Medium  (15%)", "0.15"},
+                                 {"Large  (25%)", "0.25"}, {"Very large  (35%)", "0.35"} }, 0);
+    add_option(SEC_INPUT, "curve", "Stick response curve",
+               "How stick travel maps to speed. Linear is direct; Precise is slow near the centre for fine aim; "
+               "Fast reaches full speed sooner.",
+               "PAD_CURVE", { {"Default", ""}, {"Linear", "1"}, {"Precise", "1.6"}, {"Very precise", "2.2"}, {"Fast", "0.7"} }, 0);
+}
+
+static char g_dir[MAX_PATH];
+static std::string g_hw_desc = "default settings";   // the detected hardware
+static std::string g_rec_desc;                       // what was recommended for it
+static r2ac::Hardware g_hwi;
+static r2ac::Settings g_rec;
+static bool g_detected = false;
+
+// Test hooks (--detect / --table): override what detect() found.
+static void apply_sim(r2ac::Hardware& h, const char* cmd)
+{
+    if (!cmd) return;
+    auto arg = [&](const char* k) -> const char* { const char* p = strstr(cmd, k); return p ? p + strlen(k) : nullptr; };
+    if (const char* p = arg("--sim-gpu ")) {
+        char b[128] = {}; const char* e;
+        if (*p == '"') { p++; e = strchr(p, '"'); } else e = strchr(p, ' ');
+        size_t n = e ? (size_t)(e - p) : strlen(p); if (n >= sizeof b) n = sizeof b - 1;
+        memcpy(b, p, n); strcpy_s(h.gpu, b);
+        h.vendor = r2ac::has(b, "NVIDIA") || r2ac::has(b, "GeForce") ? 0x10DE : r2ac::has(b, "AMD") || r2ac::has(b, "Radeon") ? 0x1002
+                 : r2ac::has(b, "Intel") ? 0x8086 : 0;
     }
-    if (cores < 4) pick(S_FPS, "30");   // 60 fps doubles the game's CPU work
-    char b[256];
-    snprintf(b, sizeof b, "%s, %.0f GB video memory, %d CPU cores.", gpu, gb, cores);
-    g_hw_desc = b;
+    if (const char* p = arg("--sim-vram ")) h.vram_gb = atof(p);
+    if (const char* p = arg("--sim-cores ")) { h.cores = atoi(p); h.pcores = h.ecores = 0; if (h.threads < h.cores) h.threads = h.cores; }
+    if (const char* p = arg("--sim-threads ")) h.threads = atoi(p);
+    if (const char* p = arg("--sim-screen ")) { h.screen_w = atoi(p); if (const char* x = strchr(p, 'x')) h.screen_h = atoi(x + 1); }
+    if (const char* p = arg("--sim-hz ")) h.refresh = atoi(p);
+}
+
+static void pick(int s, const char* v)
+{
+    for (size_t i = 0; i < g_set[s].choices.size(); i++) if (!strcmp(g_set[s].choices[i].value, v)) g_set[s].def = (int)i;
+}
+
+// Recommended defaults from the hardware (project/r2_autoconfig.h, shared with the game's R2_PRESET):
+// the GPU the renderer will use (discrete before integrated), the CPU's cores and threads, and the
+// primary screen's resolution and refresh rate. Sets each Setting's def.
+static void detect_hardware(const char* sim = nullptr)
+{
+    g_hwi = r2ac::Hardware();
+    r2ac::detect(g_hwi);
+    if (sim && strstr(sim, "--sim-")) { apply_sim(g_hwi, sim); r2ac::classify(g_hwi); }
+    g_rec = r2ac::recommend(g_hwi);
+    pick(S_DISPLAY, "borderless");
+    pick(S_WINDOW, g_rec.window);
+    pick(S_FPS, g_rec.fps);
+    pick(S_VSYNC, g_rec.vsync);
+    pick(S_RES, g_rec.res);
+    pick(S_FSR, g_rec.fsr);
+    pick(S_UPSCALE, !strcmp(g_rec.fsr, "0") ? "1" : g_rec.upscale);
+    pick(S_ANISO, g_rec.aniso);
+    pick(S_FILTER, g_rec.filter);
+    pick(S_SHARPEN, g_rec.sharpen);
+    pick(S_RENDERER, "rpcs3");         // Native Vulkan stays opt-in (experimental)
+    pick(S_CPU, g_rec.cpu);
+    pick(S_SHADER, g_rec.shader);
+    for (size_t i = S_COUNT; i < g_set.size(); i++)
+        if (const char* v = g_set[i].tier_val[g_rec.tier]) pick((int)i, v);
+    char b[512];
+    r2ac::describe_hw(g_hwi, b, sizeof b); g_hw_desc = b;
+    r2ac::describe(g_rec, b, sizeof b); g_rec_desc = b;
+    g_detected = true;
 }
 
 static std::string path_of(const char* name) { return std::string(g_dir) + "\\" + name; }
@@ -191,6 +340,7 @@ static void load_settings()
 }
 static const char* val(int i) { return g_set[i].choices[g_set[i].sel].value; }
 
+static void write_env(FILE* f);
 static bool save_settings()
 {
     FILE* f = fopen(path_of("settings.ini").c_str(), "w");
@@ -200,18 +350,31 @@ static bool save_settings()
     f = fopen(path_of("settings.bat").c_str(), "w");
     if (!f) return false;
     fprintf(f, "@echo off\nrem Written by Launcher.exe -- change these in the launcher.\n");
+    write_env(f);
+    fclose(f);
+    return true;
+}
+
+// the settings.bat lines for the current selection
+static void write_env(FILE* f)
+{
+    fprintf(f, "set \"R2_RSX=%s\"\n", val(S_RENDERER));
     fprintf(f, "set \"RSX_DISPLAY=%s\"\n", val(S_DISPLAY));
     fprintf(f, "set \"RSX_WINDOW=%s\"\n", val(S_WINDOW));
     fprintf(f, "set \"RSX_RES_SCALE=%s\"\n", val(S_RES));
     fprintf(f, "set \"RSX_VSYNC=%s\"\n", val(S_VSYNC));
     fprintf(f, "set \"R2_FPS=%s\"\n", val(S_FPS));
+    fprintf(f, "set \"PORT_CPU_PROFILE=%s\"\n", val(S_CPU));
     fprintf(f, "set \"RSX_ANISO=%s\"\n", val(S_ANISO));
     fprintf(f, "set \"RSX_FILTER=%s\"\n", val(S_FILTER));
     fprintf(f, "set \"RSX_SHARPEN=%s\"\n", val(S_SHARPEN));
-    fprintf(f, "set \"RSX_FSR=%s\"\n", val(S_FSR));
+    // AMD FSR 3.1 is RSX_FSR=1 on the RPCS3 renderer and RSX_FSR=3 on the native Vulkan one (1 = FSR1 there).
+    const bool fsr3_native = !strcmp(val(S_RENDERER), "vulkan") && !strcmp(val(S_FSR), "1");
+    fprintf(f, "set \"RSX_FSR=%s\"\n", fsr3_native ? "3" : val(S_FSR));
     fprintf(f, "set \"RSX_UPSCALE=%s\"\n", g_set[S_FSR].sel ? val(S_UPSCALE) : "1");
-    fclose(f);
-    return true;
+    fprintf(f, "set \"R2_SHADER_MODE=%s\"\n", val(S_SHADER));
+    for (size_t i = S_COUNT; i < g_set.size(); i++)
+        if (g_set[i].env && *val((int)i)) fprintf(f, "set \"%s=%s\"\n", g_set[i].env, val((int)i));
 }
 
 // ===========================================================================
@@ -435,11 +598,11 @@ static std::string pretty(const std::string& k)
 // ===========================================================================
 // Drawing: palette, DPI, fonts
 // ===========================================================================
-static const Color C_SIDEBAR(255, 17, 18, 20), C_BG(255, 24, 25, 28), C_PANEL(255, 31, 33, 37),
-    C_CTL(255, 40, 43, 48), C_CTL_HOT(255, 52, 56, 62), C_BORDER(255, 58, 62, 69),
+static const Color C_SIDEBAR(255, 14, 17, 21), C_BG(255, 20, 24, 28), C_PANEL(255, 27, 32, 37),
+    C_CTL(255, 35, 42, 48), C_CTL_HOT(255, 46, 56, 63), C_BORDER(255, 52, 63, 71),
     C_TEXT(255, 236, 236, 236), C_DIM(255, 150, 156, 164), C_FAINT(255, 104, 110, 118),
-    C_ACCENT(255, 222, 130, 44), C_ACCENT_HOT(255, 240, 150, 62), C_ACCENT_DIM(255, 96, 62, 30),
-    C_ON_ACCENT(255, 24, 18, 12), C_WARN(255, 236, 190, 90);
+    C_ACCENT(255, 92, 214, 226), C_ACCENT_HOT(255, 140, 234, 242), C_ACCENT_DIM(255, 30, 78, 86),
+    C_ON_ACCENT(255, 8, 22, 26), C_WARN(255, 236, 160, 90);
 
 static double g_s = 1.0;                 // DPI scale
 static int S(double v) { return (int)lround(v * g_s); }
@@ -462,7 +625,8 @@ static void make_fonts()
     for (Font* f : all) delete f;
     if (!family_ok(L"Segoe UI")) { g_fam_ui = L"Tahoma"; }
     if (family_ok(L"Segoe UI Semibold")) g_fam_ui_semi = L"Segoe UI Semibold"; else g_fam_ui_semi = g_fam_ui;
-    if (family_ok(L"Bahnschrift SemiBold Condensed")) g_fam_title = L"Bahnschrift SemiBold Condensed";
+    // R3's look: the wide, squared Bahnschrift (R2's launcher uses the condensed cut)
+    if (family_ok(L"Bahnschrift SemiBold")) g_fam_title = L"Bahnschrift SemiBold";
     else if (family_ok(L"Bahnschrift")) g_fam_title = L"Bahnschrift";
     else g_fam_title = g_fam_ui_semi;
     const bool semi = g_fam_ui_semi != g_fam_ui;
@@ -530,8 +694,8 @@ struct Widget {
     std::string title, help;     // for the help strip
     bool disabled = false;
 };
-enum Page { P_DISPLAY, P_GRAPHICS, P_CONTROLS, P_ABOUT, P_COUNT };
-static const char* g_page_name[P_COUNT] = { "Display", "Graphics", "Controls", "About" };
+enum Page { P_DISPLAY, P_GRAPHICS, P_CONTROLS, P_TROPHIES, P_ABOUT, P_COUNT };
+static const char* g_page_name[P_COUNT] = { "Display", "Graphics", "Controls", "Trophies", "About" };
 static int g_page = P_DISPLAY;
 static std::vector<Widget> g_w;
 static float g_scroll[P_COUNT], g_content_h = 0;
@@ -548,7 +712,7 @@ static int g_drag = 0;                   // slider being dragged
 // toggles
 enum { TG_INVERT = 1 };
 // buttons
-enum { BT_RESET_CTL = 1, BT_RESET_GFX, BT_FOLDER, BT_LOGS, BT_WEB, BT_CONTROLS_TXT };
+enum { BT_RESET_CTL = 1, BT_RESET_GFX, BT_FOLDER, BT_LOGS, BT_WEB, BT_CONTROLS_TXT, BT_SAVES, BT_SHOTS, BT_RESET_ALL };
 // key capture
 static int g_cap_a = -1, g_cap_k = -1;   // action/slot being captured (-2 = mouse release key)
 static std::wstring g_toast; static DWORD g_toast_until = 0;
@@ -573,6 +737,8 @@ static int dd_sel(int kind, int idx)
     if (kind == DD_PADINT) return g_padint;
     return g_mdirect ? 0 : 1;
 }
+// the choice detect_hardware() recommends for this PC
+static bool dd_recommended(int kind, int idx, int i) { return kind == DD_SETTING && g_detected && i == g_set[idx].def; }
 static void dd_set(int kind, int idx, int i)
 {
     if (kind == DD_SETTING) { g_set[idx].sel = i; save_settings(); }
@@ -581,7 +747,7 @@ static void dd_set(int kind, int idx, int i)
 }
 
 // ---- layout ---------------------------------------------------------------
-static const float SIDEBAR = 236, PAD = 40, FOOT = 76, ROWH = 52, CTLW = 300;
+static const float SIDEBAR = 236, PAD = 40, FOOT = 76, ROWH = 52, CTLW = 340;
 
 static Widget& add(WType t, RectF r, int id = 0, int sub = 0, bool scroll = true)
 {
@@ -592,20 +758,101 @@ struct Lay { float x, y, w; };          // content coordinates (unscrolled), uns
 
 struct Deco { int kind; RectF r; std::string s; };      // labels and headings (painted, not hit)
 static std::vector<Deco> g_deco;
-enum { D_H1, D_INTRO, D_H2, D_LABEL, D_LABEL_DIM, D_GROUP, D_NOTE, D_ABOUT_TITLE, D_ABOUT_TEXT, D_KEYCOL };
+enum { D_H1, D_INTRO, D_H2, D_LABEL, D_LABEL_DIM, D_GROUP, D_NOTE, D_ABOUT_TITLE, D_ABOUT_TEXT, D_KEYCOL, D_PANEL, D_REC };
 
 static void deco(int kind, RectF r, const std::string& s) { g_deco.push_back({ kind, r, s }); }
 
 static void layout_setting_row(float x, float& y, float w, int si)
 {
     Setting& s = g_set[si];
-    const bool dis = (si == S_WINDOW && strcmp(val(S_DISPLAY), "windowed") != 0);
+    const bool dis = (si == S_WINDOW && strcmp(val(S_DISPLAY), "windowed") != 0) ||
+                     (si == S_UPSCALE && g_set[S_FSR].sel == 0) ||
+                     (si == S_SHADER && strcmp(val(S_RENDERER), "rpcs3") != 0) ||
+                     (s.only_renderer && strcmp(val(S_RENDERER), s.only_renderer) != 0);
     Widget& row = add(W_ROW, RectF(x - SF(12), y, w + SF(24), SF(ROWH)), si);
     row.title = s.title; row.help = s.help; row.disabled = dis;
     deco(dis ? D_LABEL_DIM : D_LABEL, RectF(x, y, w - SF(CTLW) - SF(16), SF(ROWH)), s.title);
     Widget& d = add(W_DROP, RectF(x + w - SF(CTLW), y + SF(9), SF(CTLW), SF(ROWH - 18)), DD_SETTING, si);
     d.title = s.title; d.help = s.help; d.disabled = dis;
     y += SF(ROWH);
+}
+
+// the data-driven options of one section (add_option), under their heading; nothing when there are none
+static void layout_section(float x, float& y, float w, int section)
+{
+    bool head = false;
+    for (size_t i = S_COUNT; i < g_set.size(); i++) {
+        if (g_set[i].section != section) continue;
+        if (!head) { y += SF(18); deco(D_H2, RectF(x, y, w, SF(22)), g_section_name[section]); y += SF(26); head = true; }
+        layout_setting_row(x, y, w, (int)i);
+    }
+}
+
+// differs from the recommendation (the window size and display mode are personal taste)
+static bool differs_from_recommended()
+{
+    for (size_t i = 0; i < g_set.size(); i++)
+        if (i != S_DISPLAY && i != S_WINDOW && g_set[i].section != SEC_PC && g_set[i].section != SEC_INPUT && g_set[i].sel != g_set[i].def) return true;
+    return false;
+}
+
+// "Recommended for your PC": what was detected, what it recommends, and the button that applies it
+static void layout_recommend_panel(float x, float& y, float w)
+{
+    const float top = y;
+    deco(D_PANEL, RectF(x - SF(12), top, w + SF(24), SF(150)), "");
+    y += SF(12);
+    deco(D_H2, RectF(x, y, w, SF(22)), "RECOMMENDED FOR YOUR PC"); y += SF(26);
+    deco(D_REC, RectF(x, y, w, SF(24)), g_rec_desc); y += SF(26);
+    deco(D_NOTE, RectF(x, y, w, SF(36)), g_hw_desc); y += SF(40);
+    Widget& b = add(W_BUTTON, RectF(x, y, SF(250), SF(36)), BT_RESET_GFX);
+    b.title = "Auto-detect (recommended)";
+    b.help = "Detects your graphics card, processor and screen again and resets Display and Graphics to the "
+             "settings recommended for them (also the first-run defaults). Controls are not changed.";
+    deco(D_LABEL_DIM, RectF(x + SF(266), y, w - SF(266), SF(36)),
+         differs_from_recommended() ? "Your settings differ from the recommendation." : "Using the recommended settings.");
+    y = top + SF(150) + SF(22);
+}
+
+// ---- Trophies page: the game's trophy list (its TROPHY.TRP, read from gamefiles) and the unlocks the game
+// recorded (gamedata\\trophies\\<id>.json and Saved Games\\Resistance 3\\trophies.json, project/r3_trophies.cpp).
+static std::vector<r2t::Trophy> g_troph;
+static std::string g_troph_status;
+static DWORD g_troph_loaded = 0;
+static void load_trophies()
+{
+    if (g_troph_loaded && GetTickCount() - g_troph_loaded < 3000) return;
+    g_troph_loaded = GetTickCount();
+    g_troph.clear();
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(path_of("gamefiles\\PS3_GAME\\TROPDIR\\*").c_str(), &fd);
+    std::string comm;
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if ((fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && fd.cFileName[0] != '.') { comm = fd.cFileName; break; }
+        } while (FindNextFileA(h, &fd));
+        FindClose(h);
+    }
+    if (comm.empty() || !r2t::load_trp(path_of(("gamefiles\\PS3_GAME\\TROPDIR\\" + comm + "\\TROPHY.TRP").c_str()).c_str(), g_troph)) {
+        g_troph_status = "The trophy list is read from the game's files (gamefiles\\PS3_GAME\\TROPDIR) after Setup.";
+        return;
+    }
+    if (comm.size() > 3 && comm.compare(comm.size() - 3, 3, "_00") == 0) comm.resize(comm.size() - 3);
+    const char* gd = getenv("PS3_GAMEDATA_ROOT");
+    const std::string hle = (gd && *gd ? std::string(gd) : path_of("gamedata")) + "\\trophies\\" + comm + ".json";
+    r2t::merge_json_times(hle.c_str(), g_troph);
+    PWSTR sg = nullptr;
+    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_SavedGames, 0, nullptr, &sg)) && sg) {
+        char b[MAX_PATH * 3];
+        if (WideCharToMultiByte(CP_UTF8, 0, sg, -1, b, sizeof b, nullptr, nullptr) > 0)
+            r2t::merge_json_times((std::string(b) + "\\Resistance 3\\trophies.json").c_str(), g_troph);
+    }
+    if (sg) CoTaskMemFree(sg);
+    int n = 0;
+    for (auto& t : g_troph) n += t.unlocked != 0;
+    char b[128];
+    snprintf(b, sizeof b, "%d of %d unlocked", n, (int)g_troph.size());
+    g_troph_status = b;
 }
 
 static void layout()
@@ -631,6 +878,7 @@ static void layout()
         deco(D_INTRO, RectF(x, y, w, SF(20)), disp ? "How the game window looks and how fast it runs."
                                                   : "Image quality. Higher settings look better and cost more GPU time.");
         y += SF(40);
+        layout_recommend_panel(x, y, w);
         if (disp) {
             deco(D_H2, RectF(x, y, w, SF(22)), "SCREEN"); y += SF(26);
             layout_setting_row(x, y, w, S_DISPLAY);
@@ -639,6 +887,8 @@ static void layout()
             deco(D_H2, RectF(x, y, w, SF(22)), "FRAME RATE"); y += SF(26);
             layout_setting_row(x, y, w, S_FPS);
             layout_setting_row(x, y, w, S_VSYNC);
+            layout_setting_row(x, y, w, S_CPU);
+            layout_section(x, y, w, SEC_PC);
         } else {
             deco(D_H2, RectF(x, y, w, SF(22)), "RESOLUTION"); y += SF(26);
             layout_setting_row(x, y, w, S_RES);
@@ -649,11 +899,12 @@ static void layout()
             layout_setting_row(x, y, w, S_FSR);
             layout_setting_row(x, y, w, S_UPSCALE);
             layout_setting_row(x, y, w, S_ANISO);
-            y += SF(26);
-            Widget& b = add(W_BUTTON, RectF(x, y, SF(210), SF(38)), BT_RESET_GFX);
-            b.title = "Recommended for this PC"; b.help = "Picks Display and Graphics settings for your graphics card, "
-                "screen and processor (these are also the first-run defaults).";
-            y += SF(38);
+            layout_section(x, y, w, SEC_GAME_QUALITY);
+            y += SF(18);
+            deco(D_H2, RectF(x, y, w, SF(22)), "RENDERER"); y += SF(26);
+            layout_setting_row(x, y, w, S_RENDERER);
+            layout_setting_row(x, y, w, S_SHADER);
+            layout_section(x, y, w, SEC_RENDER_QUALITY);
         }
     } else if (g_page == P_CONTROLS) {
         deco(D_H1, RectF(x, y, w, SF(34)), "Controls"); y += SF(36);
@@ -728,6 +979,7 @@ static void layout()
         deco(D_NOTE, RectF(x, y, w, SF(40)), "Controllers work automatically. Their buttons are set in the game's "
                                              "own Options \xE2\x80\xBA Controls screen.");
         y += SF(44);
+        layout_section(x, y, w, SEC_INPUT);
         y += SF(26);
         Widget& b = add(W_BUTTON, RectF(x, y, SF(210), SF(38)), BT_RESET_CTL);
         b.title = "Restore default controls"; b.help = "Puts every key, mouse and controller option back to its default.";
@@ -735,6 +987,28 @@ static void layout()
         b2.title = "Edit controls.txt"; b2.help = "Opens the controls file in Notepad, for anything the page doesn't cover "
                                                   "(one key pressing several buttons, for example).";
         y += SF(38);
+    } else if (g_page == P_TROPHIES) {
+        load_trophies();
+        deco(D_H1, RectF(x, y, w, SF(34)), "Trophies"); y += SF(36);
+        deco(D_INTRO, RectF(x, y, w, SF(20)), "Earned in game, kept on this PC (Saved Games\\Resistance 3\\trophies.json).");
+        y += SF(40);
+        deco(D_H2, RectF(x, y, w, SF(22)), g_troph_status); y += SF(34);
+        for (int pass = 0; pass < 2; pass++)          // unlocked first, then locked
+            for (const auto& t : g_troph) {
+                if ((t.unlocked != 0) != (pass == 0)) continue;
+                const bool secret = t.hidden && !t.unlocked;
+                std::string title = std::string(t.unlocked ? "\xE2\x9C\x93  " : "      ") + (secret ? "Hidden trophy" : t.name);
+                char when[64] = "Locked";
+                if (t.unlocked) { time_t tt = (time_t)t.unlocked; struct tm lt; localtime_s(&lt, &tt);
+                                  strftime(when, sizeof when, "Unlocked %Y-%m-%d", &lt); }
+                Widget& row = add(W_ROW, RectF(x - SF(12), y, w + SF(24), SF(48)), -200 - t.id);
+                row.title = secret ? "Hidden trophy" : t.name;
+                row.help = std::string(r2t::grade_name(t.grade)) + ". " + (secret ? "Its details show once you earn it." : t.detail);
+                deco(t.unlocked ? D_LABEL : D_LABEL_DIM, RectF(x, y, w - SF(260), SF(28)), title);
+                deco(D_LABEL_DIM, RectF(x + w - SF(250), y, SF(250), SF(28)), std::string(r2t::grade_name(t.grade)) + "  \xC2\xB7  " + when);
+                deco(D_NOTE, RectF(x + SF(26), y + SF(24), w - SF(26), SF(22)), secret ? "" : t.detail);
+                y += SF(50);
+            }
     } else {
         deco(D_H1, RectF(x, y, w, SF(34)), "About"); y += SF(44);
         deco(D_ABOUT_TITLE, RectF(x, y, w, SF(24)), "Resistance 3 \xE2\x80\x94 native PC port"); y += SF(30);
@@ -750,6 +1024,10 @@ static void layout()
         static const char* keys[][2] = {
             { "Alt + Enter", "Switch between windowed and fullscreen" },
             { "F8", "Free / capture the mouse cursor (changeable on the Controls page)" },
+            { "F10", "Quit to desktop (asks first; waits for a save in progress)" },
+            { "F3", "Show / hide the performance overlay" },
+            { "View + Menu", "Hold 1.5 s on a controller: quit to desktop (asks first)" },
+            { "F12 / PrtScn", "Screenshot (PNG in the screenshots folder)" },
         };
         for (auto& k : keys) {
             deco(D_LABEL, RectF(x, y, SF(130), SF(30)), k[0]);
@@ -762,6 +1040,20 @@ static void layout()
         b1.title = "Open game folder"; b1.help = "The port's folder: settings, controls.txt and the build.";
         Widget& b2 = add(W_BUTTON, RectF(x + SF(182), y, SF(150), SF(38)), BT_LOGS);
         b2.title = "Open logs"; b2.help = "Log files from the last run. Attach logs\\run.log when reporting a bug.";
+        y += SF(50);
+        Widget& b3 = add(W_BUTTON, RectF(x, y, SF(170), SF(38)), BT_SAVES);
+        b3.title = "Open save folder";
+        b3.help = "Your saved games: gamedata\\dev_hdd0\\home\\00000001\\savedata in the game folder. "
+                  "Copy this folder to back them up.";
+        Widget& b4 = add(W_BUTTON, RectF(x + SF(182), y, SF(190), SF(38)), BT_SHOTS);
+        b4.title = "Open screenshots"; b4.help = "Screenshots taken with F12 / PrtScn in game.";
+        y += SF(38);
+        y += SF(30);
+        deco(D_H2, RectF(x, y, w, SF(22)), "RESET"); y += SF(30);
+        Widget& b5 = add(W_BUTTON, RectF(x, y, SF(210), SF(38)), BT_RESET_ALL);
+        b5.title = "Reset all to defaults";
+        b5.help = "Puts every launcher setting back to its default: display and graphics (the recommendation for "
+                  "your PC), PC options, keys and mouse. Saved games are not touched.";
         y += SF(38);
     }
     g_content_h = y + SF(40);
@@ -794,17 +1086,34 @@ static int hit(float x, float y)
 }
 
 // ---- painting -------------------------------------------------------------
-// The sidebar art: the game's own key art (PS3_GAME\PIC1.PNG, a 1920x1080 picture copied from the
-// player's disc by Setup.bat; nothing from the game is shipped). Absent before Setup, then the plain
-// sidebar is drawn. The scaled, faded picture is kept between paints and redone when the size changes.
+// The sidebar art: an original picture (a ruined town at dusk under an alien spire's beam), drawn by
+// tools/art/make_r3_art.py and embedded as RCDATA 2 in launcher.rc. Nothing from the game is shipped.
+// The scaled, faded picture is kept between paints and redone when the size changes.
 static Bitmap* g_art;
 static Bitmap* g_art_scaled;
 static void load_art()
 {
-    const std::string p = path_of("gamefiles\\PS3_GAME\\PIC1.PNG");
-    Bitmap* b = Bitmap::FromFile(W(p).c_str());
-    if (b && b->GetLastStatus() == Ok && b->GetWidth() >= 1280 && b->GetHeight() >= 720) g_art = b;
-    else delete b;
+    HRSRC r = FindResourceA(nullptr, MAKEINTRESOURCEA(2), MAKEINTRESOURCEA(10) /* RT_RCDATA */);
+    if (!r) return;
+    const DWORD n = SizeofResource(nullptr, r);
+    HGLOBAL h = LoadResource(nullptr, r);
+    const void* src = h ? LockResource(h) : nullptr;
+    if (!src || !n) return;
+    HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, n);
+    if (!mem) return;
+    memcpy(GlobalLock(mem), src, n);
+    GlobalUnlock(mem);
+    IStream* st = nullptr;
+    if (FAILED(CreateStreamOnHGlobal(mem, TRUE, &st))) { GlobalFree(mem); return; }
+    Bitmap* b = Bitmap::FromStream(st);
+    // GDI+ may read the stream lazily: make a decoded copy and let the stream go
+    if (b && b->GetLastStatus() == Ok && b->GetWidth() >= 64 && b->GetHeight() >= 64) {
+        Bitmap* c = new Bitmap(b->GetWidth(), b->GetHeight(), PixelFormat32bppPARGB);
+        { Graphics cg(c); cg.DrawImage(b, 0, 0, b->GetWidth(), b->GetHeight()); }
+        g_art = c;
+    }
+    delete b;
+    st->Release();
 }
 static void draw_sidebar_art(Graphics& g, float sw, float ch)
 {
@@ -818,16 +1127,16 @@ static void draw_sidebar_art(Graphics& g, float sw, float ch)
         Graphics cg(g_art_scaled);
         cg.SetInterpolationMode(InterpolationModeHighQualityBicubic);
         cg.SetPixelOffsetMode(PixelOffsetModeHalf);
-        // the soldier's glowing eye and the side of his face (in 1920x1080 picture units), cropped to
-        // fill the area; a taller window shows more of the picture below
-        const float kx = g_art->GetWidth() / 1920.f, ky = g_art->GetHeight() / 1080.f;
-        float cw = 460, chh = cw * ah / aw;
-        if (chh > 950) { chh = 950; cw = chh * aw / ah; }
-        const float cx = 1230 - cw / 2, cy = 60;
+        // the spire and the town (in 480x1000 picture units), cropped to fill the area around the spire
+        // (x = 307), centred between the beam and the rooftops; a taller window shows more of both
+        const float kx = g_art->GetWidth() / 480.f, ky = g_art->GetHeight() / 1000.f;
+        float cw = 480, chh = cw * ah / aw;
+        if (chh > 1000) { chh = 1000; cw = chh * aw / ah; }
+        const float cx = std::min(480.f - cw, std::max(0.f, 307 - cw / 2)), cy = (1000 - chh) * 0.55f;
         ImageAttributes ia; ia.SetWrapMode(WrapModeTileFlipXY);   // no dark fringe at the edges
         cg.DrawImage(g_art, RectF(0, 0, (REAL)aw, (REAL)ah), cx * kx, cy * ky, cw * kx, chh * ky, UnitPixel, &ia);
         // darkened, and faded in from the sidebar's color under the menu
-        const float fade = SF(140), dark = 0.25f;
+        const float fade = SF(140), dark = 0.15f;
         for (int y = 0; y < ah; y++) {
             float a = std::min(1.f, y / fade);
             a = a * a * (3 - 2 * a);
@@ -899,6 +1208,8 @@ static void paint(HDC hdc)
         case D_NOTE: text(g, W(d.s), f_small, C_DIM, r, AL_L, false, true); break;
         case D_ABOUT_TITLE: text(g, W(d.s), f_btn, C_TEXT, r); break;
         case D_ABOUT_TEXT: text(g, W(d.s), f_body, C_DIM, r, AL_L, false, true); break;
+        case D_PANEL: fill_rr(g, r, SF(8), C_PANEL); break;
+        case D_REC: text(g, W(d.s), f_body, C_TEXT, r, AL_L, true, false); break;
         }
     }
     for (int i = 0; i < (int)g_w.size(); i++) {
@@ -912,8 +1223,12 @@ static void paint(HDC hdc)
             const bool open = g_dd.open && g_dd.kind == w.id && (w.id != DD_SETTING || g_dd.idx == w.sub);
             fill_rr(g, r, SF(6), w.disabled ? C_PANEL : (hot || open) ? C_CTL_HOT : C_CTL);
             if (open) stroke_rr(g, r, SF(6), C_ACCENT, SF(1.2));
-            const std::string lab = dd_label(w.id, w.sub, dd_sel(w.id, w.sub));
-            text(g, W(lab), f_body, w.disabled ? C_FAINT : C_TEXT, RectF(r.X + SF(14), r.Y, r.Width - SF(44), r.Height));
+            const int cur = dd_sel(w.id, w.sub);
+            const std::string lab = dd_label(w.id, w.sub, cur);
+            const bool rec = dd_recommended(w.id, w.sub, cur);
+            const float tagw = rec ? SF(96) : 0;
+            text(g, W(lab), f_body, w.disabled ? C_FAINT : C_TEXT, RectF(r.X + SF(14), r.Y, r.Width - SF(44) - tagw, r.Height));
+            if (rec) text(g, L"recommended", f_tiny, w.disabled ? C_FAINT : C_ACCENT, RectF(r.X + r.Width - SF(36) - tagw, r.Y, tagw, r.Height), AL_R);
             draw_chevron(g, r.X + r.Width - SF(20), r.Y + r.Height / 2, SF(5), w.disabled ? C_FAINT : C_DIM, open);
             break; }
         case W_SLIDER: {
@@ -1004,14 +1319,18 @@ static void paint(HDC hdc)
                 text(g, L"RESISTANCE", &fsmall, C_TEXT, RectF(SF(24), SF(34), SF(SIDEBAR - 30), SF(44)));
             } else text(g, L"RESISTANCE", f_title, C_TEXT, RectF(SF(24), SF(34), SF(SIDEBAR - 30), SF(44)));
         }
-        text(g, L"2", f_sub, C_ACCENT, RectF(SF(26), SF(76), SF(SIDEBAR - 30), SF(20)), AL_L, true);
+        {   // a cyan rule with the "3" set into it
+            SolidBrush rb(C_ACCENT_DIM); g.FillRectangle(&rb, SF(26), SF(86), SF(SIDEBAR - 56), SF(1.5));
+            SolidBrush cb(C_SIDEBAR); g.FillRectangle(&cb, SF(22), SF(74), SF(30), SF(24));
+            text(g, L"3", f_h1, C_ACCENT, RectF(SF(25), SF(72), SF(30), SF(28)), AL_L, true);
+        }
         text(g, L"PC port \x00B7 work in progress", f_tiny, C_FAINT, RectF(SF(26), SF(98), SF(SIDEBAR - 30), SF(18)));
         for (int i = 0; i < (int)g_w.size(); i++) {
             const Widget& w = g_w[i];
             if (w.t == W_NAV) {
                 const bool sel = w.id == g_page, hot = i == g_hot;
-                if (sel) fill_rr(g, w.r, SF(8), Color(255, 34, 36, 40));
-                else if (hot) fill_rr(g, w.r, SF(8), Color(255, 26, 28, 31));
+                if (sel) fill_rr(g, w.r, SF(8), Color(255, 28, 38, 44));
+                else if (hot) fill_rr(g, w.r, SF(8), Color(255, 22, 29, 34));
                 if (sel) fill_rr(g, RectF(w.r.X, w.r.Y + SF(10), SF(3), w.r.Height - SF(20)), SF(1.5), C_ACCENT);
                 text(g, W(w.title), f_nav, sel ? C_TEXT : hot ? Color(255, 205, 208, 212) : C_DIM,
                      RectF(w.r.X + SF(18), w.r.Y, w.r.Width - SF(18), w.r.Height));
@@ -1035,8 +1354,11 @@ static void paint(HDC hdc)
             RectF ir(lr.X + SF(4), lr.Y + SF(4) + i * g_dd.item_h, lr.Width - SF(8), g_dd.item_h);
             if (i == g_dd.hot) fill_rr(g, ir, SF(5), C_CTL_HOT);
             if (i == cur) fill_rr(g, RectF(ir.X + SF(4), ir.Y + ir.Height / 2 - SF(7), SF(3), SF(14)), SF(1.5), C_ACCENT);
+            const bool rec = dd_recommended(g_dd.kind, g_dd.idx, i);
+            const float tagw = rec ? SF(96) : 0;
             text(g, W(dd_label(g_dd.kind, g_dd.idx, i)), f_body, i == cur ? C_TEXT : Color(255, 214, 216, 220),
-                 RectF(ir.X + SF(16), ir.Y, ir.Width - SF(20), ir.Height));
+                 RectF(ir.X + SF(16), ir.Y, ir.Width - SF(20) - tagw, ir.Height));
+            if (rec) text(g, L"recommended", f_tiny, C_ACCENT, RectF(ir.X + ir.Width - SF(8) - tagw, ir.Y, tagw, ir.Height), AL_R);
         }
     }
 
@@ -1104,11 +1426,14 @@ static void capture_done(const char* key)
     invalidate();
 }
 
+static const char* g_cmd = nullptr;     // command line (the --sim-* test hooks apply to re-detection too)
+
 static void restore_graphics()
 {
+    detect_hardware(g_cmd);
     for (auto& s : g_set) s.sel = s.def;
     save_settings();
-    toast("Recommended settings for this PC applied: " + g_hw_desc);
+    toast("Recommended for your PC: " + g_rec_desc);
 }
 
 static void play()
@@ -1141,6 +1466,21 @@ static void click(int i, float x, float y)
         else if (w.id == BT_LOGS) { CreateDirectoryA(path_of("logs").c_str(), NULL);
                                     ShellExecuteA(g_hw, "open", path_of("logs").c_str(), NULL, NULL, SW_SHOWNORMAL); }
         else if (w.id == BT_CONTROLS_TXT) { ctl_save(); ShellExecuteA(g_hw, "open", "notepad.exe", path_of("controls.txt").c_str(), NULL, SW_SHOWNORMAL); }
+        else if (w.id == BT_SAVES) {
+            const char* p = getenv("PS3_GAMEDATA_ROOT");
+            std::string d = (p && *p) ? std::string(p) : path_of("gamedata");
+            for (const char* part : { "\\dev_hdd0", "\\home", "\\00000001", "\\savedata" }) {
+                d += part; CreateDirectoryA(d.c_str(), NULL);
+            }
+            ShellExecuteA(g_hw, "open", d.c_str(), NULL, NULL, SW_SHOWNORMAL);
+        } else if (w.id == BT_SHOTS) { CreateDirectoryA(path_of("screenshots").c_str(), NULL);
+                                       ShellExecuteA(g_hw, "open", path_of("screenshots").c_str(), NULL, NULL, SW_SHOWNORMAL); }
+        else if (w.id == BT_RESET_ALL) {
+            if (MessageBoxA(g_hw, "Put every launcher setting (display, graphics, PC options, keys and mouse) back to its "
+                            "default? Saved games are not touched.", "Reset", MB_YESNO | MB_ICONQUESTION) == IDYES) {
+                ctl_defaults(); ctl_save(); restore_graphics(); toast("Everything reset to defaults.");
+            }
+        }
         break;
     default: break;
     }
@@ -1282,7 +1622,64 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int show)
 
     GetModuleFileNameA(NULL, g_dir, MAX_PATH);
     if (char* sl = strrchr(g_dir, '\\')) *sl = 0;
-    detect_hardware();
+    g_cmd = cmd;
+    register_options();
+    register_pc_options();
+    register_input_options();
+    detect_hardware(cmd);
+    // non-interactive: "Launcher.exe --detect [--sim-gpu "name" --sim-vram GB --sim-cores N --sim-threads N
+    // --sim-screen WxH --sim-hz N]" prints what was detected and recommended; "--table" prints the mapping for
+    // a set of example PCs. Nothing is saved and no window opens.
+    if (cmd && (strstr(cmd, "--detect") || strstr(cmd, "--table"))) {
+        FILE* out = stdout;
+        if (!GetStdHandle(STD_OUTPUT_HANDLE) || GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) == FILE_TYPE_UNKNOWN) {
+            if (AttachConsole(ATTACH_PARENT_PROCESS)) freopen_s(&out, "CONOUT$", "w", stdout);
+        }
+        if (strstr(cmd, "--table")) {
+            struct Ex { const char* gpu; double vram; int cores, threads, w, h, hz; };
+            static const Ex ex[] = {
+                { "Intel(R) UHD Graphics 620", 0.5, 4, 4, 1920, 1080, 60 },
+                { "Intel(R) UHD Graphics 770", 0.5, 4, 8, 1920, 1080, 60 },
+                { "AMD Radeon(TM) 780M Graphics", 2, 8, 16, 1920, 1200, 120 },
+                { "NVIDIA GeForce GTX 1050 Ti", 4, 4, 4, 1920, 1080, 60 },
+                { "NVIDIA GeForce GTX 1650", 4, 4, 8, 1920, 1080, 60 },
+                { "AMD Radeon RX 580", 8, 6, 12, 1920, 1080, 60 },
+                { "NVIDIA GeForce GTX 1070", 8, 6, 12, 2560, 1440, 144 },
+                { "NVIDIA GeForce RTX 3050", 8, 6, 12, 1920, 1080, 144 },
+                { "NVIDIA GeForce RTX 2060", 6, 6, 12, 1920, 1080, 144 },
+                { "NVIDIA GeForce RTX 3060", 12, 6, 12, 2560, 1440, 144 },
+                { "NVIDIA GeForce RTX 3070", 8, 8, 16, 2560, 1440, 165 },
+                { "AMD Radeon RX 6700 XT", 12, 8, 16, 2560, 1440, 144 },
+                { "NVIDIA GeForce RTX 4060", 8, 8, 16, 1920, 1080, 144 },
+                { "NVIDIA GeForce RTX 4070", 12, 8, 16, 1920, 1080, 144 },
+                { "NVIDIA GeForce RTX 4070 SUPER", 12, 8, 16, 2560, 1440, 165 },
+                { "NVIDIA GeForce RTX 4080", 16, 8, 16, 2560, 1440, 240 },
+                { "NVIDIA GeForce RTX 3080", 10, 8, 16, 3840, 2160, 60 },
+                { "NVIDIA GeForce RTX 4090", 24, 16, 32, 3840, 2160, 144 },
+                { "AMD Radeon RX 7900 XTX", 24, 8, 16, 3840, 2160, 144 },
+                { "Intel(R) Arc(TM) A770 Graphics", 16, 6, 12, 2560, 1440, 60 },
+            };
+            for (const Ex& e : ex) {
+                r2ac::Hardware h;
+                strcpy_s(h.gpu, e.gpu);
+                h.vendor = r2ac::has(e.gpu, "NVIDIA") ? 0x10DE : r2ac::has(e.gpu, "AMD") ? 0x1002 : 0x8086;
+                h.vram_gb = e.vram; h.cores = e.cores; h.threads = e.threads; h.ram_gb = 16;
+                h.screen_w = e.w; h.screen_h = e.h; h.refresh = e.hz;
+                r2ac::classify(h);
+                r2ac::Settings s = r2ac::recommend(h);
+                char a[512], b[512];
+                r2ac::describe_hw(h, a, sizeof a); r2ac::describe(s, b, sizeof b);
+                fprintf(out, "%s\n    -> %s\n    [fps=%s res=%s fsr=%s upscale=%s aniso=%s filter=%s sharpen=%s cpu=%s shader=%s]\n",
+                        a, b, s.fps, s.res, s.fsr, s.upscale, s.aniso, s.filter, s.sharpen, s.cpu, s.shader);
+            }
+        } else {
+            for (auto& s : g_set) s.sel = s.def;
+            fprintf(out, "Detected:    %s\nRecommended: %s\n\nsettings.bat:\n", g_hw_desc.c_str(), g_rec_desc.c_str());
+            write_env(out);
+        }
+        fflush(out);
+        return 0;
+    }
     load_settings();
     ctl_load();
 
@@ -1293,7 +1690,7 @@ int WINAPI WinMain(HINSTANCE inst, HINSTANCE, LPSTR cmd, int show)
     wc.lpfnWndProc = wndproc; wc.hInstance = inst;
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
     wc.hIcon = LoadIcon(inst, MAKEINTRESOURCE(1)); if (!wc.hIcon) wc.hIcon = LoadIcon(NULL, IDI_APPLICATION);
-    wc.lpszClassName = "PortLauncher2";
+    wc.lpszClassName = "PortLauncher3";
     RegisterClassExA(&wc);
 
     make_scale(NULL);

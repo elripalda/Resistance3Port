@@ -255,10 +255,13 @@ int main(int argc, char** argv)
             check("TC8/9 FP MSL", g_msl, n == 8 ? "[[user(locn11)]]" : "[[user(locn12)]]");
     }
     {
-        u8 vp[16];
-        rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 15, 1);   /* MOV o15, v0, END */
+        /* MOV o0, v0 ; MOV o15, v0 (END). RPCS3 BuildCode NOPs a program
+         * that never writes o0, so the position write keeps o15 alive. */
+        u8 vp[32];
+        rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);
+        rsx_test_vp_mov_out(vp + 16, 0, RSX_TEST_VP_SWZ_IDENT, 15, 1);
         rsx_vp_decompile(vp, sizeof vp, g_hlsl, sizeof g_hlsl);
-        check("TC8 VP HLSL", g_hlsl, "Out.t8=o[15]; Out.t9=o[6];");
+        check("TC8 VP HLSL", g_hlsl, "Out.t8 = (_om & 4096u) != 0u ? o[15] : _d;");
         if (translate("TC8 VP", RSX_SHADER_STAGE_VERTEX) == 0)
             check("TC8 VP MSL", g_msl, "[[user(locn11)]]");
     }
@@ -394,8 +397,10 @@ int main(int argc, char** argv)
                                                                  g_hlsl, sizeof g_hlsl, NULL), 1);
         check("persp TEX FP HLSL", g_hlsl, "(input.tc0 * _rsx_inv_w(input.position))");
         if (translate("persp TEX FP", RSX_SHADER_STAGE_FRAGMENT) == 0) {
-            check("persp TEX FP MSL", g_msl, "gl_FragCoord.w");
-            check_absent("persp TEX FP MSL", g_msl, "1.0 / gl_FragCoord.w");
+            /* spirv-cross copies FragCoord into the input struct first. */
+            check("persp TEX FP MSL", g_msl, "_input.position = gl_FragCoord;");
+            check("persp TEX FP MSL", g_msl, "* _input.position.w)");
+            check_absent("persp TEX FP MSL", g_msl, "1.0 / _input.position.w");
         }
     }
 

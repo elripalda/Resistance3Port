@@ -7,6 +7,11 @@ project(${PORT_NAME}
     LANGUAGES C CXX
     DESCRIPTION "Recompiled PS3 game project (ps3recomp)"
 )
+# CMake 4.x routes .rc through clang-cl preprocessing (meant for llvm-rc); rc.exe rejects that output.
+if(WIN32 AND CMAKE_RC_COMPILER MATCHES "[/\\\\]rc\\.exe$")
+    set(CMAKE_DEPFILE_FLAGS_RC "")
+    set(CMAKE_RC_COMPILE_OBJECT "<CMAKE_RC_COMPILER> <DEFINES> <INCLUDES> <FLAGS> /fo <OBJECT> <SOURCE>")
+endif()
 
 # ---------------------------------------------------------------------------
 # Standards
@@ -77,6 +82,17 @@ message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 # imported one arrives without SDL2, pthreads, the Metal frameworks or the
 # Winsock/XInput imports -- the link then fails on every platform for a
 # different reason. add_subdirectory hands all of that over with the target.
+# Windows: the native Vulkan renderer (R2_RSX=vulkan). glslang (with HLSL
+# input) is linked from build_rpcs3 below; the runtime only needs headers.
+if(WIN32 AND EXISTS "${CMAKE_SOURCE_DIR}/../build_rpcs3/rpcs3_rsx.lib")
+    set(PS3RECOMP_RSX_VULKAN ON CACHE BOOL "" FORCE)
+    # FSR 3.1 (RSX_FSR=3): FidelityFX SDK 1.1.4 headers; build.bat copies the DLL.
+    set(PS3RECOMP_FFX_INCLUDE_DIR "${CMAKE_SOURCE_DIR}/../tools/ffx_vk/include" CACHE PATH "" FORCE)
+    set(PS3RECOMP_GLSLANG_INCLUDE_DIR
+        "${PS3RECOMP_DIR}/third_party/rpcs3/3rdparty/glslang/glslang"
+        "${PS3RECOMP_DIR}/third_party/rpcs3/3rdparty/glslang"
+        "${CMAKE_SOURCE_DIR}/../build_rpcs3/3rdparty/glslang/glslang/include")
+endif()
 add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp_sdk"
                  EXCLUDE_FROM_ALL)
 
@@ -178,6 +194,12 @@ endif()
 add_executable(${PROJECT_NAME}
     main.cpp
     stubs.cpp
+    r3_native_aa.cpp
+    r3_pcport.cpp
+    r3_patches.cpp
+    r3_pcfeat.cpp
+    r3_trophies.cpp
+    r3_mods.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
     ${RECOMP_SOURCES}

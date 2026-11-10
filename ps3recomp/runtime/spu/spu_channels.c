@@ -14,9 +14,19 @@
 
 #include "spu_dma.h"
 int ps3_host_prio_boost(void); /* sys_ppu_thread.c: 0 = low core count */
+extern volatile int g_ps3_host_paused; /* sys_ppu_thread.c: port pause, main thread parked */
+/* While the port has the game paused, every channel access is where an idle
+ * SPU poll loop spends its time: nap 1 ms every 32 accesses so a paused SPU
+ * idles instead of spinning a core, yet still makes (slow) progress. */
+#define SPU_PAUSE_POINT() do { \
+        if (__builtin_expect(g_ps3_host_paused, 0)) { \
+            static SPU_THREAD_LOCAL unsigned t_pause_n; \
+            if ((++t_pause_n & 31u) == 0) Sleep(1); \
+        } } while (0)
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
+#include "../syscalls/ps3_waitstat.h"   /* ps3_guest_mem_notify */
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
 #include <stdint.h>
@@ -813,6 +823,7 @@ static int s_llpoll_low = -1;
 static SPU_THREAD_LOCAL uint32_t t_llpoll_ea;
 static SPU_THREAD_LOCAL unsigned t_llpoll_same;
 static SPU_THREAD_LOCAL uint8_t t_llpoll_prev[MFC_ATOMIC_LINE];
+static SPU_THREAD_LOCAL unsigned t_llfast_run;   /* consecutive lock-free GETLLAR re-reads */
 
 static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
 {
@@ -982,8 +993,30 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * offer it the core BEFORE the read, so the line and the reservation
          * stay fresh (yielding between GETLLAR and PUTLLC widened the window
          * for a stale-data race and crashed R2's job kernel). */
-        if (s_llpoll_low < 0) s_llpoll_low = !ps3_host_prio_boost();
+        if (s_llpoll_low < 0) {
+            /* PS3_SPU_LLPOLL=1 forces the detection on (e.g. to test it on an
+             * oversubscribed many-core host), =0 off; unset = low-core only. */
+            const char* e = getenv("PS3_SPU_LLPOLL");
+            s_llpoll_low = (e && *e) ? atoi(e) != 0 : !ps3_host_prio_boost();
+        }
         if (s_llpoll_low && ea == t_llpoll_ea && t_llpoll_same >= 16) SwitchToThread();
+        /* Re-read of a line this SPU already holds: lock-free seqlock copy
+         * (spu_coherency.c). Same snapshot and reservation as the locked path. */
+        if (spu_coh_llar_fast(ctx, ea, ls)) {
+            ctx->dbg_getllar++;
+            /* GETLLAR polling backoff (SPU_FAST_LLPOLL=1, default OFF): a run
+             * of fast re-reads means nobody has written the line, so the SPU
+             * is spin-waiting; one pause per poll after a long run frees the
+             * SMT sibling. Off by default: it measurably slowed the poll
+             * (0.078 -> 0.124 us/op with 4 pauses after 32), and R2's job
+             * kernel waits in rdch RdEventStat (spu_ch_wait already pauses),
+             * not in a bare GETLLAR loop. */
+            { static int s_bo = -1;
+              if (__builtin_expect(s_bo < 0, 0)) { const char* e = getenv("SPU_FAST_LLPOLL"); s_bo = e ? atoi(e) != 0 : 0; }
+              if (s_bo && ++t_llfast_run >= 256u) _mm_pause(); }
+            goto getllar_done;
+        }
+        t_llfast_run = 0;
         spu_lockline_lock();
         /* Tell the PPU store paths this line is live, so a store into it goes
          * through the lock and raises SPU_EVENT_LR here instead of landing
@@ -1024,6 +1057,8 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
          * GETLLAR until that bit is set, and spun forever on 0. PUTLLUC is 2. */
         ctx->resv_ea = ea; ctx->resv_valid = 1; ctx->atomic_stat = 4;
         ctx->dbg_getllar++;
+        spu_lockline_unlock();
+    getllar_done:
         /* A GETLLAR re-issued millions of times on one line is an SPU spin-wait
          * that nobody is releasing (a ticket lock, a counter barrier). Say so
          * once per line with the line's head, so the stuck word is visible
@@ -1037,7 +1072,6 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
                       ctx->image_id, (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK, ea,
                       m[0],m[1],m[2],m[3], m[4],m[5],m[6],m[7], m[8],m[9],m[10],m[11], m[12],m[13],m[14],m[15]);
           } }
-        spu_lockline_unlock();
         /* Polling detection, part 2: count re-reads of an unchanged line. */
         if (s_llpoll_low) {
             if (ea == t_llpoll_ea && !memcmp(t_llpoll_prev, ls, MFC_ATOMIC_LINE)) t_llpoll_same++;
@@ -1202,6 +1236,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         if (ctx->atomic_stat == 0) {
             spu_taskset_line_committed(ea & ~127u);
             if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+            ps3_guest_mem_notify(ea & ~127u);   /* a PPU short-usleep poll re-checks now */
         }
         return 1;
 
@@ -1222,6 +1257,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
         if (_ptr) spu_phys_atomic(ctx, cmd, lsa, ea, 2, ls);
         spu_taskset_line_committed(ea & ~127u);
         if (g_spu_line_commit_hook) g_spu_line_commit_hook(ea & ~127u);
+        ps3_guest_mem_notify(ea & ~127u);
         return 1;
 
     default:
@@ -1248,6 +1284,7 @@ static int channel_is_mfc(uint32_t ch)
  * ===========================================================================*/
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 {
+    if (channel == MFC_Cmd) SPU_PAUSE_POINT();
     /* SPU_CHHIST=1: which channels a job actually touches, and how often. A
      * worker that never issues an MFC command is either not being handed its
      * work descriptor or is waiting on a channel we never satisfy; the channel
@@ -1259,6 +1296,17 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
               for (int i = 0; i < 128; i++) if (w[i])
                   fprintf(stderr, "   wrch ch%-3d %llu%c", i, w[i], 10); } } }
     uint32_t v = value._u32[0];  /* channel writes use the preferred slot */
+
+    /* Plain MFC parameter latches: no engine lookup, no dispatch. */
+    switch (channel) {
+    case MFC_LSA:       ctx->mfc_lsa = v;          return;
+    case MFC_EAH:       ctx->mfc_eah = v;          return;
+    case MFC_EAL:       ctx->mfc_eal = v;          return;
+    case MFC_Size:      ctx->mfc_size = v;         return;
+    case MFC_TagID:     ctx->mfc_tag = v & 0x1F;   return;
+    case MFC_WrTagMask: ctx->mfc_tag_mask = v;     return;
+    default: break;
+    }
 
     if (channel_is_mfc(channel)) {
         /* Atomic line ops (GETLLAR/PUTLLC/...) need real reservation semantics,
@@ -1322,7 +1370,7 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
     case SPU_WrDec:          ctx->decrementer = v;
                              ctx->dec_base_ns = spu_host_ns();              break;
     case SPU_WrEventMask:    ctx->event_mask = v;                           break; /* WrEventMask */
-    case SPU_WrEventAck:
+    case SPU_WrEventAck: {
         /* Under the lock-line lock, because every producer of the LR bit sets
          * it under that lock: the PPU coherent store, and a peer SPU's PUTLLC,
          * PUTLLUC or plain PUT. A bare read-modify-write here can read
@@ -1330,8 +1378,13 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
          * write the stale value back. The edge is then gone, and an SPU that
          * has just acknowledged the events it read goes back to sleep believing
          * it still holds a reservation it has already lost, which is the parked
-         * SPURS kernel this whole mechanism exists to wake. */
-        spu_lockline_lock();
+         * SPURS kernel this whole mechanism exists to wake.
+         * SPU_EVENT_CLEAR/SET are now interlocked AND/OR, which cannot lose a
+         * concurrent set, so the lock is no longer needed for that
+         * (SPU_FAST_ACK=0 takes it again). */
+        static int s_fast_ack = -1;
+        if (__builtin_expect(s_fast_ack < 0, 0)) { const char* e = getenv("SPU_FAST_ACK"); s_fast_ack = e ? atoi(e) != 0 : 1; }
+        if (!s_fast_ack) spu_lockline_lock();
         SPU_EVENT_CLEAR(ctx, v);
         /* Upstream 81344af also re-raised Sn here while list_stall_stat was
          * non-zero. R2's WWS handler acks Sn before reading RdListStallStat, so
@@ -1342,8 +1395,9 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
           if (guard < 0) { const char* e = getenv("SPU_SN_ACK_GUARD"); guard = e ? atoi(e) : 0; }
           if (guard && (v & 0x2u) && ctx->list_stall_stat) SPU_EVENT_SET(ctx, 0x2u); }
         if (v & 0x2u) spu_pmtrace(ctx, ctx->spu_id, 4, v, ctx->event_status, ctx->pc & SPU_LS_MASK);
-        spu_lockline_unlock();
+        if (!s_fast_ack) spu_lockline_unlock();
         break;
+    }
     case SPU_WrSRR0:         ctx->srr0 = v;                                 break;
     default:
         /* Unknown / unhandled channel write -- ignore (matches a no-op SPU). */
@@ -1423,9 +1477,9 @@ static void spu_dec_event_poll(spu_context* ctx)
     SPU_EVENT_SET(ctx, 0x20u);
 }
 
-static int spu_ch_ready(spu_context* ctx, uint32_t channel)
+static int spu_ch_ready_ex(spu_context* ctx, uint32_t channel, int dec_poll)
 {
-    if (channel == SPU_RdEventStat) { spu_resv_lost_poll(ctx); spu_dec_event_poll(ctx); }
+    if (channel == SPU_RdEventStat) { spu_resv_lost_poll(ctx); if (dec_poll) spu_dec_event_poll(ctx); }
     switch (channel) {
     case SPU_RdInMbox:      return ctx->rcv_evt_n != 0 || ctx->ch_in_mbox.count != 0;
     case SPU_RdSigNotify1:  return ctx->ch_sig_notify[0].count != 0;
@@ -1434,6 +1488,7 @@ static int spu_ch_ready(spu_context* ctx, uint32_t channel)
     default:                return 1;   /* non-blocking channels: always ready */
     }
 }
+static int spu_ch_ready(spu_context* ctx, uint32_t channel) { return spu_ch_ready_ex(ctx, channel, 1); }
 
 /* Signal the per-SPU wait CV so a blocked spu_rdch re-checks its predicate.
  * MUST be called by every producer AFTER it makes a read predicate true. */
@@ -1513,15 +1568,24 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
             s_low = !ps3_host_prio_boost();
         }
         if (s_spin_us > 0 && (s_spin_all || ctx->spu_id < 8u)) {
+            /* SPU_FAST_WAIT (default on): poll the predicate every 4 pauses
+             * instead of 24 (wake latency), and read the clock every 16th
+             * poll instead of every one -- QueryPerformanceCounter in this
+             * loop was ~10% of the raw SPU thread. Overshoot is a few us. */
+            static int s_fw = -1;
+            if (s_fw < 0) { const char* e = getenv("SPU_FAST_WAIT"); s_fw = e ? atoi(e) != 0 : 1; }
+            const int pauses = s_fw ? 4 : 24;
+            const unsigned clk_mask = s_fw ? 15u : 0u;
             LARGE_INTEGER q0, q; QueryPerformanceCounter(&q0);
             const LONGLONG lim = s_qf.QuadPart * s_spin_us / 1000000;
-            for (;;) {
+            for (unsigned it = 1;; it++) {
                 MemoryBarrier();
-                if (spu_ch_ready(ctx, channel)) break;
-                for (int k = 0; k < 24; k++) YieldProcessor();
+                if (spu_ch_ready_ex(ctx, channel, !(it & clk_mask))) break;
+                for (int k = 0; k < pauses; k++) YieldProcessor();
                 /* Low-core CPUs: the producer this SPU waits on may be queued
                  * behind us; offer the core (returns at once if nothing waits). */
                 if (s_low) SwitchToThread();
+                if (it & clk_mask) continue;
                 QueryPerformanceCounter(&q);
                 if (q.QuadPart - q0.QuadPart >= lim) break;
             }
@@ -1595,6 +1659,7 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
  * ===========================================================================*/
 u128 spu_rdch(spu_context* ctx, uint32_t channel)
 {
+    SPU_PAUSE_POINT();
     { static int s_c = -1; if (s_c < 0) { const char* e = getenv("SPU_CHHIST"); s_c = e ? (atoi(e) > 0 ? atoi(e) : 2000) : 0; }
       if (s_c) { static unsigned long long r[128]; static unsigned long long n;
           r[channel & 127]++;
@@ -1626,6 +1691,12 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
             (unsigned long long)s_c[8],(unsigned long long)s_c[9]); } }
 
     if (channel_is_mfc(channel)) {
+        switch (channel) {   /* plain state reads: no engine lookup */
+        case MFC_RdAtomicStat: return spu_make_preferred_u32(ctx->atomic_stat);
+        case MFC_RdTagStat:    return spu_make_preferred_u32(ctx->mfc_tag_status);
+        case MFC_RdTagMask:    return spu_make_preferred_u32(ctx->mfc_tag_mask);
+        default: break;
+        }
         v = mfc_channel_read(mfc_for(ctx), ctx, channel);
         return spu_make_preferred_u32(v);
     }
@@ -1687,6 +1758,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel)
  * ===========================================================================*/
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel)
 {
+    SPU_PAUSE_POINT();
     /* SPU_WHOPOLLS=<n>: rchcnt/park accounting PER SPU, printed every n calls
      * with the pc each SPU is sitting at.
      *
@@ -2570,11 +2642,13 @@ static spu_fn spu_pic_content_match(spu_context* ctx, uint32_t pc)
  * unrelated overlays using the same address. Registration precedes execution. */
 static struct { uint32_t entry; int image_id; } s_stack_reset[16];
 static unsigned s_stack_reset_count;
+volatile unsigned g_spu_stack_reset_n;
 void spu_register_stack_reset_entry(uint32_t entry, int image_id)
 {
     if (s_stack_reset_count < 16) {
         s_stack_reset[s_stack_reset_count].entry = entry & SPU_LS_MASK;
         s_stack_reset[s_stack_reset_count++].image_id = image_id;
+        g_spu_stack_reset_n = s_stack_reset_count;
     }
 }
 

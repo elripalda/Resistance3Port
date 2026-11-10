@@ -78,12 +78,28 @@ extern "C" {
 #define RSX_DSP_CLASS_STATE     1   /* decoded by a getter the pipeline uses */
 #define RSX_DSP_CLASS_EXEC      2   /* triggers an execution callback        */
 
-/* Cap on one INLINE_ARRAY stream. A stream is bounded by a single
- * BEGIN_END pair, and titles use inline arrays for small immediate-mode
- * batches (UI quads, debug geometry); 64 KB is several hundred vertices of
- * a fat format. Overruns are counted, not silently truncated -- half a
- * vertex stream is worse than no draw. */
+/* In-struct capacity of one INLINE_ARRAY stream. A stream is bounded by a
+ * single BEGIN_END pair, and titles use inline arrays for small
+ * immediate-mode batches (UI quads, debug geometry); 64 KB is several
+ * hundred vertices of a fat format. A longer stream moves to a grown heap
+ * buffer (RPCS3 keeps it in an unbounded simple_array, draw_call.hpp
+ * inline_vertex_array) up to RSX_DSP_GROW_MAX_BYTES; RSX_DSP_GROW=0 restores
+ * the old fixed cap. Overruns past the limit are counted, not silently
+ * truncated -- half a vertex stream is worse than no draw. */
 #define RSX_DSP_INLINE_MAX_BYTES 65536
+/* In-struct capacity of one ARRAY_ELEMENT16/32 index list (in indices); grows
+ * like the inline stream (RPCS3 m_element_push_buffer, RSXDrawCommands.cpp). */
+#define RSX_DSP_ELEMENT_MAX 16384
+#define RSX_DSP_GROW_MAX_BYTES (64u << 20)
+/* Pseudo-method (subchannel 7 method 0x1EB0, never a guest method: the FIFO
+ * walker drops it) that abandons the open draw without drawing it: RPCS3
+ * thread::recover_fifo -> discard_draw (RSXThread.cpp:1764-1771). */
+#define RSX_DSP_DISCARD_DRAW 0xFEB0u
+#define RSX_DSP_CLAUSE_MAX_RANGES   1024
+#define RSX_DSP_CLAUSE_MAX_BARRIERS 8192
+/* RPCS3 nv4097.h max_transform_constants: writes past it are NOPs. */
+#define RSX_DSP_MAX_TRANSFORM_CONSTANTS 468
+#define RSX_DSP_ELEMENT_DROPPED 0xFFFFFFFFu   /* elem_count after an overrun */
 
 typedef struct rsx_dispatch rsx_dispatch;
 
@@ -111,6 +127,15 @@ typedef struct rsx_dispatch_sink {
      * Snapshot the current attributes now; later register writes replace them.
      * Array formats, offsets and frequencies do not describe this stream. */
     void (*immediate_vertex)(void* user, const rsx_dispatch* rsx);
+    /* ARRAY_ELEMENT16/32 (0x180C/0x1810) inside BEGIN: indices pushed through
+     * the FIFO. RPCS3 draws them as a u32 indexed draw over the vertex arrays
+     * (draw_command_processor::append_array_element). Delivered at END. */
+    void (*array_elements)(void* user, const rsx_dispatch* rsx,
+                           const u32* indices, u32 count);
+    /* A NV4097 register (< 0x2000) took a value other than the one it held,
+     * already stored: RPCS3's method handlers compare against the latch. */
+    void (*reg_changed)(void* user, const rsx_dispatch* rsx, u32 method,
+                        u32 old_value, u32 new_value);
 } rsx_dispatch_sink;
 
 struct rsx_dispatch {
@@ -130,9 +155,11 @@ struct rsx_dispatch {
     u32 seen[RSX_DSP_NUM_REGS];       /* per-register write count           */
     u8  klass[RSX_DSP_NUM_REGS];      /* RSX_DSP_CLASS_*                    */
 
-    /* INLINE_ARRAY accumulation, reset at every BEGIN_END(prim). A fixed
-     * buffer rather than a grown allocation because rsx_dispatch_init
-     * memsets the whole struct, which would drop a pointer on the floor.
+    /* INLINE_ARRAY accumulation, reset at every BEGIN_END(prim). The first
+     * RSX_DSP_INLINE_MAX_BYTES live here; a longer stream is moved to a heap
+     * buffer owned by rsx_dispatch.c (not a pointer in this struct, because
+     * rsx_dispatch_init memsets the whole struct). Consumers get the bytes
+     * through the inline_array sink, never from this array directly.
      *
      * LAST on purpose. Sitting it next to current_primitive pushed seen[]
      * and klass[] 64 KB away from the register file, and those three are
@@ -140,11 +167,39 @@ struct rsx_dispatch {
      * emits no inline arrays at all, still lost an order of magnitude of
      * poll rate in the regression gate purely from the added stride. */
     u8  inline_data[RSX_DSP_INLINE_MAX_BYTES];
+
+    /* ARRAY_ELEMENT16/32 accumulation, reset at every BEGIN_END(prim). */
+    u32 elem_count;
+    u32 elem_dropped;                 /* lists lost to the cap              */
+    u32 elem_data[RSX_DSP_ELEMENT_MAX];
+
+    /* The draw clause, RPCS3 rsx::draw_clause: DRAW_ARRAYS/DRAW_INDEX_ARRAY
+     * ranges (merged when contiguous, de-duplicated and sorted by first
+     * since the last execution barrier) plus the deferred parameter writes
+     * (vertex/index base, array offsets, transform constant load/data) that
+     * arrived after the first range. Executed at END, one sub-draw per
+     * range, each barrier applied just before the range it precedes. */
+    u32 clause_command;               /* 0 none, 1 array, 2 indexed         */
+    u32 clause_n_ranges;
+    u32 clause_cur;                   /* current_range_index                */
+    u32 clause_last_exec;             /* last_execution_barrier_index       */
+    u32 clause_n_barriers;
+    u32 clause_overflows;
+    /* The clause executed by the last END. RPCS3 keeps it until the next
+     * valid BEGIN (draw_clause::reset), so an invalid BEGIN re-runs it. */
+    u32 clause_prev_command;
+    u32 clause_prev_n_ranges;
+    u32 clause_prev_n_barriers;
+    struct { u32 first, count; } clause_ranges[RSX_DSP_CLAUSE_MAX_RANGES];
+    struct { u32 draw_id, method, arg; } clause_barriers[RSX_DSP_CLAUSE_MAX_BARRIERS];
 };
 
 /* ---- lifecycle -------------------------------------------------------- */
 
 void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink);
+/* RPCS3 rsx_state::reset image (NV4097 registers), applied at init and by
+ * GCM_FLIP_COMMAND 0xFEAC (RSX_FLIP_RESET=0 disables the latter). */
+void rsx_dispatch_reset_state(rsx_dispatch* rsx);
 
 /* Seed the register file / transform program from a captured initial state.
  * No side effects, no callbacks — mirrors loading hardware context. */
@@ -250,6 +305,7 @@ typedef struct rsx_dsp_texture {
     u32 filter;          /* raw min/mag filter word (TEX_FILTER)            */
     u32 control0;        /* raw TEX_CONTROL0 word (enable[31], LOD fields)  */
     u32 border_color;
+    u32 border;          /* 1: border texels (FORMAT bit 3 clear, RPCS3 !border_type()) */
 } rsx_dsp_texture;
 void rsx_dsp_get_texture(const rsx_dispatch* rsx, u32 unit, rsx_dsp_texture* out);
 

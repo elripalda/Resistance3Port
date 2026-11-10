@@ -27,6 +27,7 @@ static PPU_TLS int     s_exit_armed = 0;
 #include <stdio.h>
 #include <stdlib.h>   /* getenv (else return value truncated to int on x64) */
 #include "ps3emu/log_first.h"
+#include "sys_timer.h"   /* ps3_waitstat */
 #ifndef _WIN32
 #include <errno.h>
 #endif
@@ -65,6 +66,11 @@ int ps3_host_prio_boost(void)
 }
 #endif
 
+/* Port pause (PC menu, window-in-background pause): set by the port while the
+ * game's main thread is parked at its frame boundary. SPU channel polls and the
+ * RSX FIFO-empty wait nap instead of spinning while it is set. */
+volatile int g_ps3_host_paused = 0;
+
 /* ---------------------------------------------------------------------------
  * Globals
  * -----------------------------------------------------------------------*/
@@ -82,6 +88,19 @@ unsigned long ppu_host_tid_by_name(const char* name)
             return (unsigned long)t->host_tid;
     }
     return 0;
+}
+
+/* The reverse, for the [thrcpu] per-thread CPU table (debugtools.inc): the
+ * guest name of the live PPU thread running on host thread `tid`, or NULL. */
+const char* ppu_name_by_host_tid(unsigned long tid)
+{
+    if (!tid) return NULL;
+    for (int i = 0; i < PPU_THREAD_MAX; i++) {
+        const ppu_thread_info* t = &g_ppu_threads[i];
+        if (t->state != PPU_THREAD_STATE_FREE && (unsigned long)t->host_tid == tid)
+            return t->name;
+    }
+    return NULL;
 }
 
 /* Diagnostic: for every live guest thread (other than the caller), suspend
@@ -820,6 +839,7 @@ static uint32_t g_cdl_v0, g_cdl_s0, g_cdl_s1, g_cdl_s6;
 
 int64_t sys_ppu_thread_yield(ppu_context* ctx)
 {
+    { ps3_waitstat* ws = ps3_waitstat_self(); if (ws) ws->yield_n++; }
     /* PS1_SPINWAIT=1: who is yielding, and what is it waiting for?
      *
      * The chain, established from lr + ctr on a caught stall: the interpreter

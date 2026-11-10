@@ -53,6 +53,18 @@ void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
+void rsx_draw_engine_range_read(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+void rsx_draw_engine_range_wrote(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+void rsx_draw_engine_range_will_write(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+void rsx_draw_engine_range_cpu_wrote(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+int rsx_draw_engine_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g_, u32 h, u32 i, u32 j,
+                         u32 k, u32 l, u32 m, u32 n, int lin, u32 iwh)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g_; (void)h; (void)i; (void)j;
+  (void)k; (void)l; (void)m; (void)n; (void)lin; (void)iwh; return 0; }
+int rsx_draw_engine_blit_swizzled(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g_, u32 h, u32 i,
+                                  u32 j, u32 k, int lin)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g_; (void)h; (void)i; (void)j;
+  (void)k; (void)lin; return 0; }
 int  rsx_live_draw_enabled(void) { return 0; }
 void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
 int  rsx_live_draw_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 w, u32 h)
@@ -72,7 +84,9 @@ int  rsx_live_draw_resolve_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g,
 #define IO_SIZE   0x00400000u
 #define CMD_SIZE  0x00080000u
 #define TITLE_CB  0x012D6A78u      /* a title function: its own buffer-full callback */
-#define LABEL     0x42u
+/* Resistance's flip-pacing label (offset 0x440): the one acquire that does not
+ * block unless PORT_FPS=orig, so the drain below runs through the wait. */
+#define LABEL     0x44u
 #define VALUE     7u
 
 static uint32_t g_heap = 0x00800000u;
@@ -137,11 +151,15 @@ int main(void)
     long p = GCM_PENDING_TAKE();
     check((p & 1) && !(p & 2), "a tick before the drain is a vblank, not a flip");
 
-    /* 3: the title flushes; the walker runs to put (the acquire does not block
-     * unless GCM_SEMA_ACQUIRE is set) and stops at the flip. */
+    /* 3: the title flushes; the walker runs to put (the flip-pacing acquire
+     * does not block unless PORT_FPS=orig) and stops at the flip. */
     vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io + 20);
+    for (u32 q = 0; q < 16u; q += 4u) vm_write32(GCM_LABEL_GUEST_BASE + GCM_LABEL_STRIDE + q, 0x11111111u);
     cellGcm_rsx_process_fifo();
     check(s_fifo_getoff == io + 20, "the drain consumed the wait and the flip");
+    check(!vm_read32(GCM_LABEL_GUEST_BASE + 0x10) && !vm_read32(GCM_LABEL_GUEST_BASE + 0x14) &&
+          !vm_read32(GCM_LABEL_GUEST_BASE + 0x18) && !vm_read32(GCM_LABEL_GUEST_BASE + 0x1C),
+          "executing the flip clears label 1 (RPCS3 flip_command)");
     cellGcm_request_tick();
     p = GCM_PENDING_TAKE();
     check((p & 1) && (p & 2), "the next tick completes the flip");

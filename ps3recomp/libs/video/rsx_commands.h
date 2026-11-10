@@ -429,7 +429,7 @@ void rsx_tconst_block(rsx_state* state, u32 method, const u8* be_data, u32 count
 void rsx_tprog_block(rsx_state* state, const u8* be_data, u32 count);
 
 /* Process a command buffer segment.
- * buf:  pointer to command buffer data (host memory)
+ * buf:  pointer to command buffer data (big-endian guest words, host pointer)
  * size: size in bytes
  * Returns number of methods processed. */
 int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size);

@@ -64,6 +64,7 @@ static inline void rsx_test_vp_vec_out_tex(u8* p, u32 vec_op, u32 input, u32 swz
     const u32 src1 = rsx_test_vp_src(RSX_TEST_VP_SRC_TEMP, 0, RSX_TEST_VP_SWZ_IDENT);
     const u32 src2 = src1;
     const u32 d0 = (0x3Fu << 15)             /* dst_tmp: none            */
+                 | (7u << 10)                /* cond: TR (0 = FL writes nothing, RPCS3 SetDST) */
                  | (1u << 30);               /* vec_result: write o[dst] */
     const u32 d1 = (src0 >> 9)               /* src0 high 8 bits         */
                  | ((input & 0xFu) << 8)     /* input_src                */

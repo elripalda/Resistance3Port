@@ -1,0 +1,18 @@
+#version 450
+// RPCS3 VideoOutCalibrationPass.glsl main(), in place on the scaled present
+// image: rgb = pow(rgb, gamma), optional limited-range squeeze, alpha = 1.
+// glslangValidator -V --vn rsx_vk_present_gamma_spv -o rsx_vk_present_gamma.spv.h rsx_vk_present_gamma.comp
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, rgba8) uniform image2D Img;
+// opts: x gamma, y limited range, zw size
+layout(push_constant) uniform PC { vec4 opts; };
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= int(opts.z) || p.y >= int(opts.w)) return;
+    vec4 c = imageLoad(Img, p);
+    c.rgb = pow(c.rgb, vec3(opts.x));
+    if (opts.y > 0.5) c = ((c * 220.) + 16.) / 255.;
+    c.a = 1.;
+    imageStore(Img, p, c);
+}

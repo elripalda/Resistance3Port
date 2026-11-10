@@ -2677,6 +2677,8 @@ static u32 eng_texture_create_3d(void* user, rsx_be_format fmt, u32 w, u32 h,
 {
     (void)user;
     if (!s_dev || !w || !h || !depth) return 0;
+    if (fmt == RSX_BE_FMT_BC1 || fmt == RSX_BE_FMT_BC2 || fmt == RSX_BE_FMT_BC3)
+        return 0;   /* BC volumes: the engine falls back to slice 0 */
     MTLTextureDescriptor* td = [MTLTextureDescriptor new];
     td.textureType      = MTLTextureType3D;
     td.pixelFormat      = eng_pixel_format(fmt);

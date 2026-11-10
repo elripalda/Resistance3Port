@@ -75,6 +75,7 @@ unsigned spu_recent_pcs(uint32_t* out, unsigned max)
 int yz_lockstep_enabled(void);
 int g_spu_hop_fast = -1;
 int g_spu_hop_direct = -1;   /* v143: see SPU_HOP in spu_context.h */
+int g_spu_hop_deep = 0;      /* SPU_FAST_HOP: see spu_hop_direct_ok */
 int spu_hop_fast_init(void)
 {
     static const char* const v[] = { "SPU_HOP_FULL", "SPU_NO_LS0_END", "SPU_EXITTRACE",
@@ -88,6 +89,9 @@ int spu_hop_fast_init(void)
     { const char* e = getenv("SPU_DIRECT_HOP");
       g_spu_hop_direct = (!slow && !getenv("SPU_PCHIST") && !(e && *e == '0')) ? 1 : 0;
       fprintf(stderr, "[spu] direct block hops %s%c", g_spu_hop_direct ? "ON" : "off", 10); }
+    { const char* e = getenv("SPU_FAST_HOP");
+      g_spu_hop_deep = (g_spu_hop_direct > 0 && !spu_tailret_enabled() &&
+                        !(e && *e == '0')) ? 1 : 0; }
     g_spu_hop_fast = !slow;
     return g_spu_hop_fast;
 }
@@ -466,7 +470,11 @@ static void spu_drain_call_impl(spu_context* ctx, uint32_t return_pc)
      * loop exits, whichever first. */
     spu_irq_frame f;
     f.prev = 0; f.depth = 0; f.image_id = 0;
-#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = 0; } while (0)
+    /* The enclosing drain's return point, restored on the way out: code that
+     * continues in the caller (and, with SPU_FAST_HOP, the blocks it hops to
+     * directly without passing that drain) must still see its own stop pc. */
+    const uint32_t outer_ret_pc = ctx->drain_ret_pc;
+#define SPU_DRAIN_POP_IRQ() do { if (ctx->irq_frame == &f) ctx->irq_frame = f.prev; ctx->drain_ret_pc = outer_ret_pc; } while (0)
     for (;;) {
         while (g_spu_trampoline_fn) {
             if (g_spu_trampoline_fn == spu_indirect_branch &&

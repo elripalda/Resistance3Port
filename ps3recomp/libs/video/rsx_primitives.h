@@ -44,10 +44,9 @@ typedef enum {
  * modern API, so their vertices must be re-emitted as a triangle list.
  *
  * LINE_LOOP is deliberately NOT in that set. It is a line strip plus one
- * closing edge, which is a smaller fix than a full expansion, and both
- * backends currently approximate it as a plain strip -- so saying "yes" here
- * would claim an expansion that neither performs. Whoever closes the loop
- * should revisit this, and the test says so. */
+ * closing edge; the draw engine (rsx_draw_engine.c eng_topology_rebuild)
+ * closes it by rebuilding strips and loops as indexed line lists, while
+ * other backends still approximate it as a plain strip. */
 static inline int rsx_primitive_needs_expansion(u32 rsx_prim)
 {
     return rsx_prim == RSX_PRIMITIVE_QUADS      ||

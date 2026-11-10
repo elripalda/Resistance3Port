@@ -4,9 +4,37 @@
  */
 #include "../cellGcmSys.c"
 #include <assert.h>
-#include <pthread.h>
 #include <stdatomic.h>
+#ifdef _WIN32
+#include <process.h>
+typedef HANDLE pthread_t;
+typedef struct { void* (*fn)(void*); void* arg; } win_thread_start;
+static unsigned __stdcall win_thread_entry(void* p)
+{
+    win_thread_start* s = (win_thread_start*)p;
+    s->fn(s->arg);
+    return 0;
+}
+static int pthread_create(pthread_t* t, const void* attr, void* (*fn)(void*), void* arg)
+{
+    static win_thread_start start;
+    (void)attr;
+    start.fn = fn; start.arg = arg;
+    *t = (HANDLE)_beginthreadex(NULL, 0, win_thread_entry, &start, 0, NULL);
+    return *t ? 0 : -1;
+}
+static int pthread_join(pthread_t t, void** ret)
+{
+    (void)ret;
+    const int r = WaitForSingleObject(t, INFINITE) == WAIT_OBJECT_0 ? 0 : -1;
+    CloseHandle(t);
+    return r;
+}
+#define sched_yield() SwitchToThread()
+#else
+#include <pthread.h>
 #include <sched.h>
+#endif
 uint8_t* vm_base;
 uint32_t ppu_vm_size;
 int g_resv_store_active;
@@ -18,6 +46,41 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 ps3_guest_caller_fn g_ps3_guest_caller;
+/* The rest of the walker's world: no graphics backend, no lifted program. */
+PPU_THREAD_LOCAL ppu_context* g_active_ctx;
+u32 g_rsx_last_reference;
+void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
+void rsx_raise_user_cmd(uint32_t arg) { (void)arg; }
+void ppu_dump_bctrl_ring(uint32_t n, const char* why) { (void)n; (void)why; }
+void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why; }
+void rsx_state_init(rsx_state* state) { (void)state; }
+int  rsx_process_method(rsx_state* state, u32 method, u32 data) { (void)state; (void)method; (void)data; return 0; }
+int  rsx_draw_engine_enabled(void) { return 0; }
+void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
+void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
+void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
+void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
+void rsx_draw_engine_range_read(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+void rsx_draw_engine_range_wrote(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+void rsx_draw_engine_range_will_write(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+void rsx_draw_engine_range_cpu_wrote(u32 l, u32 o, u32 n) { (void)l; (void)o; (void)n; }
+int rsx_draw_engine_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g_, u32 h, u32 i, u32 j,
+                         u32 k, u32 l, u32 m, u32 n, int lin, u32 iwh)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g_; (void)h; (void)i; (void)j;
+  (void)k; (void)l; (void)m; (void)n; (void)lin; (void)iwh; return 0; }
+int rsx_draw_engine_blit_swizzled(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g_, u32 h, u32 i,
+                                  u32 j, u32 k, int lin)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g_; (void)h; (void)i; (void)j;
+  (void)k; (void)lin; return 0; }
+int  rsx_live_draw_enabled(void) { return 0; }
+void rsx_live_draw_method(u32 method, u32 arg) { (void)method; (void)arg; }
+int  rsx_live_draw_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 w, u32 h)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)w; (void)h; return 0; }
+void rsx_live_draw_note_resolve(u32 a, u32 b, u32 c, u32 d) { (void)a; (void)b; (void)c; (void)d; }
+int  rsx_live_draw_resolve_blit(u32 a, u32 b, u32 c, u32 d, u32 e, u32 f, u32 g, u32 h,
+                                u32 i, u32 j, u32 k, u32 l)
+{ (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h; (void)i; (void)j; (void)k; (void)l; return 0; }
+void rsx_live_draw_set_display_buffer(u32 b, u32 l, u32 o, u32 p, u32 w, u32 h) { (void)b; (void)l; (void)o; (void)p; (void)w; (void)h; }
 static unsigned calls;
 static uint32_t last;
 static atomic_int paused, resume_pump;

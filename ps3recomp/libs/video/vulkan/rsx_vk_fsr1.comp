@@ -1,0 +1,133 @@
+#version 450
+// AMD FidelityFX Super Resolution 1.0 (MIT, see RPCS3's Upscalers/FSR1), as
+// RPCS3's output scaling runs it: EASU to the output size, then RCAS. The
+// texelFetch, single-pixel-per-thread form of the reference's F32 path.
+// Built twice: -DFSR_EASU and -DFSR_RCAS.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D Src;
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D Dst;
+// EASU: con0 = (in/out scale xy, offset xy), rect = source clamp box,
+//       misc.yz = output size.
+// RCAS: misc.x = sharpness (exp2(-stops)), rect = source clamp box.
+layout(push_constant) uniform PC { vec4 con0; ivec4 rect; vec4 misc; } pc;
+
+vec3 ld(ivec2 p) { return texelFetch(Src, clamp(p, pc.rect.xy, pc.rect.zw), 0).rgb; }
+float rcpf(float x) { return 1.0 / max(x, 1e-20); }
+
+#ifdef FSR_EASU
+void tap(inout vec3 aC, inout float aW, vec2 off, vec2 dir, vec2 len, float lob, float clp, vec3 c)
+{
+    vec2 v;
+    v.x = off.x * dir.x + off.y * dir.y;
+    v.y = off.x * -dir.y + off.y * dir.x;
+    v *= len;
+    float d2 = min(v.x * v.x + v.y * v.y, clp);
+    float wB = 2.0 / 5.0 * d2 - 1.0;
+    float wA = lob * d2 - 1.0;
+    wB *= wB;
+    wA *= wA;
+    wB = 25.0 / 16.0 * wB - (25.0 / 16.0 - 1.0);
+    float w = wB * wA;
+    aC += c * w;
+    aW += w;
+}
+
+void setf(inout vec2 dir, inout float len, float w, float lA, float lB, float lC, float lD, float lE)
+{
+    float dc = lD - lC, cb = lC - lB;
+    float lenX = rcpf(max(abs(dc), abs(cb)));
+    float dirX = lD - lB;
+    dir.x += dirX * w;
+    lenX = clamp(abs(dirX) * lenX, 0.0, 1.0);
+    lenX *= lenX;
+    len += lenX * w;
+    float ec = lE - lC, ca = lC - lA;
+    float lenY = rcpf(max(abs(ec), abs(ca)));
+    float dirY = lE - lA;
+    dir.y += dirY * w;
+    lenY = clamp(abs(dirY) * lenY, 0.0, 1.0);
+    lenY *= lenY;
+    len += lenY * w;
+}
+
+float luma(vec3 c) { return c.b * 0.5 + (c.r * 0.5 + c.g); }
+
+void main()
+{
+    ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
+    if (ip.x >= int(pc.misc.y) || ip.y >= int(pc.misc.z)) return;
+    vec2 pp = vec2(ip) * pc.con0.xy + pc.con0.zw;
+    vec2 fp = floor(pp);
+    pp -= fp;
+    ivec2 f0 = ivec2(fp);
+    vec3 bC = ld(f0 + ivec2( 0, -1)), cC = ld(f0 + ivec2( 1, -1));
+    vec3 iC = ld(f0 + ivec2(-1,  1)), jC = ld(f0 + ivec2( 0,  1));
+    vec3 fC = ld(f0 + ivec2( 0,  0)), eC = ld(f0 + ivec2(-1,  0));
+    vec3 kC = ld(f0 + ivec2( 1,  1)), lC = ld(f0 + ivec2( 2,  1));
+    vec3 hC = ld(f0 + ivec2( 2,  0)), gC = ld(f0 + ivec2( 1,  0));
+    vec3 oC = ld(f0 + ivec2( 1,  2)), nC = ld(f0 + ivec2( 0,  2));
+    float bL = luma(bC), cL = luma(cC), iL = luma(iC), jL = luma(jC);
+    float fL = luma(fC), eL = luma(eC), kL = luma(kC), lL = luma(lC);
+    float hL = luma(hC), gL = luma(gC), oL = luma(oC), nL = luma(nC);
+
+    vec2 dir = vec2(0.0);
+    float len = 0.0;
+    setf(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);
+    setf(dir, len, pp.x * (1.0 - pp.y),         cL, fL, gL, hL, kL);
+    setf(dir, len, (1.0 - pp.x) * pp.y,         fL, iL, jL, kL, nL);
+    setf(dir, len, pp.x * pp.y,                 gL, jL, kL, lL, oL);
+
+    vec2 dir2 = dir * dir;
+    float dirR = dir2.x + dir2.y;
+    bool zro = dirR < 1.0 / 32768.0;
+    dirR = zro ? 1.0 : inversesqrt(dirR);
+    dir.x = zro ? 1.0 : dir.x;
+    dir *= dirR;
+    len = len * 0.5;
+    len *= len;
+    float stretch = (dir.x * dir.x + dir.y * dir.y) * rcpf(max(abs(dir.x), abs(dir.y)));
+    vec2 len2 = vec2(1.0 + (stretch - 1.0) * len, 1.0 - 0.5 * len);
+    float lob = 0.5 + ((1.0 / 4.0 - 0.04) - 0.5) * len;
+    float clp = rcpf(lob);
+
+    vec3 aC = vec3(0.0);
+    float aW = 0.0;
+    tap(aC, aW, vec2( 0.0, -1.0) - pp, dir, len2, lob, clp, bC);
+    tap(aC, aW, vec2( 1.0, -1.0) - pp, dir, len2, lob, clp, cC);
+    tap(aC, aW, vec2(-1.0,  1.0) - pp, dir, len2, lob, clp, iC);
+    tap(aC, aW, vec2( 0.0,  1.0) - pp, dir, len2, lob, clp, jC);
+    tap(aC, aW, vec2( 0.0,  0.0) - pp, dir, len2, lob, clp, fC);
+    tap(aC, aW, vec2(-1.0,  0.0) - pp, dir, len2, lob, clp, eC);
+    tap(aC, aW, vec2( 1.0,  1.0) - pp, dir, len2, lob, clp, kC);
+    tap(aC, aW, vec2( 2.0,  1.0) - pp, dir, len2, lob, clp, lC);
+    tap(aC, aW, vec2( 2.0,  0.0) - pp, dir, len2, lob, clp, hC);
+    tap(aC, aW, vec2( 1.0,  0.0) - pp, dir, len2, lob, clp, gC);
+    tap(aC, aW, vec2( 1.0,  2.0) - pp, dir, len2, lob, clp, oC);
+    tap(aC, aW, vec2( 0.0,  2.0) - pp, dir, len2, lob, clp, nC);
+    vec3 min4 = min(min(fC, gC), min(jC, kC));
+    vec3 max4 = max(max(fC, gC), max(jC, kC));
+    vec3 pix = min(max4, max(min4, aC * (1.0 / aW)));
+    imageStore(Dst, ip, vec4(pix, 1.0));
+}
+#endif
+
+#ifdef FSR_RCAS
+void main()
+{
+    ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
+    if (ip.x > pc.rect.z || ip.y > pc.rect.w) return;
+    vec3 b = ld(ip + ivec2( 0, -1));
+    vec3 d = ld(ip + ivec2(-1,  0));
+    vec3 e = ld(ip);
+    vec3 f = ld(ip + ivec2( 1,  0));
+    vec3 h = ld(ip + ivec2( 0,  1));
+    vec3 mn4 = min(min(b, d), min(f, h));
+    vec3 mx4 = max(max(b, d), max(f, h));
+    vec3 hitMin = min(mn4, e) / max(4.0 * mx4, vec3(1e-20));
+    vec3 hitMax = (1.0 - max(mx4, e)) / min(4.0 * mn4 - 4.0, vec3(-1e-20));
+    vec3 lobeRGB = max(-hitMin, hitMax);
+    float lobe = max(-(0.25 - 1.0 / 16.0), min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * pc.misc.x;
+    vec3 pix = (lobe * (b + d + h + f) + e) / (4.0 * lobe + 1.0);
+    imageStore(Dst, ip, vec4(pix, 1.0));
+}
+#endif

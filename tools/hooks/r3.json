@@ -1013,6 +1013,20 @@
      "        goto loc_006C7F30;"
     ]
    }
+  ],
+  "func_003710B0": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_003710B0(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r2_menu_icon(ppu_context* ctx);   /* R3: img://iconN button icons -> keys / Xbox (stubs.cpp) */",
+     "void func_003710B0(ppu_context* ctx) {",
+     "        r2_menu_icon(ctx);"
+    ]
+   }
   ]
  },
  "preamble": [],

@@ -96,7 +96,7 @@ int main(int argc, char** argv)
         if (size == 0) { no_end++; size = (u32)n; }
         tally_opcodes(filebuf, size);
 
-        int instrs = rsx_fp_decompile(filebuf, size, hlsl, sizeof(hlsl), 0);
+        int instrs = rsx_fp_decompile(filebuf, size, 0, hlsl, (u32)sizeof(hlsl));
         if (instrs < 0) { decode_err++; continue; }
 
         /* Scan for unhandled-opcode markers the decompiler emits. */
@@ -157,5 +157,8 @@ int main(int argc, char** argv)
         printf("  %-8s (0x%02X): %5d%s\n", nm, op, op_count[op],
                op_unhandled[op] ? "   <-- UNHANDLED" : "");
     }
-    return 0;
+    /* Unhandled-op files are reported, not failed: RPCS3's cache stores ucode
+     * from program_start_offset, so a leading NOP's literal can become the
+     * first slot (RPCS3 logs it as an illegal instruction too). */
+    return (total == 0 || decode_err || compile_fail) ? 1 : 0;
 }

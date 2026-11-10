@@ -47,11 +47,19 @@ list(FILTER HLE_SOURCES EXCLUDE REGEX "/tests/")
 # The Vulkan RSX backend is opt-in while it grows (stage V0: clear + present).
 # It loads libvulkan at run time, so building needs only the Vulkan headers --
 # no target-architecture libvulkan, which keeps cross-compiling simple.
-option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux)" OFF)
+option(PS3RECOMP_RSX_VULKAN "Build the Vulkan RSX backend (Linux, Windows)" OFF)
 list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vulkan_backend\\.c$")
+list(FILTER HLE_SOURCES EXCLUDE REGEX "rsx_vk_fsr3\\.cpp$")
 if(PS3RECOMP_RSX_VULKAN)
-    if(WIN32 OR APPLE)
-        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is Linux-only for now")
+    if(APPLE)
+        message(FATAL_ERROR "PS3RECOMP_RSX_VULKAN is not available on Apple platforms")
+    endif()
+    # Windows: the Vulkan headers vendored with RPCS3's 3rdparty tree.
+    if(WIN32 AND NOT PS3RECOMP_VULKAN_INCLUDE_DIR AND
+       EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rpcs3/3rdparty/Vulkan-Headers/include/vulkan/vulkan.h")
+        set(PS3RECOMP_VULKAN_INCLUDE_DIR
+            "${CMAKE_CURRENT_SOURCE_DIR}/third_party/rpcs3/3rdparty/Vulkan-Headers/include"
+            CACHE PATH "directory containing vulkan/vulkan.h")
     endif()
     find_path(PS3RECOMP_VULKAN_INCLUDE_DIR vulkan/vulkan.h)
     if(NOT PS3RECOMP_VULKAN_INCLUDE_DIR)
@@ -60,6 +68,8 @@ if(PS3RECOMP_RSX_VULKAN)
             "-DPS3RECOMP_VULKAN_INCLUDE_DIR=<dir containing vulkan/vulkan.h>")
     endif()
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vulkan_backend.c")
+    # AMD FSR 3.1 for the temporal-upscaler slot (runtime-loaded FidelityFX API).
+    list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vk_fsr3.cpp")
     # HLSL -> SPIR-V for guest programs: a stub unless glslang is found below.
     list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp")
 endif()
@@ -182,6 +192,15 @@ if(PS3RECOMP_RSX_VULKAN)
     target_compile_definitions(ps3recomp_runtime PUBLIC PS3RECOMP_RSX_VULKAN)
     target_link_libraries(ps3recomp_runtime PUBLIC ${CMAKE_DL_LIBS})
     message(STATUS "  Vulkan:       RSX backend enabled (rsx_vulkan_backend.c, headers in ${PS3RECOMP_VULKAN_INCLUDE_DIR})")
+    # FidelityFX API headers (FidelityFX SDK 1.1.x: ffx_api/ffx_api.h, ...):
+    # enables FSR 3.1 in rsx_vk_fsr3.cpp; amd_fidelityfx_vk.dll is loaded at run time.
+    set(PS3RECOMP_FFX_INCLUDE_DIR "" CACHE PATH "directory containing ffx_api/ffx_api.h (optional)")
+    if(WIN32 AND PS3RECOMP_FFX_INCLUDE_DIR AND EXISTS "${PS3RECOMP_FFX_INCLUDE_DIR}/ffx_api/ffx_api.h")
+        set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_vk_fsr3.cpp" PROPERTIES
+            INCLUDE_DIRECTORIES "${PS3RECOMP_FFX_INCLUDE_DIR}"
+            COMPILE_DEFINITIONS PS3RECOMP_HAVE_FFX)
+        message(STATUS "  Vulkan:       FSR 3.1 available (FidelityFX API headers in ${PS3RECOMP_FFX_INCLUDE_DIR})")
+    endif()
 endif()
 
 # cellVdec decodes H.264 / MPEG-2 through FFmpeg when this is on. libavcodec
@@ -291,7 +310,17 @@ endif()
 # libs/video/rsx_shader_spirv.cpp is a stub and the Vulkan backend stays on
 # its fixed-function path.
 if(PS3RECOMP_RSX_VULKAN)
-    if(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
+    # Windows: glslang comes from RPCS3's 3rdparty tree, built with HLSL input
+    # into the port's build_rpcs3 and linked by the port itself; here it only
+    # needs the headers.
+    if(WIN32 AND PS3RECOMP_GLSLANG_INCLUDE_DIR)
+        set_source_files_properties(
+            "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
+            PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_HAVE_SPIRV_TRANSLATION=1)
+        target_include_directories(ps3recomp_runtime PRIVATE ${PS3RECOMP_GLSLANG_INCLUDE_DIR})
+        set(PS3RECOMP_SPIRV_TRANSLATION ON)
+        message(STATUS "  Vulkan:       guest programs available (glslang headers in ${PS3RECOMP_GLSLANG_INCLUDE_DIR})")
+    elseif(glslang_FOUND AND TARGET glslang::glslang AND TARGET glslang::SPIRV)
         set_source_files_properties(
             "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_spirv.cpp"
             PROPERTIES COMPILE_DEFINITIONS PS3RECOMP_HAVE_SPIRV_TRANSLATION=1)

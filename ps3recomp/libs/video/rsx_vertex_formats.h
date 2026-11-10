@@ -53,11 +53,14 @@ static inline u32 rsx_vertex_attrib_size(u32 type, u32 num_components)
 static inline u32 rsx_vertex_element_index(u32 vertex_id, u32 base_index,
                                            u32 frequency, u32 modulo)
 {
+    /* RPCS3 RSXVertexFetch: modulo is (index + VERTEX_DATA_BASE_INDEX) %
+     * frequency; division works on the same rebased index. */
+    const u32 index = (vertex_id + base_index) & 0x000FFFFFu;
     if (frequency <= 1)
-        return (vertex_id + base_index) & 0x000FFFFFu;
+        return index;
     if (modulo)
-        return vertex_id % frequency;
-    return vertex_id / frequency;
+        return index % frequency;
+    return index / frequency;
 }
 
 /* DXGI format values for D3D12 input layout */

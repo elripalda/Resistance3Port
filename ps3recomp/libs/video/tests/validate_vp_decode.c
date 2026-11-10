@@ -85,5 +85,5 @@ int main(int argc, char** argv)
     for (int i = 0; i < 32; i++) if (sca_hist[i])
         printf("  %-5s (0x%02X): %5d%s\n", sca_name(i), i, sca_hist[i],
                sca_name(i)[0]=='?'?"  <-- UNKNOWN":"");
-    return 0;
+    return (total == 0 || no_end || unknown_op) ? 1 : 0;
 }

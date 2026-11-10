@@ -6,12 +6,14 @@
 #include "rsx_fp_decompiler.h"
 #include "rsx_texture_layout.h"
 static char captured[65536];
+static const char* g_dump_dir;
 static u32 capture_pipeline(void* u,const char* vs,const char* ps,const rsx_be_render_state* rs,const rsx_vertex_layout_plan* l,u32 stride,rsx_be_format f,u32 n)
-{ snprintf(captured,sizeof captured,"%s",ps);return stub_pipeline_create(u,vs,ps,rs,l,stride,f,n); }
+{ snprintf(captured,sizeof captured,"%s",ps);if(g_dump_dir){static int n;char path[1024];snprintf(path,sizeof path,"%s/engine%d.hlsl",g_dump_dir,n++);FILE* f=fopen(path,"wb");if(f){fputs(ps,f);fclose(f);}}return stub_pipeline_create(u,vs,ps,rs,l,stride,f,n); }
 static void make_fp(u8* p,u32 opcode,u32 unit,u32 expanded)
 { rsx_test_fp_instr(p,RSX_TEST_FP_OPC(opcode)|RSX_TEST_FP_MASK_XYZW|RSX_TEST_FP_INSRC_TC0|RSX_TEST_FP_TEXU(unit)|RSX_TEST_FP_END|(expanded?1u<<21:0),RSX_TEST_FP_SRC_INPUT|RSX_TEST_FP_SWZ_IDENT); }
 int main(int argc,char** argv)
 {
+ if(argc==2)g_dump_dir=argv[1];
  vm_base=calloc(1,GUEST_BYTES);ppu_vm_size=GUEST_BYTES;engine_up();rsx_draw_backend be=g_stub_backend;be.pipeline_create=capture_pipeline;rsx_draw_engine_set_backend(&be);
  u8 vp[32];rsx_test_vp_mov_out(vp,0,RSX_TEST_VP_SWZ_IDENT,0,0);rsx_test_vp_mov_out(vp+16,8,RSX_TEST_VP_SWZ_IDENT,7,1);m(0x1E9C,0);
  for(u32 i=0;i<8;i++){u32 x;memcpy(&x,vp+i*4,4);m(0xB80+i*4,x);}m(0x1EA0,0);make_fp(vm_base+0x60000,0x17,0,0);m(0x8E4,0x60002);m(0x1D60,0x40);
@@ -28,17 +30,23 @@ int main(int argc,char** argv)
  CHECK(rsx_texture_gamma_mask(0x85,0xAAE4,1u<<29,15u<<20)==14,"signed source R wins over gamma R");
  CHECK(rsx_texture_gamma_mask(0x85,0xAAE4,1u<<28,15u<<20)==7,"signed source A wins over gamma A");
  CHECK(rsx_texture_gamma_mask(0x85,0xAA1B,1u<<28,15u<<20)==11,"signed source follows remap while gamma names final B");
- CHECK(rsx_texture_gamma_mask(0x85,0,0,7u<<20)==7,"unset crossbar retains default identity");
+ /* RPCS3 decodes a written CONTROL1 of 0 as-is: every lane ZERO, none a REMAP lane, so the
+  * gamma flags (final lanes) survive and no source signed flag can clear them
+  * (RSX_TEX_REMAP_ZERO=0 restores the old read of 0 as the identity crossbar). */
+ CHECK(rsx_texture_gamma_mask(0x85,0,0,7u<<20)==7,"zero crossbar keeps final-lane gamma flags");
+ CHECK(rsx_texture_gamma_mask(0x85,0,1u<<29,15u<<20)==15,"zero crossbar: no REMAP lane, signed R does not clear gamma");
  u8 fp[32];char hlsl[65536],legacy[65536];u8 masks[16]={0};u32 constants=0;
- for(u32 unit=0;unit<16;unit+=15)for(u32 op=0;op<4;++op)for(u32 mask=0;mask<16;++mask){const u32 ops[]={0x17,0x18,0x31,0x2F};make_fp(fp,ops[op],unit,0);memset(masks,0,sizeof masks);masks[unit]=(u8)mask;
+ /* RPCS3 insert_texture_fetch: TEX/TXP/TXB/TXL/TXD all take _process_texel (gamma). */
+ for(u32 unit=0;unit<16;unit+=15)for(u32 op=0;op<5;++op)for(u32 mask=0;mask<16;++mask){const u32 ops[]={0x17,0x18,0x31,0x2F,0x19};make_fp(fp,ops[op],unit,0);memset(masks,0,sizeof masks);masks[unit]=(u8)mask;
  CHECK(rsx_fp_decompile_buffered_color_ex(fp,16,0x40,0,masks,hlsl,sizeof hlsl,&constants)>0,"supported texture opcode decompiles with channel mask");
  CHECK((strstr(hlsl,"float4 _rsx_gamma_input")!=NULL)==(mask!=0),"helper emitted only for active fetch");
  if(mask==0){CHECK(rsx_fp_decompile_buffered_ex(fp,16,0x40,0,legacy,sizeof legacy,&constants)>0&&!strcmp(legacy,hlsl),"zero metadata preserves original source byte for byte");}
  if(argc==2){char path[1024];snprintf(path,sizeof path,"%s/u%u-op%u-mask%u.hlsl",argv[1],unit,op,mask);FILE* f=fopen(path,"wb");if(f){fputs(hlsl,f);fclose(f);}}
  }
- masks[0]=7;const u32 unsupported[]={0x19,0x33,0x34};for(u32 i=0;i<3;++i){make_fp(fp,unsupported[i],0,0);CHECK(rsx_fp_decompile_buffered_color_ex(fp,16,0x40,0,masks,hlsl,sizeof hlsl,&constants)<0,"active unsupported fetch fails explicitly");}
+ masks[0]=7;const u32 unsupported[]={0x33,0x34};for(u32 i=0;i<2;++i){make_fp(fp,unsupported[i],0,0);CHECK(rsx_fp_decompile_buffered_color_ex(fp,16,0x40,0,masks,hlsl,sizeof hlsl,&constants)<0,"active unsupported fetch fails explicitly");}
  make_fp(fp,0x17,0,0);rsx_test_fp_put_word(fp,(RSX_TEST_FP_OPC(0x17)|RSX_TEST_FP_MASK_XYZW|RSX_TEST_FP_INSRC_TC0));make_fp(fp+16,0x17,0,1);
  CHECK(rsx_fp_decompile_buffered_color_ex(fp,32,0x40,0,masks,hlsl,sizeof hlsl,&constants)>0,"mixed ordinary/expanded same-unit fetch decompiles");
+ if(g_dump_dir){char path[1024];snprintf(path,sizeof path,"%s/mixed.hlsl",g_dump_dir);FILE* f=fopen(path,"wb");if(f){fputs(hlsl,f);fclose(f);}}
  CHECK(rsx_fp_texture_gamma_units(fp,32,masks)==1,"ordinary fetch retains gamma when same unit also expands");
  engine_down();free(vm_base);printf("texture gamma: %d failures\n",g_failures);return g_failures?1:0;
 }

@@ -65,7 +65,14 @@ typedef struct {
     u32  face_bytes;      /* row_bytes * rows: one face, one mip level       */
     u32  dst_bytes_per_texel; /* DECODED bytes per texel; 0 when compressed  */
     u32  dst_row_bytes;   /* DECODED row, tightly packed                     */
+    u32  border;          /* border texels around the image: 0, 1 (linear) or
+                           * 4 (swizzled; RPCS3 get_subresources_layout_impl) */
+    u32  pad_w, pad_h;    /* swizzled-with-border Morton extents             */
 } rsx_tex_layout;
+
+/* OR'd into rsx_fmt for an image with border texels (TEXTURE_FORMAT bit 3
+ * clear, CELL_GCM_TEXTURE_BORDER_TEXTURE). Layout entry points strip it. */
+#define RSX_TEX_FMT_HAS_BORDER 0x100u
 
 /* Classify `rsx_fmt` (the NV4097 SET_TEXTURE_FORMAT byte) at `w` x `h`.
  *
@@ -236,6 +243,19 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4]);
  * Read once and cached. Lives here rather than in each backend so they cannot
  * disagree about it. */
 int rsx_texture_argb_is_rgba(void);
+
+/* RSX_TEX_LEGACY=1: the texture-format handling from before the RPCS3 port
+ * (format classes, per-format component mapping and decoded remap, depth
+ * RRRR presentation, sampler LOD clamping to the real mip count). Read once
+ * and cached; for A/B bisecting. */
+int rsx_texture_legacy(void);
+
+/* RPCS3 fragment_texture::decoded_remap: TEXTURE_CONTROL1 (0 -> identity
+ * 0xAAE4) with the crossbar byte rewritten for the formats whose remap is
+ * encoded in 16-bit blocks (X16, Y16_X16, HILO8/S8) or fixed (the float
+ * formats). Idempotent. The crossbar source fields of the result are what
+ * the per-lane signed/gamma/expand masks follow. */
+u32 rsx_texture_decoded_remap(u32 control1, u32 rsx_fmt);
 
 #ifdef __cplusplus
 }

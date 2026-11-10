@@ -35,7 +35,14 @@ extern "C" {
 #if defined(_MSC_VER)
 #include <intrin.h>
 #include <windows.h>   /* SwitchToThread */
-static volatile long g_lockline = 0;
+/* The lock and its release sequence share one cache line of their own: every
+ * locker touches both, and nothing else in this file is written as often.
+ * g_lockline_seq is bumped (under the lock) by every unlock, which makes the
+ * pair a seqlock for spu_coh_llar_fast: a reader that sees the lock free and
+ * the same sequence before and after its copy overlapped no locked writer. */
+static __declspec(align(64)) volatile long g_lockline_pair[16];
+#define g_lockline     g_lockline_pair[0]
+#define g_lockline_seq g_lockline_pair[1]
 /* Test-and-test-and-set: spin on a plain read (no cache-line ping-pong) with a
  * pause, and yield after a long wait. The bare exchange loop let GH3's four
  * idle job-policy pollers saturate the line and delay every other SPU atomic
@@ -59,7 +66,11 @@ void spu_lockline_lock(void)
         g_spu_rt.lock_n++; g_spu_rt.lock_t += t1.QuadPart - t0.QuadPart;
     }
 }
-void spu_lockline_unlock(void) { _InterlockedExchange(&g_lockline, 0); }
+void spu_lockline_unlock(void)
+{
+    g_lockline_seq = g_lockline_seq + 1;   /* single writer: the lock holder */
+    _InterlockedExchange(&g_lockline, 0);
+}
 #else
 #include <stdatomic.h>
 static atomic_flag g_lockline = ATOMIC_FLAG_INIT;
@@ -112,6 +123,15 @@ unsigned long g_spu_lr_raise = 0;
  * the reservation bitmap on the premise that no SPU reserves a line of a PPU
  * stack (0xD0000000..0xE0000000). Say so loudly if one ever does. */
 volatile int g_spu_coh_stack = 0;
+
+/* Registration cache: the holder list only shrinks through spu_coh_unregister
+ * and spu_coh_forget_range, both of which bump s_coh_gen under the lock, so a
+ * thread that found `ctx` in the list at generation g knows it is still there
+ * while s_coh_gen == g. Saves the list walk on every GETLLAR. */
+static volatile long s_coh_gen = 1;
+static SPU_THREAD_LOCAL spu_context* t_coh_reg_ctx;
+static SPU_THREAD_LOCAL long t_coh_reg_gen;
+
 void spu_coh_reserve(spu_context* ctx, uint32_t ea)
 {
     if (__builtin_expect(ea >= 0xD0000000u && ea < 0xE0000000u, 0) && !g_spu_coh_stack) {
@@ -123,13 +143,17 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
                          ctx ? (unsigned)(ctx->pc & 0x3FFFF) : 0u); fclose(f); }
     }
     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
-    s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
-    s_coh_armed = 1;
-    g_spu_coh_armed = 1;
+    /* Test before set: every PPU store reads the bitmap and the armed flag
+     * (spu_coh_is_reserved), so rewriting them with the same value on each
+     * GETLLAR only pulled those cache lines away from the PPU threads. */
+    const unsigned char bit = (unsigned char)(1u << (line & 7));
+    if (!(s_coh_bitmap[line >> 3] & bit)) s_coh_bitmap[line >> 3] |= bit;
+    if (!s_coh_armed) { s_coh_armed = 1; g_spu_coh_armed = 1; }
 
     if (!ctx) return;
+    if (ctx == t_coh_reg_ctx && t_coh_reg_gen == s_coh_gen) return;
     for (spu_coh_entry* entry = s_coh_ctxs; entry; entry = entry->next)
-        if (entry->ctx == ctx) return;
+        if (entry->ctx == ctx) { t_coh_reg_ctx = ctx; t_coh_reg_gen = s_coh_gen; return; }
     spu_coh_entry* entry = (spu_coh_entry*)malloc(sizeof(*entry));
     if (!entry) {
         fprintf(stderr, "[spu-coh] cannot register reservation holder %p\n", (void*)ctx);
@@ -139,6 +163,52 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
     entry->ctx = ctx;
     entry->next = s_coh_ctxs;
     s_coh_ctxs = entry;
+    t_coh_reg_ctx = ctx; t_coh_reg_gen = s_coh_gen;
+}
+
+/* Lock-free GETLLAR re-read (SPU_FAST_LLAR, default on).
+ *
+ * The polling idiom re-issues GETLLAR on a line it already holds a valid
+ * reservation on. The locked path would only re-copy the line and re-take the
+ * reservation it already has, and its lock RMW bounces the lock line between
+ * every SPU thread and every PPU store to a reserved line. Here the copy is a
+ * seqlock read instead: every writer of a reserved line (PPU coherent store,
+ * PUTLLC/PUTLLUC, coherent DMA PUT, HLE sync) holds the lock-line lock while it
+ * writes and notifies, and every unlock bumps g_lockline_seq. So if the lock is
+ * free and the sequence is unchanged across the copy, no writer overlapped it:
+ * the bytes are one consistent snapshot, exactly what the locked copy gives.
+ *
+ * Reservation state is not written here. resv_valid/resv_ea are checked after
+ * the first sequence read, so a writer that clears them must take the lock and
+ * fails the recheck; a writer after the recheck sees the reservation and raises
+ * SPU_EVENT_LR as it would after a locked GETLLAR. Anything else (no current
+ * reservation, a different line, a context not yet registered) falls back to
+ * the locked path. Returns 1 if the GETLLAR was done, 0 to take the slow path. */
+extern uint8_t* vm_base;
+int spu_coh_llar_fast(spu_context* ctx, uint32_t ea, uint8_t* ls)
+{
+#if defined(_MSC_VER)
+    static int s_on = -1;
+    if (__builtin_expect(s_on < 0, 0)) { const char* e = getenv("SPU_FAST_LLAR"); s_on = e ? atoi(e) != 0 : 1; }
+    if (!s_on) return 0;
+    const long s1 = g_lockline_seq;
+    _ReadWriteBarrier();
+    if (g_lockline) return 0;
+    if (!ctx->resv_valid || ctx->resv_ea != ea) return 0;
+    if (ctx != t_coh_reg_ctx || t_coh_reg_gen != s_coh_gen) return 0;
+    { const uint32_t line = ea >> SPU_COH_LINE_SHIFT;
+      if (!((s_coh_bitmap[line >> 3] >> (line & 7)) & 1u)) return 0; }
+    memcpy(ls, vm_base + ea, 128);
+    /* x86 keeps loads in order: the rechecks below cannot pass the copy. */
+    _ReadWriteBarrier();
+    if (g_lockline || g_lockline_seq != s1) return 0;
+    memcpy(ctx->resv_line, ls, 128);
+    ctx->atomic_stat = 4;
+    return 1;
+#else
+    (void)ctx; (void)ea; (void)ls;
+    return 0;
+#endif
 }
 
 /* Drop a context from the reserving set.
@@ -165,6 +235,7 @@ void spu_coh_unregister(spu_context* ctx)
         spu_coh_entry* entry = *link;
         *link = entry->next;
         free(entry);
+        s_coh_gen++;
         break;
     }
     spu_lockline_unlock();
@@ -189,6 +260,7 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi)
                         (void*)c, entry->ctx->image_id);
             *link = entry->next;
             free(entry);
+            s_coh_gen++;
         } else {
             link = &entry->next;
         }

@@ -23,6 +23,7 @@
 #include "../platform/win32_compat.h"
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
 #include "ps3emu/log_first.h"
+#include "../syscalls/ps3_waitstat.h"   /* ps3_waitstat, ps3_perf_on */
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -260,9 +261,14 @@ static void sys_lwmutex_lock(ppu_context* ctx)
                 fprintf(stderr, "[LWM-CONVOY] tid=%llu BLOCKs lwm=0x%08X -> held-by-tid=%ld for %lldus (guest-owner=%u)\n",
                     (unsigned long long)ctx->thread_id, lwm, h, held, vm_read32(lwm + LWM_OWNER)); fflush(stderr); }
             long long _blk_start = lwm_trace() ? lwm_now_us() : 0;
+            ps3_waitstat* _ws = ps3_waitstat_self();
+            LARGE_INTEGER _wq0; _wq0.QuadPart = 0;
+            if (_ws) QueryPerformanceCounter(&_wq0);
             DWORD ms = INFINITE;
             if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
             DWORD wr = WaitForSingleObject(s, ms);
+            if (_ws) { LARGE_INTEGER q1; QueryPerformanceCounter(&q1);
+                       _ws->lwm_block_n++; _ws->lwm_block_qpc += (unsigned long long)(q1.QuadPart - _wq0.QuadPart); }
             if (wr == WAIT_TIMEOUT) {           /* honor the timeout: ETIMEDOUT, no acquire */
                 if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu TIMED-OUT on lwm=0x%08X after %lldus (ETIMEDOUT, retry)\n",
                     (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
@@ -362,12 +368,35 @@ static void sys_lwcond_create(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 static void sys_lwcond_destroy(ppu_context* ctx)    { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal(ppu_context* ctx)     { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_all(ppu_context* ctx) { ctx->gpr[3] = 0; }
-static void sys_lwcond_signal_to(ppu_context* ctx)  { ctx->gpr[3] = 0; }
+/* PS3_LWCOND_WAKE (default on; =0 or PS3_PERF_ALL=0 off): the wait below is a
+ * 1 ms poll. A signal now bumps a per-lwcond sequence word and wakes the
+ * waiters parked on it (WaitOnAddress), so a signalled wait returns at once
+ * instead of after the full Sleep(1). The poll stays as the fallback, so a
+ * signal sent before the waiter parks costs at most the old 1 ms. */
+static volatile LONG s_lwc_seq[256];
+static inline volatile LONG* lwc_seq(uint32_t lwcond) { return &s_lwc_seq[(lwcond * 2654435761u) >> 24]; }
+static int lwc_wake_on(void)
+{
+    static volatile int v = -1;
+    if (v < 0) v = ps3_perf_on("PS3_LWCOND_WAKE", 1);
+    return v;
+}
+static void lwc_wake(ppu_context* ctx)
+{
+    if (lwc_wake_on()) {
+        volatile LONG* q = lwc_seq((uint32_t)ctx->gpr[3]);
+        InterlockedIncrement(q);
+        WakeByAddressAll((PVOID)q);
+    }
+    ctx->gpr[3] = 0;
+}
+static void sys_lwcond_signal(ppu_context* ctx)     { lwc_wake(ctx); }
+static void sys_lwcond_signal_all(ppu_context* ctx) { lwc_wake(ctx); }
+static void sys_lwcond_signal_to(ppu_context* ctx)  { lwc_wake(ctx); }
 /* Now that the lwmutex is REAL, a no-op wait that keeps holding it deadlocks the
  * signaler. Release the paired lwmutex, wait briefly, reacquire (poll-style: the
- * guest's while(!predicate) loop re-checks; signalers stay no-ops). Handles the
+ * guest's while(!predicate) loop re-checks; a signal ends the wait early, see
+ * PS3_LWCOND_WAKE above). Handles the
  * common single (non-recursive) hold. */
 static void sys_lwcond_wait(ppu_context* ctx)
 {
@@ -375,15 +404,23 @@ static void sys_lwcond_wait(ppu_context* ctx)
     uint32_t lwmutex = vm_read32(lwcond + 0x00);
     HANDLE s = lwm_sem(lwmutex);
     if (s) {
+        ps3_waitstat* ws = ps3_waitstat_self();
+        LARGE_INTEGER q0; q0.QuadPart = 0;
+        if (ws) QueryPerformanceCounter(&q0);
+        volatile LONG* seq = lwc_seq(lwcond);
+        const LONG seq0 = *seq;   /* before the unlock: a signal after it is seen */
         uint32_t own = vm_read32(lwmutex + LWM_OWNER);
         uint32_t rc  = vm_read32(lwmutex + LWM_RECUR);
         vm_write32(lwmutex + LWM_RECUR, 0);
         vm_write32(lwmutex + LWM_OWNER, 0);
         ReleaseSemaphore(s, 1, NULL);
-        Sleep(1);
+        if (lwc_wake_on()) { LONG cmp = seq0; WaitOnAddress((volatile VOID*)seq, &cmp, sizeof cmp, 1); }
+        else Sleep(1);
         WaitForSingleObject(s, INFINITE);
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
+        if (ws) { LARGE_INTEGER q1; QueryPerformanceCounter(&q1);
+                  ws->lwc_wait_n++; ws->lwc_wait_qpc += (unsigned long long)(q1.QuadPart - q0.QuadPart); }
     }
     ctx->gpr[3] = 0;
 }

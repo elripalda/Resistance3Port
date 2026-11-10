@@ -1094,59 +1094,213 @@ static void r2ml_check(int fed, float rate, int* sign, int* bad, const char* wha
  * R2_FPS != 30 does the same and paces frames here instead, precisely, at
  * 1/R2_FPS. */
 extern "C" void ppu_gcm_pump(void);
+
+/* The primary display's exact refresh rate (QueryDisplayConfig's rational,
+ * 59.94 rather than EnumDisplaySettings' rounded 59 or 60). */
+extern "C" double r2_display_refresh_hz(void)
+{
+    static double hz = -1.0;
+    if (hz >= 0.0) return hz;
+    hz = 0.0;
+    UINT32 np = 0, nm = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &np, &nm) == ERROR_SUCCESS && np && nm) {
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(np);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(nm);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &np, paths.data(), &nm, modes.data(), NULL) == ERROR_SUCCESS) {
+            double first = 0.0;
+            for (UINT32 i = 0; i < np; i++) {
+                const DISPLAYCONFIG_RATIONAL r = paths[i].targetInfo.refreshRate;
+                if (!r.Denominator || !r.Numerator) continue;
+                const double v = (double)r.Numerator / (double)r.Denominator;
+                if (first == 0.0) first = v;
+                const UINT32 mi = paths[i].sourceInfo.modeInfoIdx;
+                if (mi < nm && modes[mi].infoType == DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE &&
+                    modes[mi].sourceMode.position.x == 0 && modes[mi].sourceMode.position.y == 0) {
+                    hz = v; break;   /* the primary display sits at the origin */
+                }
+            }
+            if (hz == 0.0) hz = first;
+        }
+    }
+    if (hz < 20.0) {
+        DEVMODEW dm; memset(&dm, 0, sizeof dm); dm.dmSize = sizeof dm;
+        if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+            hz = dm.dmDisplayFrequency == 59 ? 60000.0 / 1001.0 : (double)dm.dmDisplayFrequency;
+    }
+    if (hz < 20.0) hz = 60.0;
+    return hz;
+}
+
+/* The frame-rate target, settled once (and RSX_VSYNC=auto with it): 30 = the
+ * game's own limiter, 0 = uncapped, otherwise frames per second. */
+extern "C" double r2_fps_target(void)
+{
+    static double fps = -1.0;
+    if (fps >= 0.0) return fps;
+    const char* e = getenv("R2_FPS");
+    double f;
+    if (!e || !*e) f = 30.0;
+    else if (!_stricmp(e, "uncapped") || !_stricmp(e, "max") || !_stricmp(e, "unlimited") ||
+             !_stricmp(e, "off") || !strcmp(e, "0")) f = 0.0;
+    else if (!_stricmp(e, "refresh") || !_stricmp(e, "display")) f = r2_display_refresh_hz();
+    else if (!_stricmp(e, "vrr")) {   /* just under the refresh rate: stays inside the VRR window */
+        const double hz = r2_display_refresh_hz();
+        f = hz - hz * hz / 3600.0;
+        if (f < 30.0) f = 30.0;
+    }
+    else {
+        f = atof(e);
+        if (f < 30.0) f = 30.0;
+        if (f > 500.0) f = 500.0;
+    }
+    const double hz = r2_display_refresh_hz();
+    const int near_refresh = f > 0.0 && fabs(f - hz) < 1.0;
+    const char* v = getenv("RSX_VSYNC");
+    if (v && !_stricmp(v, "auto")) {
+        _putenv_s("RSX_VSYNC", near_refresh ? "1" : "adaptive");
+        v = getenv("RSX_VSYNC");
+    }
+    const int full_vsync = v && _stricmp(v, "adaptive") && atoi(v) > 0;
+    const char* sn = getenv("R2_FPS_SNAP");
+    if (near_refresh && full_vsync && f != 30.0 && !(sn && *sn == '0')) f = hz;
+    fps = f;
+    fprintf(stderr, "[fps] target %s%.3f (display %.3f Hz, RSX_VSYNC=%s)\n",
+            f > 0.0 ? "" : "uncapped ", f, hz, v ? v : "(unset)");
+    return fps;
+}
+
+/* Sleep until `deadline` (timebase ticks) on a high-resolution waitable timer,
+ * in chunks of at most 2 ms so pending GCM handlers keep being pumped, then
+ * spin the last R2_PACE_SPIN_US (default 500) on the clock. Sleep(n) and
+ * SwitchToThread overshot by up to a millisecond, which at 120+ fps is a
+ * visible share of the frame. */
+static void r2_pace_wait(uint64_t deadline)
+{
+    static HANDLE tmr = NULL;
+    static int init = 0;
+    static double spin_us = 500.0;
+    if (!init) {
+        init = 1;
+        tmr = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* CREATE_WAITABLE_TIMER_HIGH_RESOLUTION */,
+                                     TIMER_ALL_ACCESS);
+        if (!tmr) { tmr = CreateWaitableTimerW(NULL, TRUE, NULL); spin_us = 1500.0; }
+        const char* e = getenv("R2_PACE_SPIN_US");
+        if (e) spin_us = atof(e);
+        if (spin_us < 0.0) spin_us = 0.0;
+    }
+    for (;;) {
+        const uint64_t now = ppu_timebase_now();
+        if (now >= deadline) return;
+        const double rem_us = (double)(deadline - now) / 79.8;
+        if (rem_us > spin_us) {
+            ppu_gcm_pump();
+            double w = rem_us - spin_us;
+            if (w > 2000.0) w = 2000.0;
+            LARGE_INTEGER due; due.QuadPart = -(LONGLONG)(w * 10.0);
+            if (tmr && SetWaitableTimer(tmr, &due, 0, NULL, NULL, FALSE)) WaitForSingleObject(tmr, 10);
+            else Sleep(0);
+        } else {
+            YieldProcessor();
+        }
+    }
+}
+
+extern "C" volatile LONG r2_game_frames;   /* main.cpp r2_crash.inc: hang watchdog */
+extern "C" volatile int g_r2pc_paused;     /* r3_pcport.cpp: focus pause / quit prompt */
+extern "C" volatile int g_ps3_host_paused; /* sys_ppu_thread.c: idle the SPU / RSX wait loops */
+/* PORT_MENU_FPS=<n>: while no gameplay frame has run for a second (menus,
+ * loading screens, cutscenes) cap the frame rate at n (0 = off). The game
+ * clock (r3_dt_floor / r3_dt_ceil) follows the frame rate in effect. */
+static volatile double s_r3_eff_fps = -1.0;
+static double r3_eff_fps(void) { const double e = s_r3_eff_fps; return e >= 0.0 ? e : r2_fps_target(); }
+
+extern "C" void r2pf_frame_tick(void);       /* r3_pcfeat.cpp: F3 overlay frame times */
 extern "C" double r2_frame_period(double f1)
 {
-    static int fps = -1;
-    if (fps < 0) {
-        const char* e = getenv("R2_FPS");
-        fps = e ? atoi(e) : 30;
-        if (fps < 30) fps = 30;
-        if (fps > 240) fps = 240;
+    InterlockedIncrement(&r2_game_frames);
+    r2pf_frame_tick();
+    /* PC port: hold the game's frame loop here while paused (window in the
+     * background, R2_BACKGROUND=pause, or the quit prompt is up). The hang
+     * watchdog is fed so a long pause is not taken for a hang. */
+    if (g_r2pc_paused) {
+        /* parked at the frame boundary: SPU polls (and the RSX FIFO wait) nap too */
+        g_ps3_host_paused = 1;
+        while (g_r2pc_paused) { Sleep(5); InterlockedIncrement(&r2_game_frames); }
+        g_ps3_host_paused = 0;
+    }
+    static int init = 0;
+    static double fps = 30.0;
+    static int precise = 1;
+    if (!init) {
+        init = 1;
+        fps = r2_fps_target();
+        { const char* e = getenv("R2_PACE"); precise = !(e && *e == '0'); }
         /* R3 (BCUS98176 v1.00): the 0.001 s floor at 0xF02AD4 -> 0.0001, as
          * RPCS3's "Unlock FPS" patch (Whatcookie, boma) does; its other two
          * edits are r3_dt_floor and this function replacing the wait. */
-        if (fps != 30 && vm_read32(0x00F02AD4u) == 0x3A83126Fu) vm_write32(0x00F02AD4u, 0x38D1B717u);
-        fprintf(stderr, "[fps] target %d (floor %08x)\n", fps, vm_read32(0x00F02AD4u));
+        if (fps != 30.0 && vm_read32(0x00F02AD4u) == 0x3A83126Fu) vm_write32(0x00F02AD4u, 0x38D1B717u);
+        fprintf(stderr, "[fps] target %.3f%s (floor %08x)\n", fps, fps > 0.0 ? "" : " (uncapped)", vm_read32(0x00F02AD4u));
     }
     if (r2_diag()) {
         static double seen[8]; static int ns;
         int k = 0; while (k < ns && seen[k] != f1) k++;
         if (k == ns && ns < 8) { seen[ns++] = f1; fprintf(stderr, "[fps] limiter period %.5f\n", f1); }
     }
-    if (fps == 30) {
+    if (fps == 30.0) {
         static uint64_t t0 = 0; static unsigned n = 0;
         const uint64_t now = ppu_timebase_now();
         if (!t0) t0 = now;
         n++;
         if (now - t0 >= 5ull * 79800000ull) {
-            fprintf(stderr, "[fps] 5 s: %.1f fps (target %d)\n", n * 79800000.0 / (double)(now - t0), fps);
+            fprintf(stderr, "[fps] 5 s: %.1f fps (target 30)\n", n * 79800000.0 / (double)(now - t0));
             t0 = now; n = 0;
         }
         return f1;
     }
 
-    /* host pacing: wait until 1/fps after the previous frame */
-    static uint64_t next = 0;
-    const uint64_t step = 79800000ull / (uint64_t)fps;
+    /* Host pacing at 1/fps with up to one frame of debt carried (no catch-up
+     * burst after a stall). The schedule is kept in fractional ticks so 59.94
+     * or 144 do not drift. R2_PACE=0: the old Sleep/SwitchToThread wait. */
+    static double next = 0.0;
     uint64_t now = ppu_timebase_now();
-    if (next && now < next) {
-        for (;;) {
+    {   /* PORT_MENU_FPS: the cap while out of gameplay */
+        static double menu_fps = -1.0;
+        if (menu_fps < 0.0) { const char* e = getenv("PORT_MENU_FPS"); menu_fps = e ? atof(e) : 0.0;
+            if (menu_fps > 0.0 && menu_fps < 30.0) menu_fps = 30.0;
+            if (menu_fps > 0.0) fprintf(stderr, "[fps] menus / cutscenes capped at %.0f%c", menu_fps, 10); }
+        double eff = fps;
+        if (menu_fps > 0.0 && (fps <= 0.0 || fps > menu_fps) && GetTickCount64() - g_r2_look_ms > 1000) eff = menu_fps;
+        s_r3_eff_fps = eff;
+    }
+    const double pfps = r3_eff_fps();
+    if (pfps > 0.0) {
+        const double step = 79800000.0 / pfps;
+        if (next > 0.0 && (double)now < next) {
+            if (precise) r2_pace_wait((uint64_t)next);
+            else for (;;) {
+                now = ppu_timebase_now();
+                if ((double)now >= next) break;
+                const double rem_us = (next - (double)now) / 79.8;
+                ppu_gcm_pump();
+                if (rem_us > 2600.0) Sleep((DWORD)(rem_us / 1000.0) - 1u);
+                else if (rem_us > 150.0) SwitchToThread();
+                else YieldProcessor();
+            }
             now = ppu_timebase_now();
-            if (now >= next) break;
-            const double rem_us = (double)(next - now) / 79.8;
-            ppu_gcm_pump();
-            if (rem_us > 2600.0) Sleep((DWORD)(rem_us / 1000.0) - 1u);
-            else if (rem_us > 150.0) SwitchToThread();
-            else YieldProcessor();
         }
+        if (next <= 0.0) next = (double)now;
         next += step;
-    } else next = now + step;   /* first frame, or running behind: no catch-up burst */
+        if (next + step < (double)now) next = (double)now - step;
+    } else {
+        ppu_gcm_pump();   /* uncapped: no wait, but keep handlers flowing */
+    }
 
     { static uint64_t t0 = 0; static unsigned n = 0;
       if (!t0) t0 = now;
       n++;
       if (now - t0 >= 5ull * 79800000ull) {
-          fprintf(stderr, "[fps] 5 s: %.1f fps (target %d)\n", n * 79800000.0 / (double)(now - t0), fps);
+          fprintf(stderr, "[fps] 5 s: %.1f fps (target %s%.3f)\n", n * 79800000.0 / (double)(now - t0),
+                  fps > 0.0 ? "" : "uncapped ", fps);
           t0 = now; n = 0;
       } }
     return 0.0001;   /* the game's own wait then never holds the frame */
@@ -1158,10 +1312,9 @@ extern "C" double r2_frame_period(double f1)
 extern "C" double r3_dt_floor(uint32_t bits)
 {
     float v; memcpy(&v, &bits, 4);
-    static int fps = -1;
-    if (fps < 0) { const char* e = getenv("R2_FPS"); fps = e ? atoi(e) : 30; }
-    if (fps <= 30 || !(v > 0.0f)) return (double)v;
-    const float m = 0.5f / (float)(fps > 240 ? 240 : fps);
+    const double fps = r3_eff_fps();   /* 0 = uncapped */
+    if ((fps > 0.0 && fps <= 30.0) || !(v > 0.0f)) return (double)v;
+    const float m = 0.5f / (float)(fps <= 0.0 || fps > 500.0 ? 500.0 : fps);
     return (double)(m < v ? m : v);
 }
 /* ...and obj+8 is the ceiling. Cinematics set floor = ceiling (1/30 or 1/75:
@@ -1170,10 +1323,9 @@ extern "C" double r3_dt_floor(uint32_t bits)
 extern "C" double r3_dt_ceil(uint32_t bits)
 {
     float v; memcpy(&v, &bits, 4);
-    static int fps = -1;
-    if (fps < 0) { const char* e = getenv("R2_FPS"); fps = e ? atoi(e) : 30; }
-    if (fps <= 30 || !(v > 0.0f)) return (double)v;
-    const float m = 2.0f / (float)(fps > 240 ? 240 : fps);
+    const double fps = r3_eff_fps();   /* 0 = uncapped: assume >= 60 fps */
+    if ((fps > 0.0 && fps <= 30.0) || !(v > 0.0f)) return (double)v;
+    const float m = 2.0f / (float)(fps <= 0.0 ? 60.0 : (fps > 500.0 ? 500.0 : fps));
     return (double)(m > v ? m : v);
 }
 /* the hero's controller is controller 0 (pad port 0 = keyboard & mouse)? */
@@ -1281,10 +1433,12 @@ static void r3ml_check(int fed, float rate, int* sign, int* bad, const char* wha
         fprintf(stderr, "[mouselook] %s direction now %d (following the game's setting)%c", what, s, 10);
     }
 }
+extern "C" volatile double g_ml_sens_y;   /* cellPad.c: PAD_MOUSE_SENS_Y */
 extern "C" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp)
 {
     (void)ctx;
     s_r3ml_hero = 0;
+    if (hero) g_r2_look_ms = GetTickCount64();   /* gameplay is running (PORT_MENU_FPS) */
     if (!g_ml_mode || !hero) return;
     r3ml_load();
     const int dbg = r3ml_dbg();
@@ -1341,10 +1495,14 @@ extern "C" void r3_mouselook(ppu_context* ctx, uint32_t hero)
       static double zs = -1.0; if (zs < 0.0) { const char* e = getenv("R2_ZOOM_SENS"); zs = e ? atof(e) : 1.0;
                                                if (zs < 0.0) zs = 0.0; if (zs > 2.0) zs = 2.0; }
       const double z = (double)s_r3ml_m / (double)s_r3ml_m1;
-      if (z > 0.01) s_r3ml_zoom = (float)pow(z, zs); }
+      if (z > 0.01) s_r3ml_zoom = (float)pow(z, zs);
+      /* R2_ADS_SENS: extra multiplier while aiming / scoped (1 = as before) */
+      static double ads = -1.0; if (ads < 0.0) { const char* e = getenv("R2_ADS_SENS"); ads = e && *e ? atof(e) : 1.0;
+                                                 if (ads < 0.1) ads = 0.1; if (ads > 3.0) ads = 3.0; }
+      if (z < 0.99) s_r3ml_zoom = (float)(s_r3ml_zoom * ads); }
     const double k = g_ml_deg_per_count * (double)s_r3ml_zoom * (3.14159265358979323846 / 180.0);
     if (g_ml_invert_y) dy = -dy;
-    const double yaw = (double)s_r3ml_sx * (double)dx * k, pitch = (double)s_r3ml_sy * (double)dy * k;
+    const double yaw = (double)s_r3ml_sx * (double)dx * k, pitch = (double)s_r3ml_sy * (double)dy * k * g_ml_sens_y;
     if (!s_r3ml_swap) { ctx->fpr[31] = (double)(float)(ctx->fpr[31] + yaw);   ctx->fpr[30] = (double)(float)(ctx->fpr[30] + pitch); }
     else              { ctx->fpr[31] = (double)(float)(ctx->fpr[31] + pitch); ctx->fpr[30] = (double)(float)(ctx->fpr[30] + yaw); }
     if (r2_diag() || r3ml_dbg()) { static int n = 0; static unsigned long long seen = 0;
@@ -1745,21 +1903,73 @@ static void r2_apply(R2TextFile& t, int kbm)        /* only where the memory sti
     for (auto& b : t.bytes) { uint8_t* q = vm_base + b.ea;
         if (!memcmp(q, kbm ? b.orig : b.kbm, 3)) memcpy(q, kbm ? b.kbm : b.orig, 3); }
 }
-static void r2_icons_mode(int kbm);
-static void r2_input_mode(int kbm)
+static void r2_icons_mode(int mode);
+extern "C" int port_prompt_mode(void);   /* cellPad.c: 0 PlayStation, 1 keyboard & mouse, 2 Xbox */
+static void r2_input_mode(int mode)
 {
-    r2_icons_mode(kbm);
+    r2_icons_mode(mode);
+    /* texts: key names on keyboard; with any controller the glyphs stay, and
+     * the menus draw them with the button icons (PS or Xbox, r2_menu_icon) */
+    const int kbm = mode == 1;
     if (s_r2_mode == kbm) return;
     std::lock_guard<std::mutex> lk(s_r2_mu);
     for (auto& t : s_r2_files) r2_apply(t, kbm);
     s_r2_mode = kbm;
 }
 extern "C" void (*volatile g_r2_input_mode_cb)(int kbm);
+/* PC port: console wording in the English text (core_text_tags) -> PC wording,
+ * in place (every replacement is shorter than what it replaces; the rest of
+ * the string's bytes become NULs). Runs on each text file as it is registered,
+ * before the button glyphs are handled. R2_PC_TEXT=0 turns this off. Rules
+ * that match no Resistance 3 string change nothing. */
+static int r2_pc_text(uint8_t* p, uint32_t end)
+{
+    static int en = -1;
+    if (en < 0) { const char* e = getenv("R2_PC_TEXT"); en = e ? atoi(e) : 1; }
+    if (!en) return 0;
+    static const struct { const char* find; const char* repl; int to_end; } rules[] = {
+        { "Press and hold the PS button to quit the application.", "Press F10 to quit the game.", 0 },
+        { "Insufficient Hard Disk Drive space.", "Insufficient disk space.", 0 },
+        { "Do not switch off the power when the HDD access indicator is flashing.",
+          "Do not close the game while it is saving.", 0 },
+        { "install data on your hard disk drive.", "install data on your disk.", 0 },
+        { "A wireless controller or navigation controller is not connected.", "A controller is not connected.", 0 },
+        { "Press START on the second wireless controller", "Press START on the second controller", 0 },
+        { "Wireless controller %d has been disconnected.", "Controller %d has been disconnected.", 0 },
+        { "Insufficient hard disk space.", "Insufficient disk space.", 0 },
+        { "Your HDD has insufficient space.", "Insufficient disk space.", 0 },
+    };
+    int n = 0;
+    for (uint32_t i = 1; i < end; i++) {
+        if (p[i - 1] != 0 || p[i] == 0) continue;
+        uint32_t m = 0; while (i + m < end && p[i + m]) m++;
+        if (i + m >= end) break;
+        for (auto& r : rules) {
+            const size_t fl = strlen(r.find), rl = strlen(r.repl);
+            if (fl > m) continue;
+            uint8_t* s = p + i; uint32_t len = m;
+            for (uint32_t k = 0; k + fl <= len; k++) {
+                if (memcmp(s + k, r.find, fl)) continue;
+                const uint32_t tail = r.to_end ? 0 : (uint32_t)(len - k - fl);
+                if (k + rl + tail > len) break;
+                memmove(s + k + rl, s + k + fl, tail);
+                memcpy(s + k, r.repl, rl);
+                memset(s + k + rl + tail, 0, len - (k + rl + tail));
+                len = (uint32_t)(k + rl + tail);
+                n++;
+                break;
+            }
+        }
+        i += m;
+    }
+    if (n) { static int said = 0; if (said++ < 4) fprintf(stderr, "[prompts] text file: %d console wording(s) -> PC wording%c", n, 10); }
+    return n;
+}
 extern "C" void r2_text_patch(uint32_t file_obj)
 {
     static int en = -1;
     if (en < 0) { const char* e = getenv("R2_KEY_PROMPTS"); en = e ? atoi(e) : 1; }
-    if (!en || !file_obj || !vm_base) return;
+    if (!file_obj || !vm_base) return;
     const uint32_t base = vm_read32(file_obj + 4);
     if (!base || vm_read32(base) != 0x49474857u) return;        /* "IGHW" */
     const uint32_t n = vm_read32(base + 8);
@@ -1771,6 +1981,8 @@ extern "C" void r2_text_patch(uint32_t file_obj)
     }
     if (!end || end > (16u << 20)) return;
     std::lock_guard<std::mutex> lk(s_r2_mu);
+    r2_pc_text(vm_base + base, end);   /* idempotent: a file registered again no longer matches */
+    if (!en) return;
     static int init = 0;
     if (!init) { init = 1;
         for (auto& g : s_r2_glyphs) {
@@ -1786,8 +1998,7 @@ extern "C" void r2_text_patch(uint32_t file_obj)
     /* the same file registered again: put it back as it was first */
     for (size_t fi = 0; fi < s_r2_files.size(); fi++)
         if (s_r2_files[fi].base == base) { r2_apply(s_r2_files[fi], 0); s_r2_files.erase(s_r2_files.begin() + fi); break; }
-    int kbm = 1;
-    { XINPUT_STATE xs; if (XInputGetState(0, &xs) == ERROR_SUCCESS) kbm = 0; }
+    int kbm = port_prompt_mode() == 1;
     uint8_t* p = vm_base + base;
     std::vector<uint32_t> starts;                           /* strings with a glyph */
     for (uint32_t i = 0; i + 2 < end; i++) {
@@ -1900,7 +2111,7 @@ extern "C" void r2_text_patch(uint32_t file_obj)
 #pragma comment(lib, "gdi32.lib")
 extern "C" int32_t cellGcmMapMainMemory(uint32_t ea, uint32_t size, uint32_t* offset);
 extern "C" uint32_t cellGcmResolveLocated(int local, uint32_t offset);
-struct R2Icon { std::string name; uint32_t src, ea, hdr; int w, h, live; std::vector<uint8_t> pad, key; };
+struct R2Icon { std::string name; uint32_t src, ea, hdr; int w, h, live; std::vector<uint8_t> pad, key, xb; };
 static std::mutex s_icon_mu;
 static std::vector<R2Icon> s_icons;
 static uint32_t s_icon_blk = 0, s_icon_io = 0, s_icon_used = 0;
@@ -2043,18 +2254,26 @@ static int r2_icon_decode(int fmt, int lin, uint32_t src, uint32_t pitch, int w,
     }
     return 1;
 }
-static void r2_icons_apply(int kbm)                  /* s_icon_mu held */
+static const std::vector<uint8_t>& r2_icon_px(const R2Icon& ic, int mode)
 {
-    for (auto& ic : s_icons)
-        if (ic.live && ic.ea) memcpy(vm_base + ic.ea, kbm ? ic.key.data() : ic.pad.data(), ic.key.size());
+    return mode == 1 ? ic.key : mode == 2 && !ic.xb.empty() ? ic.xb : ic.pad;
 }
-static void r2_icons_mode(int kbm)
+static void r2_icons_apply(int mode)                 /* s_icon_mu held */
 {
-    if (s_icon_mode == kbm) return;
+    for (auto& ic : s_icons) {
+        if (!ic.ea) continue;
+        if (ic.live) memcpy(vm_base + ic.ea, r2_icon_px(ic, mode).data(), ic.key.size());
+        else if (mode == 2 && !ic.xb.empty()) memcpy(vm_base + ic.ea, ic.xb.data(), ic.key.size());
+        else if (mode == 1) memcpy(vm_base + ic.ea, ic.key.data(), ic.key.size());
+    }
+}
+static void r2_icons_mode(int mode)
+{
+    if (s_icon_mode == mode) return;
     std::lock_guard<std::mutex> lk(s_icon_mu);
-    if (s_icon_mode == kbm) return;
-    r2_icons_apply(kbm);
-    s_icon_mode = kbm;
+    if (s_icon_mode == mode) return;
+    r2_icons_apply(mode);
+    s_icon_mode = mode;
 }
 static uint32_t r2_icon_alloc(uint32_t bytes)        /* in the RSX-mapped block, 128-byte aligned */
 {
@@ -2073,38 +2292,186 @@ static uint32_t r2_icon_alloc(uint32_t bytes)        /* in the RSX-mapped block,
     s_icon_used = (s_icon_used + bytes + 127) & ~127u;
     return ea;
 }
+/* Xbox-style button icons, drawn procedurally (original art: coloured discs
+ * with letters, dark badges for the shoulder buttons, a cross for the d-pad).
+ * idx = the R3 icon number (s_r2_glyphs order: 0 Circle=B, 1 Square=X,
+ * 2 Cross=A, 3 Triangle=Y, 4 Select=View, 5 Start=Menu, 6 L1=LB, 7 L2=LT,
+ * 8 L3=LS, 9 left stick, 10 R1=RB, 11 R2=RT, 12 R3=RS, 13 right stick,
+ * 14..17 d-pad up/down/left/right). Out: A R G B bytes like r2_icon_render. */
+static void r3_text_cov(const char* label, int w, int h, float maxw, float maxh, float cx, float cy, std::vector<float>& cov)
+{
+    const int S = 4, W = w * S, H = h * S;
+    cov.assign((size_t)w * h, 0.0f);
+    HDC dc = CreateCompatibleDC(NULL);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP bm = dc ? CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, NULL, 0) : NULL;
+    if (bm && bits) {
+        HGDIOBJ obm = SelectObject(dc, bm);
+        memset(bits, 0, (size_t)W * H * 4);
+        SetBkMode(dc, TRANSPARENT); SetTextColor(dc, RGB(255, 255, 255));
+        const int len = (int)strlen(label);
+        HFONT f = NULL; HGDIOBJ of = NULL; SIZE sz = {};
+        for (int fh = (int)(maxh * S * 1.25f); fh >= 4; fh--) {
+            f = CreateFontA(-fh, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
+                            NONANTIALIASED_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
+            if (!f) break;
+            of = SelectObject(dc, f);
+            TEXTMETRICA tm; GetTextMetricsA(dc, &tm);
+            GetTextExtentPoint32A(dc, label, len, &sz);
+            if ((sz.cx <= maxw * S && (tm.tmAscent - tm.tmInternalLeading) <= maxh * S) || fh <= 4) {
+                /* centre the cap height, not the cell */
+                const int capy = tm.tmInternalLeading + (tm.tmAscent - tm.tmInternalLeading) / 2;
+                TextOutA(dc, (int)(cx * S) - sz.cx / 2, (int)(cy * S) - capy, label, len);
+                break;
+            }
+            SelectObject(dc, of); DeleteObject(f); f = NULL;
+        }
+        if (f) {
+            GdiFlush();
+            const uint8_t* px = (const uint8_t*)bits;
+            for (int y = 0; y < H; y++) for (int x = 0; x < W; x++)
+                cov[(size_t)(y / S) * w + x / S] += px[((size_t)y * W + x) * 4 + 1] / (255.0f * S * S);
+            SelectObject(dc, of); DeleteObject(f);
+        }
+        SelectObject(dc, obm);
+    }
+    if (bm) DeleteObject(bm);
+    if (dc) DeleteDC(dc);
+}
+static float r3_sd_box(float px, float py, float hx, float hy, float r)   /* centred rounded box; < 0 inside */
+{
+    if (r > hx) r = hx; if (r > hy) r = hy;
+    const float qx = fabsf(px) - (hx - r), qy = fabsf(py) - (hy - r);
+    const float ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0, mx = qx > qy ? qx : qy;
+    return sqrtf(ox * ox + oy * oy) + (mx < 0 ? mx : 0) - r;
+}
+static void r3_xbox_render(int idx, int w, int h, uint8_t* out)
+{
+    const float m = (float)(w < h ? w : h), cx = w * 0.5f, cy = h * 0.5f;
+    std::vector<float> A((size_t)w * h, 0.0f), R(A), G(A), B(A);
+    auto cl = [](float v) { return v < 0 ? 0.0f : v > 1 ? 1.0f : v; };
+    auto over = [&](size_t i, float c, float r, float g, float b) {   /* paint coverage c of colour (r,g,b) */
+        if (c <= 0) return;
+        const float a0 = A[i], a = c + a0 * (1 - c);
+        if (a <= 0) return;
+        R[i] = (r * c + R[i] * a0 * (1 - c)) / a; G[i] = (g * c + G[i] * a0 * (1 - c)) / a;
+        B[i] = (b * c + B[i] * a0 * (1 - c)) / a; A[i] = a;
+    };
+    /* shape: 0 disc, 1 bumper, 2 trigger */
+    int shape = 0; float fr = 46, fg = 46, fb = 50; float tr = 245, tg = 245, tb = 245; const char* txt = "";
+    switch (idx) {
+    case 0: fr = 214; fg = 48;  fb = 44;  txt = "B"; break;
+    case 1: fr = 38;  fg = 112; fb = 214; txt = "X"; break;
+    case 2: fr = 52;  fg = 168; fb = 64;  txt = "A"; break;
+    case 3: fr = 236; fg = 184; fb = 24;  tr = tg = tb = 36; txt = "Y"; break;
+    case 6: shape = 1; txt = "LB"; break;   case 10: shape = 1; txt = "RB"; break;
+    case 7: shape = 2; txt = "LT"; break;   case 11: shape = 2; txt = "RT"; break;
+    case 8: case 9: txt = "LS"; break;      case 12: case 13: txt = "RS"; break;
+    default: break;
+    }
+    for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) {
+        const size_t i = (size_t)y * w + x;
+        const float px = x + 0.5f - cx, py = y + 0.5f - cy;
+        float d;
+        if (idx >= 14 && idx <= 17) {   /* d-pad: a cross, the pressed arm lit */
+            const float arm = m * 0.15f, len = m * 0.45f;
+            d = fminf(r3_sd_box(px, py, arm, len, m * 0.05f), r3_sd_box(px, py, len, arm, m * 0.05f));
+            over(i, cl(0.5f - d), 225, 225, 225);
+            over(i, cl(0.5f - (d + m * 0.05f)), 52, 52, 56);
+            const float c = cl(0.5f - (d + m * 0.05f));
+            const float k = idx == 14 ? -py : idx == 15 ? py : idx == 16 ? -px : px;
+            over(i, c * cl(k - arm * 1.1f + 0.5f), 245, 245, 245);
+            continue;
+        }
+        if (shape == 1) d = r3_sd_box(px, py, w * 0.47f, h * 0.27f, m * 0.13f);
+        else if (shape == 2) d = r3_sd_box(px, py + h * 0.02f, w * 0.34f, h * 0.43f, m * 0.18f);
+        else d = sqrtf(px * px + py * py) - m * 0.46f;
+        const float rim = m * 0.06f > 1.0f ? m * 0.06f : 1.0f;
+        const int face = idx <= 3;
+        over(i, cl(0.5f - d), face ? fr * 0.62f : 200, face ? fg * 0.62f : 200, face ? fb * 0.62f : 205);   /* rim */
+        over(i, cl(0.5f - (d + rim)), fr, fg, fb);                                                          /* body */
+        if (idx == 9 || idx == 13) {   /* stick: an inner ring */
+            const float rr = sqrtf(px * px + py * py), ring = fabsf(rr - m * 0.33f) - m * 0.025f;
+            over(i, cl(0.5f - ring) * 0.55f, 160, 160, 165);
+        }
+        if (idx == 4) {   /* View: two overlapping windows */
+            const float s = m * 0.13f, t = m * 0.035f;
+            const float d1 = fabsf(r3_sd_box(px - m * 0.07f, py + m * 0.07f, s, s * 0.8f, m * 0.02f)) - t;
+            const float d2 = r3_sd_box(px + m * 0.07f, py - m * 0.07f, s, s * 0.8f, m * 0.02f);
+            over(i, cl(0.5f - d1) * cl(d2 + 0.5f - t * 1.5f), tr, tg, tb);
+            over(i, cl(0.5f - (fabsf(d2) - t)), tr, tg, tb);
+        } else if (idx == 5) {   /* Menu: three bars */
+            float dm = 1e9f;
+            for (int k = -1; k <= 1; k++) dm = fminf(dm, r3_sd_box(px, py - k * m * 0.13f, m * 0.2f, m * 0.035f, m * 0.035f));
+            over(i, cl(0.5f - dm), tr, tg, tb);
+        }
+    }
+    if (*txt) {
+        std::vector<float> cov;
+        const float tw = shape == 1 ? w * 0.70f : shape == 2 ? w * 0.56f : m * (strlen(txt) > 1 ? 0.62f : 0.5f);
+        const float th = shape == 1 ? h * 0.30f : shape == 2 ? h * 0.36f : m * (strlen(txt) > 1 ? 0.30f : 0.46f);
+        r3_text_cov(txt, w, h, tw, th, cx, cy, cov);
+        for (size_t i = 0; i < cov.size(); i++) over(i, cl(cov[i]) * (A[i] > 0.5f ? 1.0f : A[i]), tr, tg, tb);
+    }
+    for (size_t i = 0; i < A.size(); i++) {
+        uint8_t* o = out + i * 4;
+        o[0] = (uint8_t)(cl(A[i]) * 255.0f + 0.5f);
+        o[1] = (uint8_t)(R[i] + 0.5f); o[2] = (uint8_t)(G[i] + 0.5f); o[3] = (uint8_t)(B[i] + 0.5f);
+    }
+}
+/* R3: the Scaleform UI (title / "Press Start", front end, lobby menus,
+ * options, pause, loading tips, HUD and tutorial legends) draws every button
+ * as the image "img://icon<N>": IconFuncs swaps the private-use characters
+ * U+E001+N in its text fields for those bitmaps, and the menus' button_x /
+ * button_circle clips loadMovie them. The game registers them in a loop
+ * (sprintf "icon%d", texture = its icon set + N*32) through func_003710B0
+ * (name, texture header, owner), hooked at the top (tools/hooks/r3.json).
+ * Icons 0..17 are the pad buttons (s_r2_glyphs order); each gets a block of
+ * RSX-mapped memory holding the PS3 icon, a keycap or the Xbox button,
+ * switched in place with the prompt mode (cellPad.c port_prompt_mode).
+ * R2-style "button <name>" registrations are handled the same way. */
 extern "C" void r2_menu_icon(ppu_context* ctx)
 {
     static int en = -1;
     if (en < 0) { const char* e = getenv("R2_KEY_PROMPTS"); en = e ? atoi(e) : 1; }
     const uint32_t name_ea = (uint32_t)ctx->gpr[3], hdr = (uint32_t)ctx->gpr[4];
-    if (!en || !vm_base || !name_ea || !hdr) return;
+    if (!en || !vm_base || !name_ea || !hdr || name_ea >= 0xF0000000u || hdr >= 0xF0000000u) return;
     char name[32]; int n = 0;
     for (; n < 31 && vm_base[name_ea + n]; n++) name[n] = (char)vm_base[name_ea + n];
     name[n] = 0;
-    if (strncmp(name, "button ", 7)) return;
-    const char* pad = 0; const char* hint = "";
-    for (auto& k : s_icon_keys) if (!strcmp(name + 7, k.name)) { pad = k.pad; hint = k.hint; }
-    if (!pad) return;
+    const char* pad = 0; const char* hint = ""; const char* fixed = 0; int xi = -1;
+    if (!strncmp(name, "button ", 7)) {
+        for (auto& k : s_icon_keys) if (!strcmp(name + 7, k.name)) { pad = k.pad; hint = k.hint; }
+        if (!pad) return;
+        for (int g = 0; g < 18; g++) if (s_r2_glyphs[g].pad && !strcmp(s_r2_glyphs[g].pad, pad)) { xi = g; break; }
+    } else if (!strncmp(name, "icon", 4) && name[4] >= '0' && name[4] <= '9' && n <= 6) {
+        for (int k = 4; k < n; k++) if (name[k] < '0' || name[k] > '9') return;
+        xi = atoi(name + 4);
+        if (xi < 0 || xi > 17) return;
+        const R2Glyph& g = s_r2_glyphs[xi];
+        if (g.pad) { pad = g.pad; hint = g.hint; } else fixed = g.full;
+    } else return;
     const uint32_t flags = vm_read32(hdr + 4), wh = vm_read32(hdr + 0x18);
     const int w = (int)(wh >> 16), h = (int)(wh & 0xFFFF);
     if (w <= 0 || h <= 0 || w > 256 || h > 256) return;
     std::lock_guard<std::mutex> lk(s_icon_mu);
-    int kbm = 1;
-    { XINPUT_STATE xs; if (XInputGetState(0, &xs) == ERROR_SUCCESS) kbm = 0; }
-    if (s_icon_mode < 0) s_icon_mode = kbm;
-    kbm = s_icon_mode;
+    if (s_icon_mode < 0) s_icon_mode = port_prompt_mode();
+    const int mode = s_icon_mode;
     R2Icon* ic = nullptr;
     for (auto& e : s_icons) if (e.name == name && e.src == hdr) ic = &e;
     if (!ic) {
         R2Icon e; e.name = name; e.src = hdr; e.w = w; e.h = h; e.live = 0; e.ea = 0; e.hdr = 0;
         char key[64] = "", label[16] = "";
-        if (!r2_bound_key(pad, hint, key)) {
-            fprintf(stderr, "[prompts] menu icon '%s': no key bound to %s, keeping the PS3 icon%c", name, pad, 10);
-            return; }
-        r2_icon_label(key, label);
+        int has_key = 1;
+        if (fixed) snprintf(label, sizeof label, "%s", fixed);
+        else if (r2_bound_key(pad, hint, key)) r2_icon_label(key, label);
+        else has_key = 0;
         e.key.resize((size_t)w * h * 4); e.pad.resize(e.key.size());
-        r2_icon_render(label, w, h, e.key.data());
+        if (has_key) r2_icon_render(label, w, h, e.key.data());
+        if (xi >= 0) { e.xb.resize(e.key.size()); r3_xbox_render(xi, w, h, e.xb.data()); }
         static const int fmts[8] = { 0x81, 0, 0, 0, 0x85, 0x86, 0x87, 0x88 };
         const int fi = (int)((flags >> 8) & 0x1F) - 1, fmt = fi >= 0 && fi < 8 ? fmts[fi] : 0;
         const uint32_t src = cellGcmResolveLocated(((flags >> 1) & 1) == 0, vm_read32(hdr));
@@ -2112,6 +2479,11 @@ extern "C" void r2_menu_icon(ppu_context* ctx)
         int ok = src && ((mip >> 15) & 15) >= ((mip >> 27) & 15) &&
                  r2_icon_decode(fmt, (flags & 0x2000) != 0, src, vm_read32(hdr + 0x1C) & 0xFFFFF, w, h, e.pad.data());
         if (ok) { ok = 0; for (size_t i = 0; i < e.pad.size(); i += 4) ok |= e.pad[i]; }   /* not all transparent */
+        if (!has_key) {   /* no key bound to it: the PS3 icon (or the Xbox one) on keyboard too */
+            if (ok) e.key = e.pad; else if (!e.xb.empty()) e.key = e.xb;
+            else { fprintf(stderr, "[prompts] menu icon '%s': no key bound to %s, keeping the PS3 icon%c", name, pad ? pad : "?", 10);
+                   return; }
+        }
         e.ea = r2_icon_alloc((uint32_t)e.key.size());
         e.hdr = e.ea ? ps3_hle_heap_alloc(0x20) : 0;
         if (e.hdr) {
@@ -2124,15 +2496,18 @@ extern "C" void r2_menu_icon(ppu_context* ctx)
             vm_write32(e.hdr + 0x1C, (uint32_t)w * 4);
             e.live = ok;
         }
-        fprintf(stderr, "[prompts] menu icon '%s' %dx%d fmt 0x%02X remap 0x%X -> key '%s'%s%c", name, w, h, fmt, vm_read32(hdr + 0x10), label,
-                !e.hdr ? " (no texture memory: PS3 icon)" : ok ? "" : " (icon not decoded: no live switch)", 10);
+        fprintf(stderr, "[prompts] menu icon '%s' %dx%d fmt 0x%02X remap 0x%X -> key '%s'%s%s%c", name, w, h, fmt, vm_read32(hdr + 0x10),
+                has_key ? label : "(none)", e.xb.empty() ? "" : ", Xbox",
+                !e.hdr ? " (no texture memory: PS3 icon)" : ok ? "" : " (icon not decoded: no live switch to PS3)", 10);
         s_icons.push_back(std::move(e));
         ic = &s_icons.back();
-        if (ic->live) memcpy(vm_base + ic->ea, kbm ? ic->key.data() : ic->pad.data(), ic->key.size());
-        else if (ic->hdr) memcpy(vm_base + ic->ea, ic->key.data(), ic->key.size());
+        if (ic->hdr) {
+            const std::vector<uint8_t>& px = ic->live ? r2_icon_px(*ic, mode) : (mode == 2 && !ic->xb.empty() ? ic->xb : ic->key);
+            memcpy(vm_base + ic->ea, px.data(), ic->key.size());
+        }
         g_r2_input_mode_cb = r2_input_mode;
     }
-    if (ic->hdr && (ic->live || kbm)) ctx->gpr[4] = ic->hdr;
+    if (ic->hdr && (ic->live || mode != 0)) ctx->gpr[4] = ic->hdr;
 }
 /* Resistance port (v153): separate melee and interact.
  * The game's "use" checks -- func_00296EBC (switches, doors, turrets...: claims
@@ -2672,4 +3047,13 @@ extern "C" void ps3_load_prx_modules(void)
    func_007E9C30. With spare cores that is harmless; on a 4-core CPU it holds the core the SPU
    worker it waits on needs. Offer the core to any ready thread first (returns at once if none). */
 extern "C" int ps3_host_prio_boost(void);
-extern "C" void r3_spin_relax(void) { static const bool low = !ps3_host_prio_boost(); if (low) SwitchToThread(); }
+/* On many-core hosts one PAUSE per lap frees the shared core for its SMT sibling (often an
+   SPU worker on a 6c/12t CPU); the SPU's store still shows within one lap. R2_SPIN_PAUSE=0
+   restores the bare loop. */
+extern "C" void r3_spin_relax(void)
+{
+    static const bool low = !ps3_host_prio_boost();
+    static const bool pause = [] { const char* e = getenv("R2_SPIN_PAUSE"); return !e || atoi(e) != 0; }();
+    if (low) SwitchToThread();
+    else if (pause) YieldProcessor();
+}

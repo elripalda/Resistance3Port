@@ -41,6 +41,11 @@ extern "C" {
 #define RSX_SPIRV_PSCONST_BINDING  1u
 #define RSX_SPIRV_TEXTURE_BINDING  16u
 #define RSX_SPIRV_SAMPLER_BINDING  48u
+/* Point sprites: HLSL has no PointCoord semantic, so the fragment decompiler
+ * declares a float2 input `[[vk::location(30)]]`; the translation rewrites
+ * that input's Location 30 decoration into BuiltIn PointCoord. No varying of
+ * the vertex stage uses the location. */
+#define RSX_SPIRV_POINTCOORD_LOCATION 30u
 
 /* 1 when built with glslang, 0 when the stub is in. */
 int rsx_hlsl_to_spirv_available(void);

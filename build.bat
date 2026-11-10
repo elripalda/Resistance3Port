@@ -22,7 +22,7 @@ set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if not defined PORT_JOBS set "PORT_JOBS=4"
 
 echo Building the RPCS3 RSX core...
-cmake -S ps3recomp\third_party\rpcs3 -B build_rpcs3 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DRPCS3_RSX_BUILD_LINKTEST=OFF > logs\configure_rpcs3.log 2>&1
+cmake -S ps3recomp\third_party\rpcs3 -B build_rpcs3 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DRPCS3_RSX_BUILD_LINKTEST=OFF -DENABLE_HLSL=ON > logs\configure_rpcs3.log 2>&1
 if errorlevel 1 (echo RPCS3 RSX configure FAILED - see logs\configure_rpcs3.log & goto fail)
 cmake --build build_rpcs3 -j 8 --target rpcs3_rsx > logs\build_rpcs3.log 2>&1
 if errorlevel 1 (echo RPCS3 RSX build FAILED - see logs\build_rpcs3.log & goto fail)

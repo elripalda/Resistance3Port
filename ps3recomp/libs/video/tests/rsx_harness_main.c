@@ -13,11 +13,12 @@
  * failed you'd see black (the null SRV samples 0). Verifies increment (c):
  * texture upload + binding + sampling.
  *
- * Build (MinGW-w64 UCRT):
- *   gcc -std=c11 -O2 -I../../../include -I.. \
- *       rsx_harness_main.c ../rsx_d3d12_backend.c ../rsx_commands.c \
- *       ../rsx_fp_decompiler.c \
- *       -ld3d12 -ldxgi -ld3dcompiler -lgdi32 -luser32 -o rsx_harness.exe
+ * Build: the backend now pulls in most of the runtime, so link the runtime
+ * library as live_draw_test_harness.h does (on Windows with clang-cl, see
+ * scratch\enginetest: live_draw_stubs.c, runtime\host\host_stubs.c,
+ * ps3recomp_runtime.lib, the D3D12/Win32 import libraries, /FORCE:MULTIPLE).
+ * Interactive: it renders until the window is closed, so it is not part of
+ * the automated suites.
  */
 
 #include "rsx_commands.h"
@@ -29,6 +30,10 @@
 
 /* The backend reads guest memory through this. We own it here (no vm.c). */
 uint8_t* vm_base = NULL;
+/* The runtime library references the lifted title's function table. */
+struct harness_func_entry { uint64_t addr; void* func; const char* name; };
+const struct harness_func_entry function_table[1] = { { 0, NULL, NULL } };
+const uint64_t function_table_count = 0;
 
 #define VM_SIZE     (32u * 1024 * 1024)
 #define FP_ADDR     0x1000u    /* fragment program */

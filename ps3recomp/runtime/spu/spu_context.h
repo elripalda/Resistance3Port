@@ -947,6 +947,9 @@ extern int g_spu_hop_fast;
 int spu_hop_fast_init(void);
 extern void* volatile g_pm_flow_ctx;
 void spu_check_stack_reset(spu_context* ctx, void (*fn)(spu_context*));
+/* Number of registered stack-reset entries (spu_channels.c); while zero the
+ * stack-reset check is a no-op and need not run per hop. */
+extern volatile unsigned g_spu_stack_reset_n;
 static inline void spu_hop_checks(spu_context* ctx, void (*tf)(spu_context*))
 {
     int f = g_spu_hop_fast;
@@ -963,7 +966,8 @@ static inline void spu_hop_checks(spu_context* ctx, void (*tf)(spu_context*))
         spu_task_launch_check(ctx, (void*)tf);
         return;
     }
-    if (ctx->host_depth && !ctx->policy_mode) spu_check_stack_reset(ctx, tf);
+    if (ctx->host_depth && !ctx->policy_mode && g_spu_stack_reset_n)
+        spu_check_stack_reset(ctx, tf);
 }
 
 /* Resistance port (v143): direct hops. Every lifted basic block ended by
@@ -977,11 +981,18 @@ static inline void spu_hop_checks(spu_context* ctx, void (*tf)(spu_context*))
  * g_spu_hop_direct is set with g_spu_hop_fast (spu_drain.c); SPU_DIRECT_HOP=0
  * turns it off. Only built where clang's musttail exists. */
 extern int g_spu_hop_direct;
+/* SPU_FAST_HOP (default on): also hop directly inside a nested host call
+ * (host_depth > 0). There the drain additionally owes the SPU_TAILRET check
+ * and the stack-reset check; g_spu_hop_deep is only set when tail-return is
+ * off, and a hop only goes direct while no stack-reset entry is registered,
+ * so the drain would have done nothing but call F. */
+extern int g_spu_hop_deep;
 static inline int spu_hop_direct_ok(const spu_context* ctx, uint32_t target)
 {
     return g_spu_hop_direct > 0 && target != 0 &&
            !(ctx->int_enable && (ctx->event_status & ctx->event_mask)) &&
-           (ctx->policy_mode || !ctx->host_depth) &&
+           (ctx->policy_mode || !ctx->host_depth ||
+            (g_spu_hop_deep > 0 && !g_spu_stack_reset_n)) &&
            g_pm_flow_ctx != (void*)ctx;
 }
 #if defined(__clang__) && !defined(SPU_NO_DIRECT_HOP)

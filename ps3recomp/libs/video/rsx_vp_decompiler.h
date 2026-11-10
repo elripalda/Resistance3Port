@@ -48,14 +48,48 @@ int rsx_vp_analyze_inputs(const u8* ucode, u32 max_bytes,
  * vp_posoffset (the RSX viewport transform mapped to D3D clip space; the
  * caller computes them per draw), SV_Position + COLOR0/1 + FOG + TEXCOORD0..7
  * varyings routed per the NV40 output register map (o0/o1/o2/o5/o7..o14).
- * Not modeled: condition-code tests and flow control (BRA/CAL/...). TXL is
- * stubbed to zero unless rsx_vp_decompile_ex receives a bound-unit mask. */
+ * Condition codes and flow control follow RPCS3's VertexProgramDecompiler. TXL
+ * is stubbed to zero unless rsx_vp_decompile_ex receives a bound-unit mask. */
 int rsx_vp_decompile(const u8* ucode, u32 max_bytes, char* out, u32 out_size);
 
 /* The VP slot the next program decompiled starts at (NV4097 transform
  * program start). Branch targets are absolute slots; this makes them relative
  * to the ucode pointer handed in. Defaults to 0. */
 void rsx_vp_set_branch_base(u32 start_slot);
+
+/* Emit SV_ClipDistance0..5 for the user clip planes (RPCS3 reg_table UC0-5).
+ * Off by default: a Vulkan backend turns it on only once the device has
+ * shaderClipDistance enabled. */
+void rsx_vp_set_clip_distances(int enabled);
+/* Vertex texture units (bits 0-3) whose dimension is 1: TXL reads them at
+ * float2(coord.x, 0.5) (RPCS3 VERTEX_TEXTURE_FETCH1D). Default 0. */
+void rsx_vp_set_vtex_1d_mask(u32 mask);
+/* Vertex texture units whose dimension is 3 / cubemap: declared Texture3D /
+ * TextureCube and sampled at coord.xyz (RPCS3 VERTEX_TEXTURE_FETCH3D/CUBE).
+ * Default 0 (every unit a Texture2D). The 1D mask wins over both. */
+void rsx_vp_set_vtex_3d_mask(u32 mask);
+void rsx_vp_set_vtex_cube_mask(u32 mask);
+/* RPCS3 VKVertexProgram.cpp:367: CMP_FIXUP around SLT..SNE only on NVIDIA
+ * hosts. Default 1 (always on); pass vendorID == 0x10DE. RSX_VP_CMP_FIXUP=0
+ * still disables it everywhere. */
+void rsx_vp_set_low_precision_compare(int enabled);
+/* CELL_GCM_TEXTURE_UN vertex units (bits 0-3; RPCS3 VKDraw.cpp:593-619
+ * unnormalizedCoordinates). 1D/2D units in the mask sample at coord / size:
+ * dims[u] = {width, height} of the guest texture baked into the shader, or
+ * {0,0} / dims NULL to use the bound image's GetDimensions. 3D/cube units
+ * ignore it. Default 0. RSX_VP_VTEX_UN=0 disables. */
+void rsx_vp_set_vtex_unnorm(u32 mask, const u32 dims[4][2]);
+
+/* vp_branch, the uint4 after vp_posoffset:
+ *   x = TRANSFORM_BRANCH_BITS (0x1FF8)
+ *   y = VERTEX_ATTRIB_OUTPUT_MASK (0x1FF4)
+ *   z = USER_CLIP_PLANE_CONTROL (0x1478) | RSX_VP_BRANCH_ENV_VALID
+ *   w = POINT_SIZE (0x1EE0) float bits
+ * Without RSX_VP_BRANCH_ENV_VALID in z (callers that fill only x), every
+ * output stays enabled, no plane clips and the point size is 1. */
+#define RSX_VP_BRANCH_ENV_VALID 0x80000000u
+/* vp_posscale.w (otherwise unused): a multiplier for the point size the
+ * program writes itself, the backend's resolution scale; 0 or less means 1. */
 
 /* Bit N in vtex_mask declares NV40 2D vertex-texture unit N at t(16+N),
  * sampler sN, and turns TXL for that unit into SampleLevel(..., LOD 0).
@@ -70,6 +104,32 @@ int rsx_vp_decompile_ex(const u8* ucode, u32 max_bytes, u32 vtex_mask,
 int rsx_vp_decompile_compact_ex(
     const u8* ucode, u32 max_bytes, u32 vtex_mask, u32 input_mask,
     char* out, u32 out_size);
+
+/* RPCS3 vertex_program_utils::analyse_vertex_program. Walks the program from
+ * `entry` through transform program memory (vp_mem, total_slots 16-byte
+ * slots, at most 544): static BRI and CAL/CLI/CLB/RET are followed,
+ * conditional BRI/BRB targets extend the range and are walked afterwards, and
+ * an end bit stops the walk only once no branch reaches past it. The result
+ * is the touched slot range [base, base + count), the entry relative to base
+ * and a live-instruction mask (bit i = slot base + i). Returns count or -1. */
+#define RSX_VP_MASK_WORDS 17
+typedef struct rsx_vp_program_info {
+    u32 base;
+    u32 count;
+    u32 entry;
+    int has_branch;
+    u32 mask[RSX_VP_MASK_WORDS];
+} rsx_vp_program_info;
+int rsx_vp_analyse_program(const u8* vp_mem, u32 total_slots, u32 entry,
+                           rsx_vp_program_info* info);
+
+/* Analyse (above) and decompile the program that starts at entry_slot, with
+ * branch targets relative to the analysed base and dead slots skipped; a
+ * program end does not stop decoding, it returns. compact_inputs as for
+ * rsx_vp_decompile_compact_ex (branching programs keep all 16 inputs). */
+int rsx_vp_decompile_program(const u8* vp_mem, u32 total_slots, u32 entry_slot,
+                             u32 vtex_mask, u32 input_mask, int compact_inputs,
+                             char* out, u32 out_size);
 
 /* Mnemonics for the vector / scalar opcode fields ("?" if unknown). */
 const char* rsx_vp_vec_name(u32 op);

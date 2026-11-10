@@ -30,4 +30,6 @@ void r2rsx_set_zcull(uint32_t i, uint32_t o, uint32_t w, uint32_t h, uint32_t cs
 { (void)i; (void)o; (void)w; (void)h; (void)cs; (void)zf; (void)af; (void)zd; (void)zcf;
   (void)sf; (void)sr; (void)sm; (void)bound; }
 void r2rsx_wait_get(uint32_t put, unsigned max_ms) { (void)put; (void)max_ms; }
+void r2rsx_prof_enable(int on) { (void)on; }
+int  r2rsx_prof_sample(double* f, double* d, double* u) { (void)f; (void)d; (void)u; return 0; }
 #endif

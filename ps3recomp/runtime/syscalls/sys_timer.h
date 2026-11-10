@@ -43,6 +43,8 @@ int64_t lv2_usec_deadline(uint64_t usec);      /* QPC value 'usec' from now */
 int     lv2_deadline_passed(int64_t deadline); /* 1 once QPC >= deadline */
 #endif
 
+#include "ps3_waitstat.h"   /* ps3_perf_on, ps3_guest_mem_notify, ps3_waitstat */
+
 #define SYS_TIMER_MAX  64
 
 typedef struct sys_timer_info {

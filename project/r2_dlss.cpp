@@ -1,23 +1,30 @@
 // r2_dlss.dll: the only part of the Resistance 2 port that uses the NVIDIA DLSS (NGX) SDK, Vulkan flavour.
-// The RPCS3 Vulkan renderer loads it at run time (RSX_FSR=2, VKR2Upscaler.cpp); without it, or on a
-// non-RTX GPU, it falls back to FSR 3.1.
+// Loaded at run time by the RPCS3 Vulkan renderer (RSX_FSR=2, VKR2Upscaler.cpp: the r2_dlss_* exports) and
+// by ps3recomp's native Vulkan renderer (rsx_vk_upscale.c: port_dlss_vk_get_api, the port-neutral table in
+// ps3recomp/libs/video/rsx_vk_dlss_api.h). Without it, or on a non-RTX GPU, both fall back to FSR 3.1.
+// Other ports can build this file under their own name and set their NGX project id (set_project).
 // Built by build.bat: clang-cl /MT /LD r2_dlss.cpp tools\dlss\lib\nvsdk_ngx_s.lib
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
 #include <cstdarg>
+#include <cstring>
 #include <string>
+#include <vector>
 
 #include <vulkan/vulkan.h>
 #include <nvsdk_ngx_vk.h>
+#include <nvsdk_ngx_helpers.h>
 #include <nvsdk_ngx_helpers_vk.h>
+
+#include "../ps3recomp/libs/video/rsx_vk_dlss_api.h"
 
 typedef void (*R2DlssLog)(const char* msg);
 
 namespace {
-constexpr char ProjectId[] = "c4a7e2d1-3b58-4f6a-8e92-71d5b0c3f6e8";
-constexpr char EngineVersion[] = "Resistance2-ps3recomp";
+std::string g_project_id = "c4a7e2d1-3b58-4f6a-8e92-71d5b0c3f6e8";
+std::string g_engine_version = "Resistance2-ps3recomp";
 
 R2DlssLog g_log;
 VkDevice g_dev;
@@ -68,7 +75,8 @@ __declspec(dllexport) int r2_dlss_init(VkInstance inst, VkPhysicalDevice pdev, V
     common.PathListInfo.Path = paths;
     common.PathListInfo.Length = 1;
     common.LoggingInfo.MinimumLoggingLevel = NVSDK_NGX_LOGGING_LEVEL_OFF;
-    if (!Ok("NGX init", NVSDK_NGX_VULKAN_Init_with_ProjectID(ProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, EngineVersion,
+    if (!Ok("NGX init", NVSDK_NGX_VULKAN_Init_with_ProjectID(g_project_id.c_str(), NVSDK_NGX_ENGINE_TYPE_CUSTOM,
+                                                             g_engine_version.c_str(),
                                                              g_dir.c_str(), inst, pdev, dev, gipa, gdpa, &common,
                                                              NVSDK_NGX_Version_API)))
         return 0;
@@ -174,3 +182,131 @@ __declspec(dllexport) void r2_dlss_shutdown(void)
 }
 
 } // extern "C"
+
+// ---- port_dlss_vk_get_api (rsx_vk_dlss_api.h) --------------------------------
+namespace {
+
+void P_set_project(const char* project_id, const char* engine_version)
+{
+    if (project_id && *project_id) g_project_id = project_id;
+    if (engine_version && *engine_version) g_engine_version = engine_version;
+}
+
+std::wstring exe_dir()
+{
+    wchar_t p[MAX_PATH];
+    DWORD n = GetModuleFileNameW(nullptr, p, MAX_PATH);
+    while (n && p[n - 1] != L'\\' && p[n - 1] != L'/') n--;
+    return n ? std::wstring(p, n - 1) : std::wstring(L".");
+}
+
+// Name lists handed out (static storage until the next call).
+std::vector<std::string> g_inst_names, g_dev_names;
+std::vector<const char*> g_inst_ptrs, g_dev_ptrs;
+
+void add_unique(std::vector<std::string>& v, const char* s)
+{
+    if (!s || !*s) return;
+    for (const auto& x : v) if (x == s) return;
+    v.emplace_back(s);
+}
+
+int P_required_extensions(void* instance, void* phys, unsigned* ni, const char*** ie, unsigned* nd, const char*** de)
+{
+    g_inst_names.clear(); g_dev_names.clear();
+    unsigned li = 0, ld = 0;
+    const char** lie = nullptr; const char** lde = nullptr;
+    const bool legacy = NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_RequiredExtensions(&li, &lie, &ld, &lde));
+    if (legacy) {
+        for (unsigned i = 0; i < li; i++) add_unique(g_inst_names, lie[i]);
+        for (unsigned i = 0; i < ld; i++) add_unique(g_dev_names, lde[i]);
+    }
+    // DLSS-specific lists (NGX 3.x): they need no NGX init, the device one needs the instance and GPU.
+    static std::wstring dir;
+    dir = exe_dir();
+    NVSDK_NGX_FeatureCommonInfo common = {};
+    static const wchar_t* paths[1];
+    paths[0] = dir.c_str();
+    common.PathListInfo.Path = paths;
+    common.PathListInfo.Length = 1;
+    NVSDK_NGX_FeatureDiscoveryInfo fi = {};
+    fi.SDKVersion = NVSDK_NGX_Version_API;
+    fi.FeatureID = NVSDK_NGX_Feature_SuperSampling;
+    fi.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Project_Id;
+    fi.Identifier.v.ProjectDesc.ProjectId = g_project_id.c_str();
+    fi.Identifier.v.ProjectDesc.EngineType = NVSDK_NGX_ENGINE_TYPE_CUSTOM;
+    fi.Identifier.v.ProjectDesc.EngineVersion = g_engine_version.c_str();
+    fi.ApplicationDataPath = dir.c_str();
+    fi.FeatureInfo = &common;
+    bool feature = false;
+    uint32_t n = 0;
+    VkExtensionProperties* props = nullptr;
+    if (NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&fi, &n, &props)) && props) {
+        for (uint32_t i = 0; i < n; i++) add_unique(g_inst_names, props[i].extensionName);
+        feature = true;
+    }
+    if (instance && phys) {
+        n = 0; props = nullptr;
+        if (NVSDK_NGX_SUCCEED(NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(
+                (VkInstance)instance, (VkPhysicalDevice)phys, &fi, &n, &props)) && props) {
+            for (uint32_t i = 0; i < n; i++) add_unique(g_dev_names, props[i].extensionName);
+            feature = true;
+        }
+    }
+    if (!legacy && !feature) return 0;
+    g_inst_ptrs.clear(); g_dev_ptrs.clear();
+    for (const auto& s : g_inst_names) g_inst_ptrs.push_back(s.c_str());
+    for (const auto& s : g_dev_names) g_dev_ptrs.push_back(s.c_str());
+    *ni = (unsigned)g_inst_ptrs.size(); *ie = g_inst_ptrs.empty() ? nullptr : g_inst_ptrs.data();
+    *nd = (unsigned)g_dev_ptrs.size(); *de = g_dev_ptrs.empty() ? nullptr : g_dev_ptrs.data();
+    return 1;
+}
+
+int P_init(void* inst, void* phys, void* dev, void* gipa, void* gdpa, const wchar_t* dir, port_dlss_vk_log_fn log)
+{
+    return r2_dlss_init((VkInstance)inst, (VkPhysicalDevice)phys, (VkDevice)dev, (PFN_vkGetInstanceProcAddr)gipa,
+                        (PFN_vkGetDeviceProcAddr)gdpa, dir, log);
+}
+
+int P_create(void* cmd, unsigned w, unsigned h, unsigned ow, unsigned oh, int flags, unsigned preset)
+{
+    return r2_dlss_create((VkCommandBuffer)cmd, w, h, ow, oh, flags, preset);
+}
+
+int P_evaluate(void* cmd, const port_dlss_vk_eval* e)
+{
+    if (!e) return 0;
+    r2_dlss_set_mask((VkImage)(uintptr_t)e->mask.image, (VkImageView)(uintptr_t)e->mask.view, e->mask.format);
+    const int ok = r2_dlss_eval((VkCommandBuffer)cmd,
+                                (VkImage)(uintptr_t)e->color.image, (VkImageView)(uintptr_t)e->color.view, e->color.format,
+                                (VkImage)(uintptr_t)e->depth.image, (VkImageView)(uintptr_t)e->depth.view, e->depth.format,
+                                (VkImage)(uintptr_t)e->motion.image, (VkImageView)(uintptr_t)e->motion.view, e->motion.format,
+                                (VkImage)(uintptr_t)e->output.image, (VkImageView)(uintptr_t)e->output.view, e->output.format,
+                                e->out_w, e->out_h, e->jitter_x, e->jitter_y, e->mv_scale_x, e->mv_scale_y,
+                                e->reset, e->frame_ms);
+    r2_dlss_set_mask(VK_NULL_HANDLE, VK_NULL_HANDLE, 0);
+    return ok;
+}
+
+int P_optimal_render_size(unsigned ow, unsigned oh, int quality, unsigned* w, unsigned* h)
+{
+    if (!g_caps || !w || !h) return 0;
+    unsigned mxw = 0, mxh = 0, mnw = 0, mnh = 0;
+    float sharp = 0.f;
+    const NVSDK_NGX_Result r = NGX_DLSS_GET_OPTIMAL_SETTINGS(g_caps, ow, oh, (NVSDK_NGX_PerfQuality_Value)quality,
+                                                             w, h, &mxw, &mxh, &mnw, &mnh, &sharp);
+    return NVSDK_NGX_SUCCEED(r) && *w && *h ? 1 : 0;
+}
+
+const port_dlss_vk_api g_api = {
+    PORT_DLSS_VK_API_VERSION, (unsigned)sizeof(port_dlss_vk_api),
+    P_set_project, P_required_extensions, P_init, P_create, P_evaluate, P_optimal_render_size,
+    r2_dlss_release, r2_dlss_shutdown,
+};
+
+} // namespace
+
+extern "C" __declspec(dllexport) const port_dlss_vk_api* port_dlss_vk_get_api(unsigned version)
+{
+    return version >= 1u && version <= PORT_DLSS_VK_API_VERSION ? &g_api : nullptr;
+}

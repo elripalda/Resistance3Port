@@ -2413,6 +2413,9 @@ static DWORD WINAPI spurs_pm_worker(LPVOID p)
     { extern void spu_thread_fp_init_ext(void); spu_thread_fp_init_ext(); }
 #ifdef _WIN32
     { ULONG g = 256 * 1024; SetThreadStackGuarantee(&g); }
+    /* named for the [thrcpu] table and debuggers */
+    { wchar_t nm[48]; _snwprintf(nm, 48, L"SPURS lane %d (inst %d)", (int)(slot - si->slots), (int)(si - s_inst));
+      SetThreadDescription(GetCurrentThread(), nm); }
 #endif
     AcquireSRWLockExclusive(&si->lock);
     for (;;) {

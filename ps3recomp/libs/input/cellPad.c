@@ -322,6 +322,40 @@ static const char* s_kbm_default =
 volatile long g_ml_mode = 1;                 /* 1 = direct */
 volatile double g_ml_deg_per_count = 0.05;   /* already x mouse_sensitivity */
 volatile int g_ml_invert_y = 0;
+/* PC options (env, written to settings.bat by the launcher):
+ *   PAD_MOUSE_SENS_Y=<x>   vertical mouse sensitivity relative to horizontal (default 1)
+ *   PAD_DEADZONE=<0..0.9>  controller stick deadzone, radial (default: per-axis 0.24, as before)
+ *   PAD_CURVE=<0.5..3>     stick response exponent past the deadzone (1 = linear)
+ *   PAD_AIM_TOGGLE=1       Aim (L1) toggles on press instead of hold, keyboard and controller */
+volatile double g_ml_sens_y = 1.0;
+static double s_pad_dz = -1.0, s_pad_curve = 1.0;
+static int s_pad_aim_toggle = 0, s_pad_feat_init = 0;
+static void pad_feat_init(void)
+{
+    if (s_pad_feat_init) return;
+    s_pad_feat_init = 1;
+    const char* e;
+    if ((e = getenv("PAD_MOUSE_SENS_Y")) && *e) { double v = atof(e); if (v >= 0.1 && v <= 4.0) g_ml_sens_y = v; }
+    if ((e = getenv("PAD_DEADZONE")) && *e) { double v = atof(e); if (v >= 0.0 && v <= 0.9) s_pad_dz = v; }
+    if ((e = getenv("PAD_CURVE")) && *e) { double v = atof(e); if (v >= 0.5 && v <= 3.0) { s_pad_curve = v; if (s_pad_dz < 0.0) s_pad_dz = 7849.0 / 32767.0; } }
+    if ((e = getenv("PAD_AIM_TOGGLE")) && *e && *e != '0') s_pad_aim_toggle = 1;
+    printf("[controls] PC options: vertical mouse x%.2f, stick deadzone %s%.2f, curve %.2f, aim %s\n", g_ml_sens_y,
+           s_pad_dz < 0.0 ? "per-axis " : "radial ", s_pad_dz < 0.0 ? 7849.0 / 32767.0 : s_pad_dz, s_pad_curve,
+           s_pad_aim_toggle ? "toggle" : "hold");
+}
+/* Aim toggle: a press of L1 latches it, the next press releases it. `src` 0 keyboard, 1 controller.
+ * Menus (reset != 0) release it. */
+static u16 pad_aim_toggle(int src, u16 btns, int reset)
+{
+    static int prev[2], on[2];
+    pad_feat_init();
+    if (!s_pad_aim_toggle) return btns;
+    const int down = (btns & CELL_PAD_CTRL_L1) != 0;
+    if (reset) { on[src] = 0; prev[src] = down; return btns; }
+    if (down && !prev[src]) on[src] = !on[src];
+    prev[src] = down;
+    return (u16)(on[src] ? (btns | CELL_PAD_CTRL_L1) : (btns & ~CELL_PAD_CTRL_L1));
+}
 volatile int g_ml_fed_rx = 0, g_ml_fed_ry = 0;   /* last stick deflection fed (-127..127) */
 volatile long g_kbm_ml_dx = 0, g_kbm_ml_dy = 0;  /* mouse counts for the direct look */
 /* v151: when the keyboard+mouse pad last fed port 0 (a connected controller
@@ -410,6 +444,7 @@ static void kbm_load(void)
     if (f) fclose(f);
     g_ml_deg_per_count = s_ml_deg * s_kbm_sens;
     g_ml_invert_y = s_kbm_invert;
+    pad_feat_init();
     printf("[controls] %d bindings loaded from controls.txt (sens %.2f, deadzone %.2f, mouse look %s, %.3f deg/count)\n",
            s_kbm_n, s_kbm_sens, s_kbm_dz, g_ml_mode ? "direct" : "stick", g_ml_deg_per_count);
 }
@@ -475,13 +510,13 @@ static u32 kbm_unswap(u32 hsb)
     return (u32)(((out >> 8) & 0xFF) | ((u32)NSW(out & 0xFF) << 8));
 #undef NSW
 }
+static int s_kbm_loaded = 0;
 static void pad_poll_keyboard(void)
 {
     static int off = -1;
     if (off < 0) off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
     if (off) return;
-    static int loaded = 0;
-    if (!loaded) { loaded = 1; kbm_load(); }
+    if (!s_kbm_loaded) { s_kbm_loaded = 1; kbm_load(); }
 
     PadHostState* hs = &s_host_state[0];
     if (!pad_host_window_focused()) {
@@ -638,6 +673,7 @@ static void pad_poll_keyboard(void)
     vx += (ix - vx) * al; vy += (iy - vy) * al;
     double fx = vx * s_kbm_sens / 2500.0, fy = vy * s_kbm_sens / 2500.0;
     if (s_kbm_invert) fy = -fy;
+    fy *= g_ml_sens_y;
 
     /* v162: in-game menus (pause etc.) only read the d-pad and Cross/Circle, but WASD are
      * bound to the left stick. While the in-play look code isn't running (paused, menus),
@@ -688,6 +724,7 @@ static void pad_poll_keyboard(void)
                      const char* b = strrchr(mp, '\\'); b = b ? b + 1 : mp;
                      fe3 = _stricmp(b, "PortFrontEnd.exe") ? 0 : 1; }
       if (fe3 && (GetAsyncKeyState(VK_SPACE) & 0x8000)) btns |= CELL_PAD_CTRL_START; }
+    btns = pad_aim_toggle(0, btns, menu_raw);
     hs->buttons   = menu_raw ? btns : kbm_unswap(btns);   /* v152: undo the in-game button swaps for the keyboard */
     g_port_use_kbm = interact;
     hs->connected = 1;
@@ -720,19 +757,200 @@ static void pad_poll_keyboard(void)
           printf("[cellPad] keyboard+mouse active on port 0 (no XInput device)\n");
           fflush(stdout); } }
 }
+
+/* PC port: which device drives port 0, which button glyphs the prompts show,
+ * the quit overlay's input block and the intro-logo skip.
+ *
+ * Port 0 follows the LAST USED device: a controller (XInput) when one is
+ * connected and was touched more recently than the keyboard/mouse, else the
+ * keyboard & mouse. Prompts follow too (g_r2_input_mode_cb, project/stubs.cpp):
+ * 1 = keys, 2 = Xbox buttons, 0 = PS3 buttons. A controller shows Xbox buttons
+ * unless R2_PAD_GLYPHS=ps, or R2_PAD_GLYPHS=auto (default) and a Sony
+ * DualShock 3/4 or DualSense is plugged in (seen as a HID device; XInput
+ * itself only sees it through Steam Input / DS4Windows). */
+#include <setupapi.h>
+#pragma comment(lib, "setupapi.lib")
+volatile int g_port_ui_modal = 0;     /* set by project/r2_pcport.cpp: game input blocked, cursor free */
+volatile int g_port_input_mode = 1;   /* 0 PS3 buttons, 1 keyboard & mouse, 2 Xbox buttons */
+int port_prompt_mode(void) { return g_port_input_mode; }   /* project/stubs.cpp */
+extern volatile int g_port_intro_movie;   /* sys_fs.c */
+static int pad_sony_hid_present(void)
+{
+    static const GUID hid = { 0x4D1E55B2, 0xF16F, 0x11CF, { 0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30 } };
+    static const char* pids[] = { "0268", "05c4", "09cc", "0ba0", "0ce6", "0df2" };
+    HDEVINFO di = SetupDiGetClassDevsA(&hid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (di == INVALID_HANDLE_VALUE) return 0;
+    int found = 0;
+    SP_DEVICE_INTERFACE_DATA ifd; ifd.cbSize = sizeof ifd;
+    for (DWORD i = 0; !found && SetupDiEnumDeviceInterfaces(di, NULL, &hid, i, &ifd); i++) {
+        union { SP_DEVICE_INTERFACE_DETAIL_DATA_A d; char b[1024]; } u;
+        u.d.cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+        if (!SetupDiGetDeviceInterfaceDetailA(di, &ifd, &u.d, sizeof u, NULL, NULL)) continue;
+        char* p = u.d.DevicePath; _strlwr(p);
+        if (!strstr(p, "054c")) continue;
+        for (unsigned k = 0; k < sizeof pids / sizeof pids[0]; k++) if (strstr(p, pids[k])) found = 1;
+    }
+    SetupDiDestroyDeviceInfoList(di);
+    return found;
+}
+/* R2_PAD_GLYPHS = auto (default) | ps | xbox | keys (key names even with a controller) */
+static volatile int s_glyph_pref = -1;   /* 0 auto, 1 ps, 2 xbox, 3 keys */
+static int pad_glyph_pref_of(const char* e)
+{
+    if (!e || !*e || !_stricmp(e, "auto")) return 0;
+    if (!_stricmp(e, "ps") || !_stricmp(e, "playstation")) return 1;
+    if (!_stricmp(e, "keys") || !_stricmp(e, "keyboard")) return 3;
+    return 2;
+}
+static int pad_glyph_mode(int recheck)
+{
+    static int sony = 0, seen = -1;
+    if (s_glyph_pref < 0) s_glyph_pref = pad_glyph_pref_of(getenv("R2_PAD_GLYPHS"));
+    const int pref = s_glyph_pref;
+    if (pref != seen) { seen = pref; recheck = 1; }
+    if (pref == 0 && recheck) {
+        sony = pad_sony_hid_present();
+        printf("[cellPad] controller prompts: %s\n", sony ? "PlayStation (Sony controller found)" : "Xbox");
+    }
+    return pref == 1 ? 0 : pref == 2 ? 2 : pref == 3 ? 1 : (sony ? 0 : 2);
+}
+/* PC port (project/r3_pcport.cpp, the in-game PC menu): live changes. */
+void cellpad_set_glyph_pref(const char* v) { s_glyph_pref = pad_glyph_pref_of(v); }
+double cellpad_mouse_sens(void)
+{
+    if (!s_kbm_loaded) { s_kbm_loaded = 1; kbm_load(); }
+    return s_kbm_sens;
+}
+void cellpad_set_mouse_sens(double s)
+{
+    if (!s_kbm_loaded) { s_kbm_loaded = 1; kbm_load(); }
+    if (s < 0.1) s = 0.1;
+    if (s > 4.0) s = 4.0;
+    s_kbm_sens = s;
+    g_ml_deg_per_count = s_ml_deg * s;
+}
+static int pad_state_active(const PadHostState* s)
+{
+    if (s->buttons) return 1;
+    if (abs((int)s->analog_lx - 128) > 48 || abs((int)s->analog_ly - 128) > 48 ||
+        abs((int)s->analog_rx - 128) > 48 || abs((int)s->analog_ry - 128) > 48) return 1;
+    return s->trigger_l2 > 40 || s->trigger_r2 > 40;
+}
+static int pad_kbm_active(void)
+{
+    if (!s_kbm_loaded) { s_kbm_loaded = 1; kbm_load(); }
+    if (!pad_host_window_focused()) return 0;
+    if (labs(g_kbm_mouse_dx) + labs(g_kbm_mouse_dy) > 6 || g_kbm_wheel) return 1;
+    for (int i = 0; i < s_kbm_n; i++) {
+        const int vk = s_kbm[i].vk;
+        if (vk == KBM_WHEEL_UP || vk == KBM_WHEEL_DOWN) continue;
+        if (GetAsyncKeyState(vk) & 0x8000) return 1;
+    }
+    return 0;
+}
+static void pad_state_neutral(PadHostState* hs)
+{
+    const int c = hs->connected;
+    memset(hs, 0, sizeof *hs);
+    hs->connected = c;
+    hs->analog_lx = hs->analog_ly = hs->analog_rx = hs->analog_ry = 128;
+}
+static void pad_drop_mouse(void)
+{
+    InterlockedExchange(&g_kbm_mouse_dx, 0); InterlockedExchange(&g_kbm_mouse_dy, 0);
+    InterlockedExchange(&g_kbm_ml_dx, 0); InterlockedExchange(&g_kbm_ml_dy, 0);
+    InterlockedExchange(&g_kbm_wheel, 0);
+}
+static void pad_select_port0(void)
+{
+    static int kb_off = -1, was_conn = 0;
+    static ULONGLONG t_pad = 0, t_kbm = 0;
+    if (kb_off < 0) kb_off = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+    const ULONGLONG now = GetTickCount64();
+    PadHostState* hs = &s_host_state[0];
+    const int pad = hs->connected;
+    int recheck = 0;
+    if (pad && !was_conn) { t_pad = now; recheck = 1; }    /* plugging a controller in = using it */
+    was_conn = pad;
+    if (pad && pad_state_active(hs)) t_pad = now;
+    if (!kb_off && pad_kbm_active()) t_kbm = now;
+    const int kbm = !pad || (!kb_off && t_kbm > t_pad);
+    if (pad && !kbm) pad_drop_mouse();   /* no stale mouse motion when switching back */
+    if (kbm) g_port_pad_btns0 = 0;
+    { static int was = -1;
+      if (pad && was >= 0 && kbm != was) printf("[cellPad] port 0 now driven by the %s\n", kbm ? "keyboard & mouse" : "controller");
+      if (!kbm && was == 1) ClipCursor(NULL);   /* the keyboard path held the cursor in the window */
+      was = kbm; }
+    g_port_input_kbm = kbm;
+    const int mode = kbm ? 1 : pad_glyph_mode(recheck);
+    g_port_input_mode = mode;
+    { void (*cb)(int) = g_r2_input_mode_cb; if (cb) cb(mode); }
+    if (g_port_ui_modal) {
+        pad_state_neutral(hs);
+        if (kbm) hs->connected = 1;
+        g_port_use_kbm = 0; g_port_pad_btns0 = 0;
+        pad_drop_mouse();
+        ClipCursor(NULL);
+        return;
+    }
+    if (kbm) pad_poll_keyboard();
+    if (g_port_intro_movie) {
+        /* only the first time the logo movie is opened (start-up), and only
+         * for its first 4 s, so the presses never reach the title screen */
+        static int skip = -1, seen = 0, opens = 0; static ULONGLONG t0 = 0;
+        if (skip < 0) { const char* e = getenv("R2_SKIP_INTRO"); skip = (e && *e) ? atoi(e) : 1;
+                        if (skip) printf("[cellPad] skipping the intro logo movie (R2_SKIP_INTRO)\n"); }
+        if (seen != g_port_intro_movie) { seen = g_port_intro_movie; t0 = now; opens++; }
+        const ULONGLONG t = now - t0;
+        if (skip && opens == 1 && t >= 300 && t < 4000 && (t % 500) < 80) {
+            hs->connected = 1;
+            hs->buttons |= CELL_PAD_CTRL_START | CELL_PAD_CTRL_CROSS;
+            hs->press_cross = 255;
+        }
+    }
+}
 #endif
 
+/* PAD_DEADZONE / PAD_CURVE: radial deadzone, then |v|^curve, direction kept. Y flipped as above (256 - y). */
+static void pad_stick_radial(short rx, short ry, u8* ox, u8* oy)
+{
+    const double x = rx / 32767.0, y = ry / 32767.0;
+    const double m = sqrt(x * x + y * y);
+    double sx = 0.0, sy = 0.0;
+    if (m > s_pad_dz && m > 1e-6) {
+        double t = (m - s_pad_dz) / (1.0 - s_pad_dz);
+        if (t > 1.0) t = 1.0;
+        t = pow(t, s_pad_curve);
+        sx = x / m * t; sy = y / m * t;
+    }
+    int vx = (int)(sx * 127.0) + 128, vy = (int)(sy * 127.0) + 128;
+    vx = vx < 0 ? 0 : vx > 255 ? 255 : vx; vy = vy < 0 ? 0 : vy > 255 ? 255 : vy;
+    *ox = (u8)vx; *oy = (u8)(256 - vy);
+}
 static void pad_poll_xinput(void)
 {
+    /* PC port: an empty XInput slot is slow to query, so a port that had no
+     * controller is retried about once a second (hot-plug still works). */
+    static unsigned long long s_retry_ms[PAD_MAX_HOST_PORTS];
+    static int s_xi_conn[PAD_MAX_HOST_PORTS];
+    const unsigned long long tnow = (unsigned long long)GetTickCount64();
     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
         XINPUT_STATE state;
         memset(&state, 0, sizeof(state));
 
+        if (i >= XUSER_MAX_COUNT) { s_host_state[i].connected = 0; continue; }
+        if (!s_xi_conn[i] && s_retry_ms[i] && tnow - s_retry_ms[i] < 1000) { s_host_state[i].connected = 0; continue; }
         DWORD result = XInputGetState((DWORD)i, &state);
         if (result != ERROR_SUCCESS) {
+            if (s_xi_conn[i]) printf("[cellPad] controller %d disconnected\n", i + 1);
+            s_xi_conn[i] = 0;
             s_host_state[i].connected = 0;
+            s_retry_ms[i] = tnow;
             continue;
         }
+        if (!s_xi_conn[i]) printf("[cellPad] controller %d connected (XInput)\n", i + 1);
+        s_xi_conn[i] = 1;
+        s_retry_ms[i] = 0;
 
         s_host_state[i].connected = 1;
         XINPUT_GAMEPAD* gp = &state.Gamepad;
@@ -756,6 +974,8 @@ static void pad_poll_xinput(void)
         if (gp->wButtons & XINPUT_GAMEPAD_A)              btns |= CELL_PAD_CTRL_CROSS;
         if (gp->wButtons & XINPUT_GAMEPAD_X)              btns |= CELL_PAD_CTRL_SQUARE;
 
+        pad_feat_init();
+        if (i == 0) btns = pad_aim_toggle(1, btns, g_port_play_ms == 0 || GetTickCount64() - g_port_play_ms > 500);
         s_host_state[i].buttons = btns;
         if (i == 0) g_port_pad_btns0 = btns;
 
@@ -763,10 +983,15 @@ static void pad_poll_xinput(void)
          * 128 (256 - x), NOT 255 - x: the latter turns a centered stick into 127,
          * whose bits (0x7F) alias SELECT+START and can make the guest self-exit.
          * (via sagemono, PR #42) */
+        if (s_pad_dz >= 0.0) {
+            pad_stick_radial(gp->sThumbLX, gp->sThumbLY, &s_host_state[i].analog_lx, &s_host_state[i].analog_ly);
+            pad_stick_radial(gp->sThumbRX, gp->sThumbRY, &s_host_state[i].analog_rx, &s_host_state[i].analog_ry);
+        } else {
         s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, PAD_STICK_DEADZONE);
         s_host_state[i].analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, PAD_STICK_DEADZONE));
         s_host_state[i].analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, PAD_STICK_DEADZONE);
         s_host_state[i].analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE));
+        }
 
         /* Triggers */
         s_host_state[i].trigger_l2 = gp->bLeftTrigger;
@@ -994,10 +1219,7 @@ static void pad_poll_backend(void)
 #endif
 #ifdef _WIN32
     { static int once = 0; if (!once) { once = 1; ctl_extra_load(); } }
-    if (!s_host_state[0].connected) g_port_pad_btns0 = 0;
-    g_port_input_kbm = !s_host_state[0].connected;
-    { void (*cb)(int) = g_r2_input_mode_cb; if (cb) cb(g_port_input_kbm); }
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    pad_select_port0();
 #endif
 }
 

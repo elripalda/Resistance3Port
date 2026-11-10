@@ -92,6 +92,22 @@ int main(void)
 {
     char hlsl[16384];
 
+    /* An unnormalised 3D unit scales its float3 coordinate on all three
+     * axes (RPCS3 texture_cache.h); a 2D unit keeps the float2 scale. */
+    {
+        const u32 dim[16][2] = { [1] = { 64, 32 }, [2] = { 32, 32 } };
+        const u32 depth[16] = { [2] = 16 };
+        snprintf(hlsl, sizeof hlsl,
+                 "a = rsx_tex1.Sample(rsx_samp[1], c.xy);\n"
+                 "b = rsx_tex2.Sample(rsx_samp[2], c.xyz);\n");
+        const int n = rsx_fp_apply_unnorm_scale_vol(hlsl, sizeof hlsl, 0x6u, dim, 0, 0x4u,
+                                                    0x4u, depth);
+        check_true("unnorm_vol_count", n == 2);
+        check("unnorm_vol_2d", hlsl, "rsx_tex1.Sample(rsx_samp[1], c.xy * float2(0.015625, 0.03125))");
+        check("unnorm_vol_3d", hlsl,
+              "rsx_tex2.Sample(rsx_samp[2],( c.xyz) * float3(0.03125, 0.03125, 0.0625)"
+              " + float3(0.0003125, 0.0003125, 0.000625))");
+    }
     /* RSX_FP_DEBUG=<hash>:<n>:<reg>: the named register, captured after the
      * program's n-th instruction, becomes colour target 0 with alpha 1 --
      * in that program only. The variable is read once, on the first
@@ -138,7 +154,7 @@ int main(void)
         check("mov_input",  hlsl, "input.col0");
         check("mov_entry",  hlsl, "float4 main(PSInput input) : SV_TARGET {");
         check("mov_return", hlsl, "    float4 _o = r[0];\n"
-                                  "    return (_o == _o) ? _o : (float4)0;\n}\n");
+                                  "    return _o;\n}\n");
     }
 
     /* Test 2: MUL r1.xy, r0, r0  (partial write mask). */
@@ -167,7 +183,7 @@ int main(void)
         put_float(prog + 28, 1.0f);
         int n = rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
         printf("-- test3 MAD: %d instr\n", n);
-        check("mad_sat",   hlsl, "saturate(");
+        check("mad_sat",   hlsl, "_v = _rsx_pc(_v, 0.0, 1.0);");
         check("mad_const", hlsl, "float4(0.5,0.25,0,1)");
 
         /* ...and the buffered variant, which hoists that constant into b1. */
@@ -176,6 +192,47 @@ int main(void)
                                      hlsl, sizeof(hlsl), &nk);
         check_true("mad_buffered_count", nk == 1);
         check("mad_buffered", hlsl, "fp_constants[0]");
+    }
+
+    /* RPCS3 SetDst at Shader Precision High (no native half): an fp16-
+     * precision write to an H register goes through clamp16; an R
+     * destination is untouched. */
+    {
+        u8 prog[32];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | OUTHALF | OUTREG(1) | (1u << 22)); /* MOV h1 (prec fp16) */
+        put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | OUTREG(2) | (1u << 22) | END); /* MOV r2 (prec fp16) */
+        put_word(prog + 20, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("half_dest_cast", hlsl, "_v = _rsx_h16(_v); h[1].xyzw = _v.xyzw;");
+        check_absent("half_dest_no_c16", hlsl, "_v = _rsx_c16(_v)");
+        check("full_dest_plain", hlsl, "((r[0]).xyzw); r[2].xyzw = _v.xyzw;");
+    }
+
+    /* Shader Precision High: H registers are float, so a write without fp16
+     * precision, an exempt opcode (MAX) and a saturate get no fp16 cast. */
+    {
+        u8 prog[48];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | OUTHALF | OUTREG(1));                /* MOV h1 (prec 0) */
+        put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x09) | OUTMASK_ALL | OUTHALF | OUTREG(2) | (1u << 22));  /* MAX h2 (prec fp16) */
+        put_word(prog + 20, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, T_TEMP | REG(1) | SWZ_IDENT);
+        put_word(prog + 28, 0);
+        put_word(prog + 32, OPC(0x02) | OUTMASK_ALL | OUTHALF | OUTREG(3) | (1u << 22) | (1u << 31) | END); /* MUL_SAT h3 */
+        put_word(prog + 36, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 40, T_TEMP | REG(0) | SWZ_IDENT);
+        put_word(prog + 44, 0);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_absent("high_prec_no_half_cast", hlsl, "_rsx_h16(_v)");
+        check("high_prec_half_plain", hlsl, "((r[0]).xyzw); h[1].xyzw = _v.xyzw;");
+        check("high_prec_sat_half", hlsl, "_v = _rsx_pc(_v, 0.0, 1.0); h[3].xyzw = _v.xyzw;");
     }
 
     /* Test 4: TEX r0, TC0 from texture unit 3. */
@@ -242,9 +299,9 @@ int main(void)
                                    "};\n");
         check("mrt_entry",   hlsl, "PSOutput main(PSInput input) {");
         check("mrt_t0",      hlsl, "float4 _o0 = r[0];\n"
-                                   "    _out.t0 = (_o0 == _o0) ? _o0 : (float4)0;");
+                                   "    _out.t0 = _o0;");
         check("mrt_t1",      hlsl, "float4 _o1 = r[2];\n"
-                                   "    _out.t1 = (_o1 == _o1) ? _o1 : (float4)0;");
+                                   "    _out.t1 = _o1;");
         check("mrt_return",  hlsl, "    return _out;\n}\n");
         check_absent("mrt_no_target2", hlsl, "SV_TARGET2");
 
@@ -324,7 +381,7 @@ int main(void)
         put_word(prog + 56, 0);
         put_word(prog + 60, 0);
         rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
-        const char* ife  = strstr(hlsl, "    if (cc0.x > 0.0) {\n");
+        const char* ife  = strstr(hlsl, "    if (any(cc0.xxxx > 0.0)) {\n");
         const char* then = strstr(hlsl, "input.col0");
         const char* els  = strstr(hlsl, "    } else {\n");
         const char* alt  = strstr(hlsl, "input.col1");
@@ -360,6 +417,35 @@ int main(void)
         check("vol_none", hlsl, "rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy)");
     }
 
+    /* RPCS3 TEX1D / TEX1D_PROJ: a 1D unit reads .x only (x / w projected);
+     * the height-1 image is sampled at y = 0.5 so T never contributes. */
+    {
+        u8 prog[16];
+        u32 nk = 0;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TEX TC0 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_set_tex_1d_mask(1u);
+        rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, sizeof prog, CTRL_32BIT, 0, 0,
+                                                             NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("tex1d_sample", hlsl, "rsx_tex[0].Sample(rsx_samp[0], float2(((input.tc0).xyzw).x, 0.5))");
+        put_word(prog + 0, OPC(0x18) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TXP TC0 */
+        rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, sizeof prog, CTRL_32BIT, 0, 0,
+                                                             NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("tex1d_txp", hlsl,
+              "rsx_tex[0].Sample(rsx_samp[0], float2(((input.tc0).xyzw).x / ((input.tc0).xyzw).w, 0.5))");
+        /* A cube/volume unit wins over the 1D bit. */
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END);
+        rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, sizeof prog, CTRL_32BIT, 0, 1u,
+                                                             NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("tex1d_vol_wins", hlsl, "rsx_tex0.Sample(rsx_samp[0], ((input.tc0).xyzw).xyz)");
+        rsx_fp_set_tex_1d_mask(0);
+        rsx_fp_decompile_buffered_shadow_color_expand_vol_ex(prog, sizeof prog, CTRL_32BIT, 0, 0,
+                                                             NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("tex1d_off", hlsl, "rsx_tex[0].Sample(rsx_samp[0], ((input.tc0).xyzw).xy)");
+    }
+
     /* A 4096-byte program fits the D3D12 caller's input bound, but its
      * predicated, CC-writing instructions expand beyond 32 KiB of HLSL.
      * Assemble it here instead of depending on a captured game shader. */
@@ -384,7 +470,7 @@ int main(void)
                n, strlen(backend_hlsl));
         check_true("backend_source_capacity", n == INSTRUCTION_COUNT);
         check_true("source_exceeds_old_capacity", strlen(backend_hlsl) > 32768u);
-        check("large_program_return", backend_hlsl, "return (_o == _o) ? _o");
+        check("large_program_return", backend_hlsl, "    return _o;");
     }
 
     /* A predicated write is a select, not a blend: MOV r0, COL0 executed
@@ -421,9 +507,9 @@ int main(void)
         rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT | 0xEu, hlsl, sizeof(hlsl));
         check("depth_export_semantic", hlsl, "    float depth : SV_Depth;\n");
         check("depth_export_entry",    hlsl, "PSOutput main(PSInput input) {");
-        check("depth_export_colour",   hlsl, "_out.t0 = (_o0 == _o0) ? _o0 : (float4)0;");
+        check("depth_export_colour",   hlsl, "_out.t0 = _o0;");
         check("depth_export_value",    hlsl, "    float _d = r[1].z;\n"
-                                             "    _out.depth = (_d == _d) ? saturate(_d) : 0.0;\n");
+                                             "    _out.depth = _d;\n");
         rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
         check_absent("no_depth_export_semantic", hlsl, "SV_Depth");
         check("no_depth_export_entry", hlsl, "float4 main(PSInput input) : SV_TARGET {");
@@ -518,6 +604,358 @@ int main(void)
         rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
         check("persp_off_raw",    hlsl, "((input.tc2).xyzw).xy");
         check_absent("persp_off_no_helper", hlsl, "_rsx_inv_w");
+    }
+
+    /* Point sprites (POINT_SPRITE_CONTROL texcoord mask, RPCS3
+     * texcoord_is_point_coord): the unit reads the sprite coordinate from a
+     * fixed-location input the SPIR-V translation makes BuiltIn PointCoord,
+     * and a perspective_corr read of it is not divided. */
+    {
+        u8 prog[16];
+        u32 nk = 0;
+        rsx_fp_frag_state fs;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(6) | TEXU(0) | END); /* TEX TC2 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 1u << 31);
+        memset(&fs, 0, sizeof fs);
+        fs.point_sprite_mask = 1u << 2;
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, NULL, NULL, &fs,
+                                hlsl, sizeof hlsl, &nk);
+        check("psprite_decl", hlsl, "    [[vk::location(30)]] float2 _rsx_pcoord : RSX_PCOORD;\n#endif\n");
+        check("psprite_read", hlsl, "    input.tc2 = float4(input._rsx_pcoord, 1.0, 0.0);\n#endif\n");
+        check_absent("psprite_no_persp", hlsl, "(input.tc2 * _rsx_inv_w(input.position))");
+        fs.texcoord_2d_mask = 1u << 2;
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, NULL, NULL, &fs,
+                                hlsl, sizeof hlsl, &nk);
+        check("psprite_2d", hlsl,
+              "    input.tc2 = float4(input._rsx_pcoord, 0.0, 1.0 / _rsx_inv_w(input.position));\n");
+        fs.texcoord_2d_mask = 0;
+        fs.point_sprite_rmode = 2;
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, NULL, NULL, &fs,
+                                hlsl, sizeof hlsl, &nk);
+        check("psprite_rmode_ignored", hlsl, "float4(input._rsx_pcoord, 1.0, 0.0)"); /* RPCS3 ignores RMODE */
+        fs.point_sprite_mask = 0;
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, NULL, NULL, &fs,
+                                hlsl, sizeof hlsl, &nk);
+        check_absent("psprite_off", hlsl, "_rsx_pcoord");
+        check("psprite_off_persp", hlsl, "(input.tc2 * _rsx_inv_w(input.position))");
+    }
+
+    /* RPCS3 FragmentProgramDecompiler op semantics: NRM keeps w = z,
+     * DIVSQ's fallback is a, DDX/DDY/DST/LIT/STR/SFL/DP2A/RFL emit code. */
+    {
+        static const struct { u32 op; const char* name; const char* needle; } ops[] = {
+            { 0x39, "nrm_w_is_z",  "_rsx_nrm(((r[0]).xyzw).xyz).xyzz" },
+            { 0x3B, "divsq_fallback", ": ((r[0]).xyzw))" },
+            { 0x15, "ddx",  "ddx((r[0]).xyzw)" },
+            { 0x16, "ddy",  "ddy((r[0]).xyzw)" },
+            { 0x07, "dst",  "float4(1.0," },
+            { 0x1E, "lit",  "log2(max(" },
+            { 0x20, "str",  "(float4)1.0" },
+            { 0x21, "sfl",  "(float4)0.0" },
+            { 0x2E, "dp2a", "dot(((r[0]).xyzw).xy, ((r[1]).xyzw).xy) + ((r[2]).xyzw).x" },
+            { 0x36, "rfl",  "reflect(((r[0]).xyzw), ((r[1]).xyzw))" },
+        };
+        for (u32 i = 0; i < sizeof ops / sizeof ops[0]; i++) {
+            u8 prog[16];
+            put_word(prog + 0, OPC(ops[i].op) | OUTMASK_ALL | OUTREG(3) | END);
+            put_word(prog + 4, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+            put_word(prog + 8, T_TEMP | REG(1) | SWZ_IDENT);
+            put_word(prog + 12, T_TEMP | REG(2) | SWZ_IDENT);
+            rsx_fp_decompile(prog, sizeof prog, CTRL_32BIT, hlsl, sizeof hlsl);
+            check(ops[i].name, hlsl, ops[i].needle);
+            check_absent(ops[i].name, hlsl, "TODO");
+        }
+    }
+
+    /* Texture fetch paths (RPCS3 insert_texture_fetch): a comparison unit
+     * maps TXB/TXL/TXD to the shadow compare instead of failing the program;
+     * TXD is SampleGrad with the two gradient operands; a cube TXP divides
+     * by w. */
+    {
+        u8 prog[16];
+        u32 nk = 0;
+        rsx_fp_shadow_desc shadow[16];
+        memset(shadow, 0, sizeof shadow);
+        shadow[0].enabled = 1;
+        shadow[0].func = 1;
+        static const u32 shops[3] = { 0x31, 0x2F, 0x19 };
+        for (u32 i = 0; i < 3; i++) {
+            put_word(prog + 0, OPC(shops[i]) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END);
+            put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+            put_word(prog + 8, T_TEMP | REG(1) | SWZ_IDENT);
+            put_word(prog + 12, T_TEMP | REG(2) | SWZ_IDENT);
+            const int n = rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, shadow,
+                                                  NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+            check_true("shadow_txb_txl_txd_ok", n >= 0);
+            check("shadow_txb_txl_txd", hlsl, "_rsx_shadow0(((input.tc0).xyzw).xyz)");
+        }
+        put_word(prog + 0, OPC(0x19) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TXD */
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, NULL,
+                                NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("txd_grad", hlsl,
+              "SampleGrad(rsx_samp[0], ((input.tc0).xyzw).xy, ((r[1]).xyzw).xy, ((r[2]).xyzw).xy)");
+        put_word(prog + 0, OPC(0x18) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TXP */
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 1u, 0, NULL,
+                                NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("txp_cube_divides", hlsl, ".xyz / (");
+    }
+
+    /* T2-01/T2-02: RPCS3 shadow compare on float depth (unclamped reference),
+     * cube units (samplerCubeShadow, reference in w), every filter; forms
+     * RPCS3 cannot express (3D, cube TXP) sample plainly instead of failing
+     * the program. The compare takes an implicit LOD. */
+    {
+        u8 prog[16];
+        u32 nk = 0;
+        rsx_fp_shadow_desc shadow[16];
+        memset(shadow, 0, sizeof shadow);
+        shadow[0].enabled = 1;
+        shadow[0].func = 3;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TEX */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        int n = rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, shadow,
+                                        NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check_true("shadow_int_ok", n >= 0);
+        check("shadow_int_ref_clamped", hlsl, "float reference = saturate(coordinate.z);");
+        check("shadow_implicit_lod", hlsl, "_lod = rsx_tex[0].CalculateLevelOfDetail(rsx_samp[0], uv * rsx_shscale.xy);");
+        check("shadow_lod_sample", hlsl, "SampleLevel(rsx_samp[0], uv, _lod)");
+        shadow[0].depth_float = 1;
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, shadow,
+                                NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("shadow_float_ref_unclamped", hlsl, "float reference = coordinate.z;");
+        shadow[0].linear = 1;
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, shadow,
+                                NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check("shadow_linear_lod_level", hlsl, "GetDimensions(0u, _w0, _h0, _nl)");
+        check("shadow_linear_lod_tap", hlsl, "/ _ls, _lv).r");
+        shadow[0].depth_float = 0;
+        shadow[0].linear = 0;
+        n = rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 1u, 0, shadow,
+                                    NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check_true("shadow_cube_ok", n >= 0);
+        check("shadow_cube_call", hlsl, "_rsx_shadow0(((input.tc0).xyzw))");
+        check("shadow_cube_helper", hlsl, "float4 _rsx_shadow0(float4 coordinate)");
+        check("shadow_cube_ref_w", hlsl, "float reference = saturate(coordinate.w);");
+        put_word(prog + 0, OPC(0x18) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TXP */
+        n = rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 1u, 0, shadow,
+                                    NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check_true("shadow_cube_txp_ok", n >= 0);
+        check("shadow_cube_txp_plain", hlsl, ".xyz / (");
+        check_absent("shadow_cube_txp_no_compare", hlsl, "_rsx_shadow0((");
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TEX, 3D */
+        n = rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 1u, shadow,
+                                    NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check_true("shadow_3d_ok", n >= 0);
+        check_absent("shadow_3d_plain", hlsl, "_rsx_shadow");
+        shadow[0].func = 9;
+        n = rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, shadow,
+                                    NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check_true("shadow_bad_func_ok", n >= 0);
+        check_absent("shadow_bad_func_plain", hlsl, "_rsx_shadow");
+        shadow[0].func = 3;
+        put_word(prog + 0, OPC(0x33) | OUTMASK_ALL | INSRC(4) | TEXU(0) | END); /* TEXBEM */
+        n = rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, shadow,
+                                    NULL, NULL, NULL, hlsl, sizeof hlsl, &nk);
+        check_true("shadow_texbem_ok", n >= 0);
+
+        /* Metadata: D24F + CONVOLUTION_MIN compares linearly; 3D / func 8+ do not compare. */
+        rsx_fp_shadow_desc d;
+        rsx_fp_shadow_desc_from_texture(&d, 0x93u, 2, 0, 1, 7u << 16 | 1u << 24, 3u << 28, 0x80000000u);
+        check_true("shadow_meta_float", d.enabled == 1 && d.depth_float == 1 && d.linear == 1 && d.func == 3);
+        rsx_fp_shadow_desc_from_texture(&d, 0x92u, 2, 1, 1, 1u << 16 | 1u << 24, 3u << 28, 0x80000000u);
+        check_true("shadow_meta_cube", d.enabled == 1 && !d.linear && !d.depth_float);
+        rsx_fp_shadow_desc_from_texture(&d, 0x92u, 3, 0, 1, 1u << 16 | 1u << 24, 3u << 28, 0x80000000u);
+        check_true("shadow_meta_3d_off", d.enabled == 0);
+        rsx_fp_shadow_desc_from_texture(&d, 0x92u, 2, 0, 1, 1u << 16 | 1u << 24, 9u << 28, 0x80000000u);
+        check_true("shadow_meta_func8_off", d.enabled == 0);
+    }
+
+    /* _bx2 (EXP_TEX) per RPCS3 _enable_texture_expand: no effect on a format
+     * without biased renormalisation (gamma stays), and on a biased one only
+     * the remap's texture-sourced lanes expand. */
+    {
+        u8 prog[16];
+        u32 nk = 0;
+        u8 gamma[16] = {0};
+        rsx_fp_frag_state fs;
+        put_word(prog + 0, OPC(0x17) | OUTMASK_ALL | INSRC(4) | TEXU(0) | (1u << 21) | END);
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        memset(&fs, 0, sizeof fs);
+        gamma[0] = 0x7;
+        fs.bx2_lanes[0] = 0x20;
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, gamma, NULL, &fs,
+                                hlsl, sizeof hlsl, &nk);
+        check_absent("bx2_unbiased_no_expand", hlsl, "_rsx_expand_input(rsx_tex");
+        check("bx2_unbiased_keeps_gamma", hlsl, "_rsx_gamma_input(");
+        fs.bx2_lanes[0] = 0x10 | 0x7;
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, gamma, NULL, &fs,
+                                hlsl, sizeof hlsl, &nk);
+        check("bx2_biased_lanes", hlsl, ", 7u, true)");
+        check_absent("bx2_biased_erases_gamma", hlsl, "_rsx_gamma_input(rsx_tex");
+    }
+
+    /* RPCS3 loops: for (iN = 0; iN < rep_count; iN++), and an input read
+     * with SRC2.use_index_reg inside one is _indexed_load(iN + addr_reg). */
+    {
+        u8 prog[48];
+        put_word(prog + 0, OPC(0x03) | OUTMASK_ALL);                   /* LOOP */
+        put_word(prog + 4, EXEC_ALWAYS);
+        put_word(prog + 8, (1u << 31) | (4u << 2) | (3u << 10) | (2u << 19));
+        put_word(prog + 12, 32u >> 2);
+        put_word(prog + 16, OPC(0x03) | OUTMASK_ALL | INSRC(4));       /* ADD r0, r0, TC[i+1] */
+        put_word(prog + 20, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, T_INPUT | SWZ_IDENT);
+        put_word(prog + 28, (1u << 30) | (1u << 19));
+        put_word(prog + 32, OPC(0x01) | OUTMASK_ALL | INSRC(1) | OUTREG(1) | END);
+        put_word(prog + 36, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 40, 0);
+        put_word(prog + 44, 0);
+        rsx_fp_decompile(prog, sizeof prog, CTRL_32BIT, hlsl, sizeof hlsl);
+        check("loop_rep_count", hlsl, "for (int _l0 = 0; _l0 < 4; _l0++)");
+        check("indexed_load", hlsl, "_rsx_iload(input, _l0 + 1)");
+        check("indexed_helper", hlsl, "return float4(0.0, 0.0, 0.0, 1.0);");
+        check("indexed_tc9_declared", hlsl, "float4 tc9:TEXCOORD9;");
+        check_true("indexed_input_mask", rsx_fp_input_mask(prog, sizeof prog) == ((0x3FFu << 4) | 2u));
+    }
+
+    /* Source type 3 is not a register file: RPCS3 marks the ucode invalid
+     * and the program discards. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | END);
+        put_word(prog + 4, 3u | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof prog, CTRL_32BIT, hlsl, sizeof hlsl);
+        check("src_type3_discard", hlsl, "discard");
+    }
+
+    /* ALPHA_REF by surface format, RPCS3 rsx_methods.h alpha_ref():
+     * W16Z16Y16X16 (0xB) fp16, W32Z32Y32X32 (0xC) / X32 (0xD) bit-cast,
+     * A8B8G8R8 (0x10) / X8B8G8R8 (0xE) and the rest 8-bit unorm. */
+    {
+        const float one = 1.0f; u32 one_bits; memcpy(&one_bits, &one, 4);
+        check_true("alpha_ref_fp16", rsx_fp_alpha_ref(0x12343C00u, 0x0Bu) == 1.0f);
+        check_true("alpha_ref_fp32", rsx_fp_alpha_ref(one_bits, 0x0Cu) == 1.0f);
+        check_true("alpha_ref_x32", rsx_fp_alpha_ref(one_bits, 0x0Du) == 1.0f);
+        check_true("alpha_ref_a8b8g8r8", rsx_fp_alpha_ref(0x3C80u, 0x10u) == 128.0f / 255.0f);
+        check_true("alpha_ref_x8b8g8r8", rsx_fp_alpha_ref(0x3C80u, 0x0Eu) == 128.0f / 255.0f);
+        check_true("alpha_ref_a8r8g8b8", rsx_fp_alpha_ref(0x1FFu, 0x08u) == 1.0f);
+    }
+
+    /* RPCS3 NVIDIA FLR: _builtin_floor(x) = floor(x + 0.000001)
+     * (FragmentProgramDecompiler.cpp:972-983, has_low_precision_rounding). */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x11) | OUTMASK_ALL | INSRC(1) | END);   /* FLR r0, COL0 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_decompile(prog, sizeof prog, CTRL_32BIT, hlsl, sizeof hlsl);
+        check("flr_nv_bias", hlsl, ") + 0.000001)");
+    }
+
+    /* RET (RPCS3 AddFlowOp("return") inside fs_main): the body moves into
+     * _rsx_fs_main over static registers, main still exports after it. */
+    {
+        u8 prog[32];
+        put_word(prog +  0, OPC(0x05));                                 /* RET if cc0.x > 0 */
+        put_word(prog +  4, 1u << 20);
+        put_word(prog +  8, 1u << 31);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);  /* MOV r0, COL0 */
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        rsx_fp_decompile(prog, sizeof prog, CTRL_32BIT, hlsl, sizeof hlsl);
+        const char* fn = strstr(hlsl, "void _rsx_fs_main(PSInput input) {\n");
+        const char* ret = strstr(hlsl, "    if (any(cc0.xxxx > 0.0)) return;\n");
+        const char* mn = strstr(hlsl, "float4 main(PSInput input) : SV_TARGET {\n");
+        const char* call = strstr(hlsl, "    _rsx_fs_main(input);\n");
+        const char* exp = strstr(hlsl, "    float4 _o = r[0];\n    return _o;\n}\n");
+        check("ret_static_regs", hlsl, "static float4 r[48]; static float4 h[48];\n");
+        check_true("ret_layout", fn && ret && mn && call && exp &&
+                                 fn < ret && ret < mn && mn < call && call < exp);
+        check_absent("ret_not_skipped", hlsl, "flow-control op skipped");
+        check_absent("ret_marker_gone", hlsl, "_rsx_fs_main_end");
+        check_true("ret_alpha_test", rsx_fp_apply_alpha_test(hlsl, sizeof hlsl, 0x201u, 0.5f) == 1);
+        /* a program without RET keeps the single-function text */
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        rsx_fp_decompile(prog, 16, CTRL_32BIT, hlsl, sizeof hlsl);
+        check_absent("no_ret_no_split", hlsl, "_rsx_fs_main");
+    }
+
+    /* Branch join (RPCS3 RegisterDependencyPass.cpp:373-444): h1 written on
+     * the if path, r0 on the else path, r0 read after the join -- the if
+     * path ends with the r0.zw <- h1 barrier. */
+    {
+        u8 prog[64];
+        put_word(prog +  0, OPC(0x02));                                 /* IFE cc0.x > 0 */
+        put_word(prog +  4, 1u << 20);
+        put_word(prog +  8, (1u << 31) | (32u >> 2));
+        put_word(prog + 12, 48u >> 2);
+        put_word(prog + 16, OPC(0x01) | OUTMASK_ALL | OUTHALF | OUTREG(1) | INSRC(1)); /* MOV h1, COL0 */
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 0);
+        put_word(prog + 32, OPC(0x01) | OUTMASK_ALL | INSRC(2));        /* MOV r0, COL1 */
+        put_word(prog + 36, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 40, 0);
+        put_word(prog + 44, 0);
+        put_word(prog + 48, OPC(0x01) | OUTMASK_ALL | OUTREG(2) | END); /* MOV r2, r0 */
+        put_word(prog + 52, T_TEMP | REG(0) | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 56, 0);
+        put_word(prog + 60, 0);
+        rsx_fp_decompile(prog, sizeof prog, CTRL_32BIT, hlsl, sizeof hlsl);
+        const char* h1w = strstr(hlsl, "input.col0");
+        const char* bz = strstr(hlsl, "    r[0].z = asfloat((asuint(r[0].z) & 0xFFFF0000u) | (f32tof16(h[1].x) & 0xFFFFu));\n");
+        const char* bw = strstr(hlsl, "    r[0].w = asfloat((asuint(r[0].w) & 0xFFFFu) | (f32tof16(h[1].w) << 16));\n");
+        const char* els = strstr(hlsl, "    } else {\n");
+        check_true("join_barrier_in_if_path", h1w && bz && bw && els && h1w < bz && bz < els && bw < els);
+        check_absent("join_no_xy_barrier", hlsl, "r[0].x = asfloat");
+        check_absent("join_markers_stripped", hlsl, "/*@B");
+    }
+
+    /* Point/line draws on NVIDIA (low_precision_tests): set ops and the
+     * alpha test compare CMP_FIXUP(a) = sign(a) * 16 + a. */
+    {
+        u8 prog[16];
+        u32 nk = 0;
+        rsx_fp_frag_state fs;
+        put_word(prog + 0, OPC(0x0A) | OUTMASK_ALL | INSRC(1) | END);   /* SLT r0, COL0, r0 */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, T_TEMP | REG(0) | SWZ_IDENT);
+        put_word(prog + 12, 0);
+        memset(&fs, 0, sizeof fs);
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, NULL, NULL, &fs,
+                                hlsl, sizeof hlsl, &nk);
+        check_absent("cmpfix_off", hlsl, "_rsx_cmpfix");
+        fs.low_precision_tests = 1;
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, NULL, NULL, &fs,
+                                hlsl, sizeof hlsl, &nk);
+        check("cmpfix_define", hlsl, "#define _rsx_cmpfix(a) (sign(a) * 16.0 + (a))\n");
+        check("cmpfix_slt", hlsl, "(float4)(_rsx_cmpfix(");
+        check_true("cmpfix_alpha_applied", rsx_fp_apply_alpha_test_buffered(hlsl, sizeof hlsl, 0x201u) == 1);
+        check("cmpfix_alpha", hlsl, "_rsx_cmpfix(_rsx_out.a) < _rsx_cmpfix(_rsx_alpha_ref)");
+        /* H2-01: RPCS3 gates both the compare fixup and the FLR bias on an
+         * NVIDIA host. */
+        fs.host_not_nvidia = 1;
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, NULL, NULL, &fs,
+                                hlsl, sizeof hlsl, &nk);
+        check_absent("cmpfix_not_nv", hlsl, "_rsx_cmpfix");
+        put_word(prog + 0, OPC(0x11) | OUTMASK_ALL | INSRC(1) | END);   /* FLR r0, COL0 */
+        rsx_fp_decompile_engine(prog, sizeof prog, CTRL_32BIT, 0, 0, NULL, NULL, NULL, &fs,
+                                hlsl, sizeof hlsl, &nk);
+        check_absent("flr_not_nv_no_bias", hlsl, "0.000001");
+        check("flr_not_nv_floor", hlsl, "floor(");
     }
 
     printf("\n===========================================\n");
