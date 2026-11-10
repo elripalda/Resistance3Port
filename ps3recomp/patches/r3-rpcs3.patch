@@ -513,10 +513,10 @@ index 3b3c9a0..56cc070 100644
 +endif()
 diff --git a/README.port.md b/README.port.md
 new file mode 100644
-index 0000000..a9ebd89
+index 0000000..f052c10
 --- /dev/null
 +++ b/README.port.md
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,88 @@
 +# Vendored RPCS3 RSX (Resistance 2 port)
 +
 +Origin: https://github.com/RPCS3/rpcs3 at commit `eee3f0f`, licensed GPLv2 (see `LICENSE`).
@@ -565,6 +565,7 @@ index 0000000..a9ebd89
 +| `rpcs3/Emu/RSX/Core/RSXCoreRenderer.cpp`, `RSXFIFO.cpp`, `RSXThread.cpp` | R3 only, diagnostics: `R2_DRAWLOG=<seconds>[:frames]` (per-draw state log, `R2_DRAWLOG_M=1` adds every method) and `R2_DRAWSTATS=1` (draws per frame). |
 +| `rpcs3/Emu/RSX/VK/VKR2Upscaler.cpp` | R3 only: logical frame split for DLSS/FSR (`RSX_AA_SPLIT`, R3 renders the next frame's pre-pass before the flip). Relaxed ZCULL sync is the R3 default (set in the bridge; `R2_ZCULL=sync` = strict). |
 +| `port_prof.h`, `Core/RSXCoreRenderer.cpp`, `Common/texture_cache.h`, `VK/VKGSRender.cpp` | Round 7 profiling: `now_ns` uses the invariant TSC (scaled once against QPC) instead of `steady_clock`, so the ~40 timestamps per draw disturb `R2_RSX_PROF` runs less. New counters: draw-window split (`begin` incl. fb-bind vs cond-render, `end` phases vs rest, methods between begin/end, post-draw tail), lock-phase internals (superseded invalidation, create+reprotect, fresh-lock reasons, superseded surfaces) and invalidation internals (intersection, unprotect, fast discards). Relaxed ZCULL sync is now the default on both ports (bridge; `R2_ZCULL=sync` = strict); the bridge profiler monitor caches its RSX thread handles, runs below normal priority and writes each 5 s block once (its own cost is printed on the `monitor:` line). No behaviour change with `R2_RSX_PROF` unset. |
++| FIFO recovery (rp9 crash) | `RSXFIFO.h/.cpp`, `RSXThread.cpp` | `recover_fifo` inside a method batch (`set_get(restore)` + `abort`) no longer lets `read_unsafe` step 4 bytes past the restored GET (upstream bug; with Atomic FIFO fetch the `ensure` in `fetch_u32` then killed rsx::thread). That `ensure` is now a logged resync. The "dead FIFO queue" path (20 recoveries < 2 s) skips GET to PUT and keeps running instead of throwing. Recoveries are logged (rate-limited) in rpcs3_rsx.log: `FIFO: recovering`, `out of step`, `dead command queue`. |
 +
 +## Not vendored / replaced (see `../rpcs3_shim`)
 +
@@ -2206,7 +2207,7 @@ index 7cab474..da22f2f 100644
  
  	bool two_sided_lighting = false;
 diff --git a/rpcs3/Emu/RSX/RSXFIFO.cpp b/rpcs3/Emu/RSX/RSXFIFO.cpp
-index 107f5b2..64c13f0 100644
+index 107f5b2..ab15704 100644
 --- a/rpcs3/Emu/RSX/RSXFIFO.cpp
 +++ b/rpcs3/Emu/RSX/RSXFIFO.cpp
 @@ -10,16 +10,24 @@
@@ -2234,7 +2235,58 @@ index 107f5b2..64c13f0 100644
  	namespace FIFO
  	{
  		FIFO_control::FIFO_control(::rsx::thread* pctrl)
-@@ -761,10 +769,15 @@ namespace rsx
+@@ -170,7 +178,18 @@ namespace rsx
+ 				u32 bytes_read = 0;
+ 
+ 				u32 fifo_code_path = m_next_cmd_entry;
+-				ensure(m_next_cmd_entry >= m_fifo_pos && m_next_cmd_entry < m_fifo_pos + 8192);
++				if (!(m_next_cmd_entry >= m_fifo_pos && m_next_cmd_entry < m_fifo_pos + 8192)) [[unlikely]]
++				{
++					// R2PORT: upstream ensure() here terminated rsx::thread. Command-entry tracking lost after a desync:
++					// parse from the fetch address (only the cache trim at FIFO control commands depends on it).
++					static u32 s_warned = 0;
++					if (s_warned++ < 8)
++					{
++						rsx_log.error("FIFO: command entry 0x%x out of step with GET 0x%x (fetch 0x%x); resyncing", m_next_cmd_entry, m_fifo_pos, addr);
++					}
++
++					m_next_cmd_entry = fifo_code_path = addr;
++				}
+ 
+ 				// Find the next set bit after every iteration
+ 				for (int i = 0;; i = (std::countr_zero<u32>(std::rotl<u8>(to_fetch, 0 - i - 1)) + i + 1) % 8)
+@@ -391,6 +410,16 @@ namespace rsx
+ 				return true;
+ 			}
+ 
++			// R2PORT: a method handler that recovered the FIFO (recover_fifo: set_get(restore point) + abort) leaves
++			// m_fifo_pos on the new GET. Upstream stepped 4 bytes past it here, so the next fetch saw GET != the
++			// command entry and, with atomic FIFO fetch, died on the ensure in fetch_u32 (bench rp9: invalid method
++			// 0x5b00 from a desynced FIFO -> recovery -> rsx::thread terminated, game spinning on 0 draws).
++			if (m_aborted) [[unlikely]]
++			{
++				m_aborted = false;
++				return false;
++			}
++
+ 			m_fifo_pos += 4;
+ 			return false;
+ 		}
+@@ -416,10 +445,13 @@ namespace rsx
+ 		void FIFO_control::abort()
+ 		{
+ 			m_remaining_commands = 0;
++			m_aborted = true; // R2PORT
+ 		}
+ 
+ 		void FIFO_control::read(register_pair& data)
+ 		{
++			m_aborted = false; // R2PORT: only meaningful within one batch
++
+ 			if (m_remaining_commands)
+ 			{
+ 				// Previous block aborted to wait for PUT pointer
+@@ -761,10 +793,15 @@ namespace rsx
  				{
  					performance_counters.FIFO_idle_timestamp = get_system_time();
  					performance_counters.state = FIFO::state::empty;
@@ -2251,7 +2303,7 @@ index 107f5b2..64c13f0 100644
  				}
  
  				return;
-@@ -803,6 +816,7 @@ namespace rsx
+@@ -803,6 +840,7 @@ namespace rsx
  				else
  				{
  					last_known_code_start = offs;
@@ -2259,7 +2311,7 @@ index 107f5b2..64c13f0 100644
  				}
  
  				//rsx_log.warning("rsx jump(0x%x) #addr=0x%x, cmd=0x%x, get=0x%x, put=0x%x", offs, m_ioAddress + get, cmd, get, put);
-@@ -820,6 +834,7 @@ namespace rsx
+@@ -820,6 +858,7 @@ namespace rsx
  				}
  
  				const u32 offs = cmd & RSX_METHOD_CALL_OFFSET_MASK;
@@ -2267,7 +2319,7 @@ index 107f5b2..64c13f0 100644
  				fifo_ret_addr = fifo_ctrl->get_pos() + 4;
  				fifo_ctrl->set_get(offs);
  				last_known_code_start = offs;
-@@ -834,6 +849,7 @@ namespace rsx
+@@ -834,6 +873,7 @@ namespace rsx
  					return;
  				}
  
@@ -2275,7 +2327,7 @@ index 107f5b2..64c13f0 100644
  				// Optimize returning to another CALL
  				if ((ctrl->put & ~3) != fifo_ret_addr)
  				{
-@@ -880,6 +896,8 @@ namespace rsx
+@@ -880,6 +920,8 @@ namespace rsx
  
  		do
  		{
@@ -2284,6 +2336,18 @@ index 107f5b2..64c13f0 100644
  			if (capture_current_frame) [[unlikely]]
  			{
  				const u32 reg = (command.reg & 0xfffc) >> 2;
+diff --git a/rpcs3/Emu/RSX/RSXFIFO.h b/rpcs3/Emu/RSX/RSXFIFO.h
+index d0611bc..2dab12c 100644
+--- a/rpcs3/Emu/RSX/RSXFIFO.h
++++ b/rpcs3/Emu/RSX/RSXFIFO.h
+@@ -162,6 +162,7 @@ namespace rsx
+ 			u32 m_args_ptr = 0;
+ 			u32 m_cmd = ~0u;
+ 			u32 m_next_cmd_entry = ~0u;
++			bool m_aborted = false; // R2PORT: abort() inside a method batch; the batch loop must not step past the new GET
+ 
+ 			u32 m_cache_addr = 0;
+ 			u32 m_cache_size = 0;
 diff --git a/rpcs3/Emu/RSX/RSXOffload.cpp b/rpcs3/Emu/RSX/RSXOffload.cpp
 index 493fc8c..0fc8c33 100644
 --- a/rpcs3/Emu/RSX/RSXOffload.cpp
@@ -2326,7 +2390,7 @@ index 493fc8c..0fc8c33 100644
  
  		return true;
 diff --git a/rpcs3/Emu/RSX/RSXThread.cpp b/rpcs3/Emu/RSX/RSXThread.cpp
-index a572df4..9326619 100644
+index a572df4..23c2183 100644
 --- a/rpcs3/Emu/RSX/RSXThread.cpp
 +++ b/rpcs3/Emu/RSX/RSXThread.cpp
 @@ -1,6 +1,9 @@
@@ -2566,7 +2630,49 @@ index a572df4..9326619 100644
  	bool thread::is_fifo_idle(const context* ctx) const
  	{
  		const auto channel = ctx->fifo.ctrl;
-@@ -2095,7 +2253,7 @@ namespace rsx
+@@ -1761,8 +1919,39 @@ namespace rsx
+ 
+ 		if (kill_itself)
+ 		{
+-			fmt::throw_exception("Dead FIFO commands queue state has been detected!"
+-				"\nTry increasing \"Driver Wake-Up Delay\" setting or setting \"RSX FIFO Accuracy\" to \"%s\", both in Advanced settings. Called from %s", std::min<rsx_fifo_mode>(rsx_fifo_mode{static_cast<u32>(g_cfg.core.rsx_fifo_accuracy.get()) + 1}, rsx_fifo_mode::atomic_ordered), src_loc);
++			// R2PORT: upstream threw here, which terminates rsx::thread and leaves the game spinning on a dead GPU
++			// forever. Native port: the guest is still alive, so drop what is queued instead. GET jumps to PUT (the
++			// commands between them are lost, like a GPU reset on hardware) and the desync history starts over.
++			static u32 s_resyncs = 0;
++			const u32 put = ctrl->put & ~3;
++			if (s_resyncs++ < 16)
++			{
++				rsx_log.error("FIFO: dead command queue detected (20 recoveries in < 2 s, called from %s); skipping to PUT 0x%x (GET was 0x%x)",
++					src_loc, put, fifo_ctrl->get_pos());
++			}
++
++			recovered_fifo_cmds_history = {};
++			fifo_ctrl->set_get(put);
++			fifo_ret_addr = RSX_CALL_STACK_EMPTY;
++			restore_point = put;
++			saved_fifo_ret = RSX_CALL_STACK_EMPTY;
++			last_known_code_start = put;
++			std::this_thread::sleep_for(2ms);
++			fifo_ctrl->abort();
++
++			if (std::exchange(m_ctx->in_begin_end, false) && !REGS(m_ctx)->current_draw_clause.empty())
++			{
++				discard_draw();
++			}
++
++			return;
++		}
++
++		// R2PORT: log the recoveries (rate-limited) so a desync shows up in rpcs3_rsx.log even when it heals
++		static u32 s_r2_recoveries = 0;
++		if (s_r2_recoveries++ < 32)
++		{
++			rsx_log.error("FIFO: recovering, GET 0x%x -> restore point 0x%x (called from %s)", fifo_ctrl->get_pos(), restore_point, src_loc);
+ 		}
+ 
+ 		// Error. Should reset the queue
+@@ -2095,7 +2284,7 @@ namespace rsx
  		switch (request_code)
  		{
  		case rsx::mm_backend_ctrl::cmd_mm_flush:
@@ -2575,7 +2681,7 @@ index a572df4..9326619 100644
  			break;
  		default:
  			if (!m_renderer->on_renderctl(request_code, args))
-@@ -2168,6 +2326,25 @@ namespace rsx
+@@ -2168,6 +2357,25 @@ namespace rsx
  
  	void thread::on_frame_end(context* ctx, u32 buffer, bool forced)
  	{
@@ -2601,7 +2707,7 @@ index a572df4..9326619 100644
  		bool pause_emulator = false;
  
  		// MM sync. This is a pre-emptive operation, so we can use a deferred request.
-@@ -2277,9 +2454,29 @@ namespace rsx
+@@ -2277,9 +2485,29 @@ namespace rsx
  			thread_ctrl::wait_for(30'000);
  		}
  
