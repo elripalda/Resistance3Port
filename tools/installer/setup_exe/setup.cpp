@@ -869,11 +869,17 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
 
     // follow the build logs for Ninja's [N/M] (build_rpcs3.log is not echoed to the console)
     std::atomic<bool> stop{false};
+    // a ticking clock on the step line and a note during quiet stretches, so a long step never looks hung
+    std::mutex stepMx;
+    wstring stepBase;
+    ULONGLONG stepT0 = GetTickCount64();
+    std::atomic<ULONGLONG> lastOut{GetTickCount64()};
     std::thread tail([&] {
         auto logs = BuildLogs();
         Meter meter;
-        ULONGLONG lastShown = 0;
+        ULONGLONG lastShown = 0, lastFeed = 0, lastClock = 0;
         while (!stop) {
+            bool fed = false;
             for (auto& b : logs) {
                 WIN32_FILE_ATTRIBUTE_DATA fa{};
                 if (!GetFileAttributesExW(P(b.rel).c_str(), GetFileExInfoStandard, &fa) || CompareFileTime(&fa.ftLastWriteTime, &start) < 0) continue;
@@ -904,20 +910,41 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
                 if (b.enc == 1) {
                     wstring w((const wchar_t*)b.pend.data(), b.pend.size() / 2);
                     size_t a = 0, i;
-                    while ((i = w.find(L'\n', a)) != wstring::npos) { meter.Feed(Trim(w.substr(a, i - a)), b); a = i + 1; }
+                    while ((i = w.find(L'\n', a)) != wstring::npos) { fed |= meter.Feed(Trim(w.substr(a, i - a)), b); a = i + 1; }
                     b.pend.erase(0, a * 2);
                 } else {
                     size_t a = 0, i;
                     while ((i = b.pend.find('\n', a)) != std::string::npos) {
-                        meter.Feed(Trim(Widen(b.pend.substr(a, i - a), CP_UTF8)), b);
+                        fed |= meter.Feed(Trim(Widen(b.pend.substr(a, i - a), CP_UTF8)), b);
                         a = i + 1;
                     }
                     b.pend.erase(0, a);
                 }
             }
-            if (meter.m && GetTickCount64() - lastShown > 900) {
+            ULONGLONG now = GetTickCount64();
+            if (fed) lastFeed = now;
+            bool quiet = now - lastOut > 30000 && now - lastFeed > 30000;
+            if (meter.m && now - lastShown > 900) {
                 SetDetail(meter.Text(), meter.Progress());
-                lastShown = GetTickCount64();
+                lastShown = now;
+            }
+            if (!g_console && now - lastClock >= 1000) {
+                lastClock = now;
+                wstring base;
+                ULONGLONG t0;
+                { std::lock_guard<std::mutex> lk(stepMx); base = stepBase; t0 = stepT0; }
+                if (!base.empty()) {
+                    ULONGLONG s = (now - t0) / 1000;
+                    wstring clock = s >= 3600 ? Fmt(L"%d:%02d:%02d", (int)(s / 3600), (int)(s / 60 % 60), (int)(s % 60))
+                                              : Fmt(L"%d:%02d", (int)(s / 60), (int)(s % 60));
+                    std::lock_guard<std::mutex> lk(g_ui.mx);
+                    g_ui.step = base + L"   (" + clock + L")";
+                    if (quiet && !meter.m)
+                        g_ui.detail = Fmt(L"Still working: no new messages for %d min %02d s. Some steps print nothing for 10+ minutes; this is normal.",
+                                          (int)((now - lastOut) / 60000), (int)((now - lastOut) / 1000 % 60));
+                    g_ui.dirty = true;
+                }
+                Kick();
             }
             for (int k = 0; k < 10 && !stop; ++k) Sleep(100);
         }
@@ -929,12 +956,14 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
         wstring l = Trim(raw);
         if (l.empty()) return;
         LogRaw(L"| " + raw);
+        lastOut = GetTickCount64();
         if (!g_console) { std::lock_guard<std::mutex> lk(g_ui.mx); g_ui.lines.push_back(l); if (g_ui.lines.size() > 2000) g_ui.lines.pop_front(); Kick(); }
         last.push_back(l);
         if (last.size() > 400) last.pop_front();
         if (StartsWith(l, L"== ")) {
             wstring s = l.substr(3);
             SetStep(s);
+            { std::lock_guard<std::mutex> lk(stepMx); stepBase = s; stepT0 = GetTickCount64(); }
             int p = StartsWith(s, L"1/5") ? 50 : StartsWith(s, L"2/5") ? 100 : StartsWith(s, L"3/5") ? 200 : StartsWith(s, L"4/5") ? 230 : StartsWith(s, L"5/5") ? 280 : 20;
             SetDetail(L"", p);
         } else if (StartsWith(l, L"SETUP STOPPED")) {
