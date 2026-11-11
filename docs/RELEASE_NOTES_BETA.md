@@ -13,6 +13,7 @@ This is a **beta**. Only the intro and the opening Haven level have been played 
 Setup fixes only; the game itself is unchanged from 0.2.0.
 
 - **Progress bar during the build.** The bar no longer stops partway while the game compiles; it follows the build to the end, so Setup no longer looks stuck.
+- **Setup shows that it is working:** a running clock for each step, the game copy in GB with the time left, the time left while the game compiles, and a "still working" note during steps that print nothing for several minutes.
 - **The installer now opens the Setup window** (with the progress bar and your game already filled in) instead of a console window. Click **Install** there.
 - **Much smaller build logs.** The compiler was set to report every possible warning, which made `logs\build.log` grow past 150 MB and slowed the build. It now reports normal warnings only.
 - **Low-RAM PCs:** if the build runs out of memory, Setup again detects it and retries with fewer parallel jobs (this check could not read the build log in 0.2.0).
