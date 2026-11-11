@@ -64,15 +64,15 @@ Source: "{#StageDir}\tools\installer\game_profile.psd1"; Flags: dontcopy
 
 [Icons]
 Name: "{autoprograms}\{#PortName}\{#PortName}"; Filename: "{app}\Launcher.exe"; WorkingDir: "{app}"; IconFilename: "{app}\project\launcher.ico"
-Name: "{autoprograms}\{#PortName}\Setup (locate game, rebuild)"; Filename: "{app}\Setup.bat"; WorkingDir: "{app}"; IconFilename: "{app}\project\launcher.ico"
+Name: "{autoprograms}\{#PortName}\Setup (locate game, rebuild)"; Filename: "{app}\Setup.exe"; WorkingDir: "{app}"; IconFilename: "{app}\project\launcher.ico"
 Name: "{autoprograms}\{#PortName}\Uninstall"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#PortName}"; Filename: "{app}\Launcher.exe"; WorkingDir: "{app}"; IconFilename: "{app}\project\launcher.ico"; Tasks: desktopicon
 
 [Run]
-Filename: "{cmd}"; Parameters: "/c """"{app}\Setup.bat"" {code:GameArg}"""; WorkingDir: "{app}"; Description: "Run the first-time setup now (copies your game files and builds the port)"; Flags: postinstall nowait skipifsilent
+Filename: "{app}\Setup.exe"; Parameters: "{code:GameArg}"; WorkingDir: "{app}"; Description: "Open Setup now to build the port from your game (shows progress; click Install there)"; Flags: postinstall nowait skipifsilent
 
 [UninstallDelete]
-; Files made by Setup.bat and the build. Settings are copied to Saved Games first (see usUninstall below).
+; Files made by Setup and the build. Settings are copied to Saved Games first (see usUninstall below).
 Type: filesandordirs; Name: "{app}\build"
 Type: filesandordirs; Name: "{app}\build_game"
 Type: filesandordirs; Name: "{app}\build_regen"
@@ -261,7 +261,7 @@ begin
   WizardForm.Refresh;
   if not RunCheck('-Game ' + QuoteArg(P) + ' -Dest ' + QuoteArg(WizardDirValue + '\gamefiles'), Lines) then
   begin
-    StatusText.Caption := 'The game files could not be checked here. Setup.bat checks them when it runs.';
+    StatusText.Caption := 'The game files could not be checked here. Setup checks them when it runs.';
     Exit;
   end;
   St := Field(Lines, 'status');
@@ -282,7 +282,7 @@ begin
     Result := False;
   end
   else
-    StatusText.Caption := 'The game files could not be checked here. Setup.bat checks them when it runs.';
+    StatusText.Caption := 'The game files could not be checked here. Setup checks them when it runs.';
 end;
 
 procedure InitializeWizard;
@@ -301,7 +301,7 @@ begin
   Intro.Width := GamePage.SurfaceWidth;
   Intro.Height := ScaleY(30);
   Intro.Caption := 'Use a decrypted disc image (.iso) or a disc dump folder (the one that contains PS3_GAME). ' +
-                   'Copies found on this PC are listed below. Leave the path empty to choose the game later with Setup.bat.';
+                   'Copies found on this PC are listed below. Leave the path empty to choose the game later in Setup.';
 
   FoundList := TNewListBox.Create(GamePage);
   FoundList.Parent := GamePage.Surface;
@@ -381,7 +381,7 @@ function GameArg(Param: String): String;
 begin
   Result := '';
   if Trim(PathEdit.Text) <> '' then
-    Result := '-Game "' + Trim(PathEdit.Text) + '"';
+    Result := '--game ' + QuoteArg(Trim(PathEdit.Text));
 end;
 
 function UpdateReadyMemo(Space, NewLine, MemoUserInfoInfo, MemoDirInfo, MemoTypeInfo, MemoComponentsInfo, MemoGroupInfo, MemoTasksInfo: String): String;
@@ -392,7 +392,7 @@ begin
   if Trim(PathEdit.Text) <> '' then
     Result := Result + Trim(PathEdit.Text) + NewLine + Space + '(copied into the install folder by the first-time setup)'
   else
-    Result := Result + 'choose it later with Setup.bat';
+    Result := Result + 'choose it later in Setup';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

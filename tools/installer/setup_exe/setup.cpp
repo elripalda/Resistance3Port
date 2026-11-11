@@ -276,7 +276,7 @@ static void LogRaw(const wstring& s) {
     fflush(g_log);
 }
 
-enum { WM_APP_UI = WM_APP + 1, WM_APP_DONE, WM_APP_TOOLS };
+enum { WM_APP_UI = WM_APP + 1, WM_APP_DONE, WM_APP_TOOLS, WM_APP_PREFILL };
 struct UiState {
     std::mutex mx;
     std::deque<wstring> lines;
@@ -633,7 +633,13 @@ static void ApplyJobs(const Jobs& j) {
 }
 
 // ---------------------------------------------------------------- build progress and errors
-struct BuildLog { wstring rel, what; int lo, hi; LONGLONG off = 0; std::string pend; };
+// Windows PowerShell's Tee-Object writes UTF-16LE with a BOM; everything else is UTF-8
+static bool IsUtf16Bom(const std::string& s) { return s.size() >= 2 && (unsigned char)s[0] == 0xFF && (unsigned char)s[1] == 0xFE; }
+static wstring DecodeLog(const std::string& s) {
+    if (IsUtf16Bom(s)) return wstring((const wchar_t*)(s.data() + 2), (s.size() - 2) / 2);
+    return Widen(s, CP_UTF8);
+}
+struct BuildLog { wstring rel, what; int lo, hi; LONGLONG off = 0; std::string pend; int enc = -1; /* -1 unknown, 0 UTF-8, 1 UTF-16LE */ };
 static std::vector<BuildLog> BuildLogs() {
     if (TwoPrograms()) return {{L"logs\\build.log", L"Building the front end", 30, 50}, {L"logs\\build_game.log", L"Building the game", 50, 98}};
     if (NeedsRpcs3()) return {{L"logs\\build_rpcs3.log", L"Building the RPCS3 renderer", 30, 42}, {L"logs\\build.log", L"Building the game", 42, 98}};
@@ -681,8 +687,10 @@ static wstring RecentBuildLogText(const FILETIME& since) {
         if (!GetFileAttributesExW(P(b.rel).c_str(), GetFileExInfoStandard, &fa) || CompareFileTime(&fa.ftLastWriteTime, &since) < 0) continue;
         std::string s;
         if (!ReadBytes(P(b.rel), s)) continue;
+        bool u16 = IsUtf16Bom(s);
         if (s.size() > 512 * 1024) s.erase(0, s.size() - 512 * 1024);
-        all += Widen(s, CP_UTF8) + L"\n";
+        if (u16) { if (s.size() & 1) s.erase(0, 1); all += wstring((const wchar_t*)s.data(), s.size() / 2) + L"\n"; }
+        else all += Widen(s, CP_UTF8) + L"\n";
     }
     return all;
 }
@@ -874,7 +882,15 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
                 if (size == b.off) continue;
                 HANDLE h = CreateFileW(P(b.rel).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
                 if (h == INVALID_HANDLE_VALUE) continue;
-                if (size - b.off > 4 * 1024 * 1024) { b.off = size - 64 * 1024; b.pend.clear(); }
+                if (b.enc < 0) {
+                    if (size < 2) { CloseHandle(h); continue; }
+                    char bom[2] = {};
+                    DWORD g2 = 0;
+                    ReadFile(h, bom, 2, &g2, nullptr);
+                    b.enc = (g2 == 2 && (unsigned char)bom[0] == 0xFF && (unsigned char)bom[1] == 0xFE) ? 1 : 0;
+                    if (b.enc == 1 && b.off == 0) b.off = 2;
+                }
+                if (size - b.off > 4 * 1024 * 1024) { b.off = size - 64 * 1024; if (b.enc == 1) b.off &= ~1LL; b.pend.clear(); }
                 LARGE_INTEGER li;
                 li.QuadPart = b.off;
                 SetFilePointerEx(h, li, nullptr, FILE_BEGIN);
@@ -885,12 +901,19 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
                 chunk.resize(got);
                 b.off += got;
                 b.pend += chunk;
-                size_t a = 0, i;
-                while ((i = b.pend.find('\n', a)) != std::string::npos) {
-                    meter.Feed(Trim(Widen(b.pend.substr(a, i - a), CP_UTF8)), b);
-                    a = i + 1;
+                if (b.enc == 1) {
+                    wstring w((const wchar_t*)b.pend.data(), b.pend.size() / 2);
+                    size_t a = 0, i;
+                    while ((i = w.find(L'\n', a)) != wstring::npos) { meter.Feed(Trim(w.substr(a, i - a)), b); a = i + 1; }
+                    b.pend.erase(0, a * 2);
+                } else {
+                    size_t a = 0, i;
+                    while ((i = b.pend.find('\n', a)) != std::string::npos) {
+                        meter.Feed(Trim(Widen(b.pend.substr(a, i - a), CP_UTF8)), b);
+                        a = i + 1;
+                    }
+                    b.pend.erase(0, a);
                 }
-                b.pend.erase(0, a);
             }
             if (meter.m && GetTickCount64() - lastShown > 900) {
                 SetDetail(meter.Text(), meter.Progress());
@@ -1090,10 +1113,11 @@ static int DryRun() {
         BuildLog src{L"(log)", L"Building", 30, 98};
         Meter m;
         int lines = 0, updates = 0;
-        for (auto& l : Split(Widen(b, CP_UTF8), L'\n')) { ++lines; if (m.Feed(Trim(l), src)) ++updates; }
+        wstring text = DecodeLog(b);
+        for (auto& l : Split(text, L'\n')) { ++lines; if (m.Feed(Trim(l), src)) ++updates; }
         ConsoleWrite(Fmt(L"== Parsed %s: %d lines, %d progress lines, last [%d/%d] = %d.%d%% of the bar, out of memory: %s\r\n\r\n",
                          g_opt.parseLog.c_str(), lines, updates, m.n, m.m, m.Progress() / 10, m.Progress() % 10,
-                         LooksLikeOom(Widen(b, CP_UTF8)) ? L"YES (would retry with fewer jobs)" : L"no"));
+                         LooksLikeOom(text) ? L"YES (would retry with fewer jobs)" : L"no"));
         return 0;
     }
 
@@ -1271,7 +1295,7 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         Ctl(w, L"BUTTON", L"1   Build tools", BS_GROUPBOX, 12, 64, 676, 80, 0);
         h_tools = Ctl(w, L"STATIC", L"Checking the build tools...", 0, 24, 84, 652, 54, 0);
         Ctl(w, L"BUTTON", L"2   Your game", BS_GROUPBOX, 12, 150, 676, 116, 0);
-        h_game = Ctl(w, L"EDIT", GetState(L"game").c_str(), WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 24, 172, 452, 24, ID_GAME);
+        h_game = Ctl(w, L"EDIT", (g_opt.game.empty() ? GetState(L"game") : g_opt.game).c_str(), WS_BORDER | ES_AUTOHSCROLL | WS_TABSTOP, 24, 172, 452, 24, ID_GAME);
         Ctl(w, L"BUTTON", L"ISO...", WS_TABSTOP, 484, 171, 90, 26, ID_ISO);
         Ctl(w, L"BUTTON", L"Folder...", WS_TABSTOP, 582, 171, 94, 26, ID_FOLDER);
         h_gameSt = Ctl(w, L"STATIC", L"", 0, 24, 202, 652, 58, 0);
@@ -1301,11 +1325,16 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         EnableWindow(h_cancel, FALSE);
         UpdateGoButton();
         ShowGameState();
+        if (!g_opt.game.empty() && !HaveGameFiles())  // the installer passes the copy picked in its wizard
+            PostMessageW(w, WM_APP_PREFILL, 0, 0);
         g_busy = true;
         EnableWindow(h_go, FALSE);
         std::thread([] { CheckTools(); if (g_hwnd) PostMessageW(g_hwnd, WM_APP_TOOLS, 0, 0); }).detach();
         return 0;
     }
+    case WM_APP_PREFILL:
+        CheckPickedGame(g_opt.game);
+        return 0;
     case WM_APP_TOOLS:
         SetWindowTextW(h_tools, ToolsText().c_str());
         if (!g_worker.joinable()) { g_busy = false; EnableWindow(h_go, TRUE); }
@@ -1438,7 +1467,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         OpenConsole();
         ConsoleWrite(L"Setup.exe: one-click setup of this PC port (window). Options:\r\n"
                      L"  --dry-run            check this PC and print what Setup would do; changes nothing\r\n"
-                     L"  --game <iso|folder>  with --dry-run: also check that game copy\r\n"
+                     L"  --game <iso|folder>  fill in the game copy (the installer passes it); with --dry-run: also check it\r\n"
                      L"  --uninstall          remove what Setup made (with --dry-run: only list it)\r\n"
                      L"  --ram-gb N, --free-gb N, --cores N, --ppu-gb N, --reduce N\r\n"
                      L"                       pretend this RAM / free RAM / core count / GB per big file / out-of-memory retry\r\n"

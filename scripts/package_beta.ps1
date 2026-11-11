@@ -164,7 +164,7 @@ foreach ($h in $hits) { Fail "the installer would ship $h" }
 foreach ($f in 'README.md', 'LICENSE', 'THIRD_PARTY_NOTICES.md', 'VERSION', 'docs/RELEASE_NOTES_BETA.md', 'docs/REPORTING.md', 'docs/INSTALL.md') {
     if ((Test-Path -LiteralPath (Join-Path $Repo $f)) -and ($set -notcontains $f)) { Warn "$f is not in the installer yet: build_installer.ps1 only picks up new files under project/, tools/, ps3recomp/, docs/ and the root, so commit it" }
 }
-# Setup.exe is gitignored: it goes into the release zip (below), not into the Inno installer, which runs Setup.bat.
+# Setup.exe is gitignored: it is added to the release zip (below) and to the Inno installer, which opens it after installing.
 
 $sizes = @($set | ForEach-Object { [pscustomobject]@{ Rel = $_; Len = (Get-Item -LiteralPath (Join-Path $Repo $_)).Length } })
 $total = ($sizes | Measure-Object Len -Sum).Sum

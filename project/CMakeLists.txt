@@ -403,8 +403,14 @@ endif()
 # Compiler-specific flags
 # ---------------------------------------------------------------------------
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    # clang-cl reads -Wall as /Wall (= -Weverything): hundreds of MB of warnings
+    # in the build log and console. /W3 is its usual level.
+    if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
+        target_compile_options(${PROJECT_NAME} PRIVATE /W3)
+    else()
+        target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    endif()
     target_compile_options(${PROJECT_NAME} PRIVATE
-        -Wall -Wextra -Wno-unused-parameter
         -fno-strict-aliasing
         # The lift spells PPC arithmetic as signed C arithmetic, which must wrap;
         # without this, clang exploits overflow UB (e.g. folds "x*x < 0" to false).

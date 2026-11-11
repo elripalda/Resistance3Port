@@ -67,6 +67,9 @@ if (-not $Launcher) {
 }
 if (-not $Launcher -or -not (Test-Path $Launcher)) { throw "No Launcher.exe found. Build it first (build.bat), or pass -Launcher <path>." }
 Copy-Item $Launcher "$Stage\Launcher.exe" -Force
+# Setup.exe (the window with the progress bar) is what the installer opens after installing.
+if (-not (Test-Path "$Repo\Setup.exe")) { throw "No Setup.exe found. Build it first: tools\installer\setup_exe\build_setup.bat" }
+Copy-Item "$Repo\Setup.exe" "$Stage\Setup.exe" -Force
 foreach ($h in 'RFoMSwitch.exe') {
     $src = @("$Repo\build_dist\$h", "$Repo\build\$h") | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($src) { Copy-Item $src "$Stage\$h" -Force }

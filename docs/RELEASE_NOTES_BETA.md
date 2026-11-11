@@ -1,12 +1,23 @@
 # Resistance 3 PC port: community beta release notes
 
-**Version:** 0.2.0-beta (GitHub pre-release). **Release date:** _to be filled in on release_.
+**Version:** 0.2.1-beta (GitHub pre-release). **Release date:** _to be filled in on release_.
 
 A native PC port of *Resistance 3* (PS3) built by static recompilation: the game's PowerPC and SPU code is translated to C/C++ and compiled for Windows. Graphics go through RPCS3's Vulkan renderer, built into the game as a library.
 
 > **No game files and no prebuilt game are included.** This release is the source code plus Setup. You need your own legally dumped copy of the game (see *Install*); Setup builds the game on your PC from that copy.
 
 This is a **beta**. Only the intro and the opening Haven level have been played through so far, on one PC (Ryzen 5 5600X, GeForce RTX 5070, Windows 11). Expect bugs, and please report them (see *Reporting problems*).
+
+## 0.2.1-beta (setup hotfix)
+
+Setup fixes only; the game itself is unchanged from 0.2.0.
+
+- **Progress bar during the build.** The bar no longer stops partway while the game compiles; it follows the build to the end, so Setup no longer looks stuck.
+- **The installer now opens the Setup window** (with the progress bar and your game already filled in) instead of a console window. Click **Install** there.
+- **Much smaller build logs.** The compiler was set to report every possible warning, which made `logs\build.log` grow past 150 MB and slowed the build. It now reports normal warnings only.
+- **Low-RAM PCs:** if the build runs out of memory, Setup again detects it and retries with fewer parallel jobs (this check could not read the build log in 0.2.0).
+
+If 0.2.0 is already built and runs, you don't need this update.
 
 ## What's in this beta
 
