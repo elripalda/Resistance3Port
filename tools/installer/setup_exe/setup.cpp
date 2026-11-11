@@ -869,7 +869,22 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
 
     // follow the build logs for Ninja's [N/M] (build_rpcs3.log is not echoed to the console)
     std::atomic<bool> stop{false};
-    // a ticking clock on the step line and a note during quiet stretches, so a long step never looks hung
+    // a ticking clock on the step line and a note during quiet stretches, so a long step never looks hung;
+    // while the game is copied, an ETA from the size of gamefiles\ (Write-Progress does not reach us)
+    std::function<double(const wstring&)> dirBytes = [&](const wstring& d) {
+        double t = 0;
+        WIN32_FIND_DATAW fd;
+        HANDLE h = FindFirstFileW((d + L"\\*").c_str(), &fd);
+        if (h == INVALID_HANDLE_VALUE) return t;
+        do {
+            if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L"..")) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) t += dirBytes(d + L"\\" + fd.cFileName);
+            else t += (double)(((ULONGLONG)fd.nFileSizeHigh << 32) | fd.nFileSizeLow);
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+        return t;
+    };
     std::mutex stepMx;
     wstring stepBase;
     ULONGLONG stepT0 = GetTickCount64();
@@ -877,7 +892,9 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
     std::thread tail([&] {
         auto logs = BuildLogs();
         Meter meter;
-        ULONGLONG lastShown = 0, lastFeed = 0, lastClock = 0;
+        ULONGLONG lastShown = 0, lastFeed = 0, lastClock = 0, copyT0 = 0;
+        double copy0 = -1, copyNow = 0;
+        int copyTick = 0;
         while (!stop) {
             bool fed = false;
             for (auto& b : logs) {
@@ -937,8 +954,21 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
                     ULONGLONG s = (now - t0) / 1000;
                     wstring clock = s >= 3600 ? Fmt(L"%d:%02d:%02d", (int)(s / 3600), (int)(s / 60 % 60), (int)(s % 60))
                                               : Fmt(L"%d:%02d", (int)(s / 60), (int)(s % 60));
+                    int copyProg = -1;
+                    if (StartsWith(base, L"2/5") && g_prof.minBytes > 0) {
+                        if (copyTick++ % 2 == 0) {
+                            copyNow = dirBytes(P(L"gamefiles"));
+                            if (copy0 < 0) { copy0 = copyNow; copyT0 = now; }
+                        }
+                        double total = std::max(g_prof.minBytes, copyNow * 1.01);
+                        clock += Fmt(L"  \x2022  %.1f of about %.1f GB", copyNow / 1e9, total / 1e9);
+                        double el = (now - copyT0) / 1000.0, done = copyNow - copy0;
+                        if (el > 15 && done > 200e6) clock += L"  \x2022  " + Duration((total - copyNow) / (done / el)) + L" left";
+                        copyProg = 100 + (int)(100 * std::min(1.0, copyNow / total));
+                    }
                     std::lock_guard<std::mutex> lk(g_ui.mx);
                     g_ui.step = base + L"   (" + clock + L")";
+                    if (copyProg >= 0) g_ui.progress = copyProg;
                     if (quiet && !meter.m)
                         g_ui.detail = Fmt(L"Still working: no new messages for %d min %02d s. Some steps print nothing for 10+ minutes; this is normal.",
                                           (int)((now - lastOut) / 60000), (int)((now - lastOut) / 1000 % 60));
