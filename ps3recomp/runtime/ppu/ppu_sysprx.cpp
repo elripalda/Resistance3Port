@@ -24,6 +24,7 @@
 #include "../memory/vm.h"   /* VM_HLE_INJECT_BASE -- not platform-specific */
 #include "ps3emu/log_first.h"
 #include "../syscalls/ps3_waitstat.h"   /* ps3_waitstat, ps3_perf_on */
+#include "ps3emu/port_hitch.h"            /* [hitch]: guest wait call sites of the frame loop */
 
 extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
@@ -268,7 +269,9 @@ static void sys_lwmutex_lock(ppu_context* ctx)
             if (timeout_us) { uint64_t m = (timeout_us + 999) / 1000; ms = m > 0xFFFFFFFEull ? 0xFFFFFFFEu : (DWORD)m; }
             DWORD wr = WaitForSingleObject(s, ms);
             if (_ws) { LARGE_INTEGER q1; QueryPerformanceCounter(&q1);
-                       _ws->lwm_block_n++; _ws->lwm_block_qpc += (unsigned long long)(q1.QuadPart - _wq0.QuadPart); }
+                       _ws->lwm_block_n++; _ws->lwm_block_qpc += (unsigned long long)(q1.QuadPart - _wq0.QuadPart);
+                       port_hitch_guest_wait((uint32_t)ctx->lr, q1.QuadPart - _wq0.QuadPart); }
+            PS3_STALL_CHAIN("semstall-lwmutex");
             if (wr == WAIT_TIMEOUT) {           /* honor the timeout: ETIMEDOUT, no acquire */
                 if (lwm_trace()) fprintf(stderr, "[LWM-CONVOY] tid=%llu TIMED-OUT on lwm=0x%08X after %lldus (ETIMEDOUT, retry)\n",
                     (unsigned long long)ctx->thread_id, lwm, lwm_now_us() - _blk_start);
@@ -420,7 +423,9 @@ static void sys_lwcond_wait(ppu_context* ctx)
         vm_write32(lwmutex + LWM_OWNER, own);
         vm_write32(lwmutex + LWM_RECUR, rc ? rc : 1);
         if (ws) { LARGE_INTEGER q1; QueryPerformanceCounter(&q1);
-                  ws->lwc_wait_n++; ws->lwc_wait_qpc += (unsigned long long)(q1.QuadPart - q0.QuadPart); }
+                  ws->lwc_wait_n++; ws->lwc_wait_qpc += (unsigned long long)(q1.QuadPart - q0.QuadPart);
+                  port_hitch_guest_wait((uint32_t)ctx->lr, q1.QuadPart - q0.QuadPart); }
+        PS3_STALL_CHAIN("semstall-lwcond");
     }
     ctx->gpr[3] = 0;
 }
@@ -551,11 +556,12 @@ static void gcm_guest_write32(unsigned int addr, unsigned int val) { vm_write32(
  * garbage-vcall guard no-opped the callback, the FIFO never recycled and the
  * title stopped flipping. One definition, one place. */
 #define GCM_FIFO_CALLBACK_SENTINEL_EA (VM_HLE_INJECT_BASE + 0x2F00u)
-extern "C" void cellGcm_fifo_recycle(unsigned int ctx_ea);
+extern "C" void cellGcm_fifo_recycle_count(unsigned int ctx_ea, unsigned int count);
 extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
 static void hle_gcm_callback(ppu_context* ctx)
 {
-    cellGcm_fifo_recycle((unsigned int)ctx->gpr[3]);   /* r3 = context EA */
+    /* r3 = context EA, r4 = words the title is reserving */
+    cellGcm_fifo_recycle_count((unsigned int)ctx->gpr[3], (unsigned int)ctx->gpr[4]);
     ctx->gpr[3] = 0;                                   /* CELL_OK */
 }
 

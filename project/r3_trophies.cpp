@@ -33,6 +33,7 @@ std::mutex s_mtx;
 std::string s_loaded_comm;
 std::vector<r2t::Trophy> s_list;
 std::string s_title;
+std::vector<int> s_saved;   // ids in the Saved Games record (announced before)
 
 std::string saved_games_dir()
 {
@@ -62,6 +63,7 @@ void load(const char* comm)
         fprintf(stderr, "[trophy] %s not readable: unlocks are recorded without names\n", trp.c_str());
     const std::string sg = saved_games_dir() + "\\trophies.json";
     r2t::merge_json_times(sg.c_str(), s_list);
+    for (auto& x : s_list) if (x.unlocked) s_saved.push_back(x.id);   // before the runtime's record, which already has this unlock
     // the runtime's own record (sceNpTrophy.c), for unlocks made before this mirror existed
     const char* gd = getenv("PS3_GAMEDATA_ROOT");
     const std::string hle = std::string(gd && *gd ? gd : "gamedata") + "/trophies/" + comm + ".json";
@@ -74,6 +76,9 @@ int hook(const char* comm_id, int id, const unsigned char* unlocked, unsigned co
     load(comm_id ? comm_id : "");
     const long long now = (long long)time(nullptr);
     r2t::Trophy* t = nullptr;
+    bool earned = false;   // already in the Saved Games record (e.g. gamedata was reset): no second toast
+    for (int sid : s_saved) if (sid == id) earned = true;
+    if (!earned) s_saved.push_back(id);
     for (auto& x : s_list) {
         if (x.id >= 0 && (unsigned)x.id < count && unlocked[x.id] && !x.unlocked) x.unlocked = now;
         if (x.id == id) t = &x;
@@ -109,7 +114,8 @@ int hook(const char* comm_id, int id, const unsigned char* unlocked, unsigned co
         fprintf(stderr, "[trophy] unlocked #%d %s\n", tid, tr ? tr->name.c_str() : "");
         if (toast) r2pf_toast(head, body.c_str(), tr ? tr->grade : 'B');
     };
-    show(t, id);
+    if (earned) fprintf(stderr, "[trophy] #%d already earned (Saved Games record), not announced again\n", id);
+    else show(t, id);
     if (plat >= 0) {
         const r2t::Trophy* p = nullptr;
         for (auto& x : s_list) if (x.id == plat) p = &x;

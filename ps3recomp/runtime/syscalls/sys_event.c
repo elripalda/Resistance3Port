@@ -3,6 +3,7 @@
  */
 
 #include "sys_event.h"
+#include "ps3emu/port_hitch.h"   /* [hitch] */
 #include "../ps3_log.h"
 #include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -291,7 +292,17 @@ void sys_event_queue_cancel_by_id(uint32_t queue_id)
 /* Diagnostic gates polled on every receive (~140k/s in GH3): read once. */
 static int s_ps3_waitbt = -1, s_ydkj_sputask = -1, s_ydkj_spurs_ready = -1, s_ydkj_fakecomplete = -1, s_ydkj_hle_draw = -1;
 
+static int64_t sys_event_queue_receive_body(ppu_context* ctx);
 int64_t sys_event_queue_receive(ppu_context* ctx)
+{
+    /* [hitch]: blocking waits of the game's frame-loop thread */
+    if (!port_hitch_on_main()) return sys_event_queue_receive_body(ctx);
+    const uint64_t ht = port_hitch_t0();
+    const int64_t r = sys_event_queue_receive_body(ctx);
+    port_hitch_end(PH_SYNC, ht);
+    return r;
+}
+static int64_t sys_event_queue_receive_body(ppu_context* ctx)
 {
     uint32_t queue_id    = LV2_ARG_U32(ctx, 0);
     uint32_t event_addr  = LV2_ARG_PTR(ctx, 1);
@@ -1158,7 +1169,17 @@ static int flag_check(uint64_t pattern, uint64_t bitpat, uint32_t mode)
  * r6 = pointer to receive result pattern (u64*)
  * r7 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
+static int64_t sys_event_flag_wait_body(ppu_context* ctx);
 int64_t sys_event_flag_wait(ppu_context* ctx)
+{
+    /* [hitch]: blocking waits of the game's frame-loop thread */
+    if (!port_hitch_on_main()) return sys_event_flag_wait_body(ctx);
+    const uint64_t ht = port_hitch_t0();
+    const int64_t r = sys_event_flag_wait_body(ctx);
+    port_hitch_end(PH_SYNC, ht);
+    return r;
+}
+static int64_t sys_event_flag_wait_body(ppu_context* ctx)
 {
     uint32_t flag_id    = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);

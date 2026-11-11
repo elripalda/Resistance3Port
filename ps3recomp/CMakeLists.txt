@@ -89,6 +89,17 @@ list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_shader_msl.c
 file(GLOB AT3_SOURCES "third_party/at3_standalone/*.cpp")
 set_source_files_properties(${AT3_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
 list(APPEND HLE_SOURCES ${AT3_SOURCES})
+# Host audio output stage (libs/audio/audio_out.cpp): ring buffer + SoundTouch
+# time stretch, after RPCS3's cellAudio "time stretching". SoundTouch is
+# LGPL-2.1, vendored unmodified in third_party/soundtouch (see its README),
+# built with RPCS3's defines.
+set(SOUNDTOUCH_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/soundtouch")
+file(GLOB SOUNDTOUCH_SOURCES "${SOUNDTOUCH_DIR}/source/SoundTouch/*.cpp")
+set_source_files_properties(${SOUNDTOUCH_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")  # upstream code
+set_source_files_properties(${SOUNDTOUCH_SOURCES} "${CMAKE_CURRENT_SOURCE_DIR}/libs/audio/audio_out.cpp" PROPERTIES
+    COMPILE_DEFINITIONS "ST_NO_EXCEPTION_HANDLING;USE_MULTICH_ALWAYS;SOUNDTOUCH_FLOAT_SAMPLES;SOUNDTOUCH_ALLOW_SSE"
+    INCLUDE_DIRECTORIES "${SOUNDTOUCH_DIR}/include")
+list(APPEND HLE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/libs/audio/audio_out.cpp" ${SOUNDTOUCH_SOURCES})
 
 # Runtime core (syscalls, PPU, SPU, memory)
 file(GLOB_RECURSE RUNTIME_SOURCES
@@ -146,6 +157,21 @@ if(WIN32)
         ole32       # COM for WASAPI audio
         bcrypt      # BCryptGenRandom for SSL RNG
     )
+    # SDL3 gamepads (libs/input/pad_sdl3.c): the default controller backend,
+    # XInput stays as the fallback (PAD_BACKEND=xinput). Static, vendored in
+    # third_party/SDL3 (built from upstream SDL with /MD, see its VERSION.txt).
+    set(PS3RECOMP_SDL3_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/SDL3")
+    if(EXISTS "${PS3RECOMP_SDL3_DIR}/lib/SDL3-static.lib")
+        target_include_directories(ps3recomp_runtime PRIVATE "${PS3RECOMP_SDL3_DIR}/include")
+        target_compile_definitions(ps3recomp_runtime PRIVATE PS3RECOMP_PAD_SDL3=1)
+        target_link_libraries(ps3recomp_runtime PRIVATE
+            "${PS3RECOMP_SDL3_DIR}/lib/SDL3-static.lib"
+            kernel32 user32 gdi32 winmm imm32 ole32 oleaut32 version uuid
+            advapi32 setupapi shell32 hid mincore dinput8 cfgmgr32)
+        message(STATUS "  SDL3:         vendored (gamepad backend enabled)")
+    else()
+        message(STATUS "  SDL3:         not found (controllers: XInput only)")
+    endif()
 else()
     # cellPad and cellAudio select their SDL2 backends unconditionally off
     # Windows (see PAD_BACKEND_SDL2 / AUDIO_BACKEND_SDL2), so SDL2 is required
@@ -433,6 +459,12 @@ if(PS3RECOMP_BUILD_TESTS)
     add_executable(test_log_first tests/test_log_first.c)
     target_include_directories(test_log_first PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/include")
     add_test(NAME log_first COMMAND test_log_first)
+    # r*_trophy_data.h as the launcher's Trophies page uses it: TROPHY.TRP list + icon entries, unlock records merged.
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../project/r3_trophy_data.h" OR EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/../project/r2_trophy_data.h")
+        add_executable(test_trophy_list tests/test_trophy_list.cpp)
+        target_include_directories(test_trophy_list PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../project")
+        add_test(NAME trophy_list COMMAND test_trophy_list WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+    endif()
 
     find_package(Python3 3.10 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)

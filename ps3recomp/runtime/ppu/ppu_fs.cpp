@@ -72,6 +72,7 @@ typedef struct stat fs_stat64_t;
 
 extern "C" uint8_t* vm_base;
 extern "C" void ppu_guest_caller(char* out, size_t n);
+extern "C" void (*volatile g_port_file_open_cb)(int, const char*);   /* sys_fs.c: PC port extras */
 extern "C" uint32_t ppu_vm_size;
 extern "C" void     ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 extern "C" void     vm_write32(uint64_t a, uint32_t v);
@@ -296,6 +297,7 @@ static void cellFsOpen(ppu_context* ctx)
             if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
           } }
       else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
+    { void (*cb)(int, const char*) = g_port_file_open_cb; if (cb) cb(-1, gpath); }
     if (getenv("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
          * which criMv/criFs function opened the movie, so the reader-attach path

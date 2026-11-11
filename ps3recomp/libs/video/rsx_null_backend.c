@@ -8,7 +8,9 @@
 
 #include "rsx_null_backend.h"
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include "../../runtime/ps3_log.h"
 
 #ifdef _WIN32
@@ -51,6 +53,100 @@ typedef struct {
 
 static NullBackendState s_state;
 
+/* RSX_RESIZABLE=0: fixed-size window (no resize border / maximize box).
+ * RSX_ALT_ENTER=0: Alt+Enter does not toggle fullscreen. Both default on. */
+static int nb_env_on(const char* n) { const char* e = getenv(n); return !(e && e[0] == '0'); }
+static DWORD nb_win_style(void)
+{
+    return nb_env_on("RSX_RESIZABLE") ? WS_OVERLAPPEDWINDOW
+                                      : (WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX));
+}
+
+/* PORT_REFRESH_SWITCH (default off, 1 = on; it blanked the screen and glitched audio on focus changes): in exclusive fullscreen
+ * (RSX_DISPLAY=exclusive), when the frame-rate target (PORT_FPS_EFFECTIVE, set
+ * by the port's r2_fps_target) does not divide the display refresh evenly --
+ * 60 fps on 144 Hz shows frames for 2, then 3 refreshes -- switch the monitor
+ * to the closest mode at the same resolution whose refresh is a multiple of the
+ * target (144 -> 120 Hz). Temporary (CDS_FULLSCREEN) and given back when the
+ * window loses focus, is minimised, leaves fullscreen, closes, the process
+ * exits or crashes. Borderless / windowed never switch: there the [fps] note
+ * suggests VRR or an even frame rate. With G-Sync / FreeSync it is not needed
+ * (harmless: the VRR range still covers the target) -- PORT_REFRESH_SWITCH=0. */
+static struct { int active, warned, hooked; char dev[CCHDEVICENAME]; DWORD from_hz, to_hz; } s_rs;
+static LPTOP_LEVEL_EXCEPTION_FILTER s_rs_prev_filter;
+
+static double nb_hz(DWORD f) { return (f + 1) % 30 == 0 ? (f + 1) * 1000.0 / 1001.0 : (double)f; }   /* 59 / 119 = NTSC */
+static int nb_hz_even(double hz, double fps)
+{
+    const double q = hz / fps;
+    return q >= 0.97 && fabs(q - floor(q + 0.5)) <= 0.03;
+}
+
+static void nb_refresh_restore(void)
+{
+    if (!s_rs.active) return;
+    s_rs.active = 0;
+    ChangeDisplaySettingsExA(s_rs.dev, NULL, NULL, 0, NULL);   /* back to the registry (desktop) mode */
+    { char hz[16]; snprintf(hz, sizeof hz, "%lu", (unsigned long)s_rs.from_hz); _putenv_s("PORT_DISPLAY_HZ", hz); }   /* [hitch] present stats */
+    fprintf(stderr, "[fps] display restored %lu->%lu Hz%c", (unsigned long)s_rs.to_hz, (unsigned long)s_rs.from_hz, 10);
+}
+static void nb_refresh_atexit(void) { nb_refresh_restore(); }
+static LONG WINAPI nb_refresh_crash(EXCEPTION_POINTERS* ep)
+{
+    nb_refresh_restore();
+    return s_rs_prev_filter ? s_rs_prev_filter(ep) : EXCEPTION_CONTINUE_SEARCH;
+}
+/* The port's crash reporter (project\port_crash.h) calls this before it writes
+ * a report, on every crash path -- also stack overflows and abort(), which never
+ * reach the filter above -- so a crash does not leave the monitor switched. */
+void rsx_null_refresh_restore_on_crash(void) { nb_refresh_restore(); }
+
+static void nb_refresh_apply(HWND hwnd)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PORT_REFRESH_SWITCH"); on = e && e[0] == '1'; }
+    const char* dm = getenv("RSX_DISPLAY");
+    if (!on || s_rs.active || !hwnd || !s_state.fullscreen || !dm || _stricmp(dm, "exclusive")) return;
+    const char* fe = getenv("PORT_FPS_EFFECTIVE");
+    const char* rf = getenv("R2_FPS");   /* before r2_fps_target ran: plain numbers only, unset = 30 */
+    const double fps = fe ? atof(fe) : !rf || !*rf ? 30.0 : (rf[0] >= '1' && rf[0] <= '9') ? atof(rf) : 0.0;
+    if (fps < 20.0) return;   /* uncapped / unknown */
+    MONITORINFOEXA mi; memset(&mi, 0, sizeof mi); mi.cbSize = sizeof mi;
+    if (!GetMonitorInfoA(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), (MONITORINFO*)&mi)) return;
+    DEVMODEA cur; memset(&cur, 0, sizeof cur); cur.dmSize = sizeof cur;
+    if (!EnumDisplaySettingsA(mi.szDevice, ENUM_CURRENT_SETTINGS, &cur) || cur.dmDisplayFrequency < 24) return;
+    if (nb_hz_even(nb_hz(cur.dmDisplayFrequency), fps)) return;
+    DEVMODEA best; memset(&best, 0, sizeof best);
+    double bd = 1e9;
+    for (DWORD i = 0;; i++) {
+        DEVMODEA m; memset(&m, 0, sizeof m); m.dmSize = sizeof m;
+        if (!EnumDisplaySettingsA(mi.szDevice, i, &m)) break;
+        if (m.dmPelsWidth != cur.dmPelsWidth || m.dmPelsHeight != cur.dmPelsHeight || m.dmBitsPerPel != cur.dmBitsPerPel ||
+            (m.dmDisplayFlags & DM_INTERLACED) || m.dmDisplayFrequency < 24 || !nb_hz_even(nb_hz(m.dmDisplayFrequency), fps)) continue;
+        const double d = fabs((double)m.dmDisplayFrequency - (double)cur.dmDisplayFrequency);
+        if (d < bd || (d == bd && m.dmDisplayFrequency > best.dmDisplayFrequency)) { bd = d; best = m; }
+    }
+    if (!best.dmDisplayFrequency) {
+        if (!s_rs.warned) fprintf(stderr, "[fps] note: no %lux%lu mode refreshes at a multiple of %.0f fps; turn on G-Sync / FreeSync or pick an even frame rate%c",
+                                  (unsigned long)cur.dmPelsWidth, (unsigned long)cur.dmPelsHeight, fps, 10);
+        s_rs.warned = 1;
+        return;
+    }
+    best.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY;
+    const LONG rc = ChangeDisplaySettingsExA(mi.szDevice, &best, NULL, CDS_FULLSCREEN, NULL);
+    if (rc != DISP_CHANGE_SUCCESSFUL) {
+        if (!s_rs.warned) fprintf(stderr, "[fps] display switch to %lu Hz failed (%ld)%c", (unsigned long)best.dmDisplayFrequency, (long)rc, 10);
+        s_rs.warned = 1;
+        return;
+    }
+    memcpy(s_rs.dev, mi.szDevice, sizeof s_rs.dev);
+    s_rs.from_hz = cur.dmDisplayFrequency; s_rs.to_hz = best.dmDisplayFrequency; s_rs.active = 1;
+    { char hz[16]; snprintf(hz, sizeof hz, "%lu", (unsigned long)s_rs.to_hz); _putenv_s("PORT_DISPLAY_HZ", hz); }
+    if (!s_rs.hooked) { s_rs.hooked = 1; atexit(nb_refresh_atexit); s_rs_prev_filter = SetUnhandledExceptionFilter(nb_refresh_crash); }
+    fprintf(stderr, "[fps] display switched %lu->%lu Hz (%.0f fps target; PORT_REFRESH_SWITCH=0 keeps the desktop rate)%c",
+            (unsigned long)s_rs.from_hz, (unsigned long)s_rs.to_hz, fps, 10);
+}
+
 static void nb_set_fullscreen(HWND hwnd, int on)
 {
     if (on) {
@@ -63,11 +159,12 @@ static void nb_set_fullscreen(HWND hwnd, int on)
                      SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
     } else {
         const RECT r = s_state.windowed_rect;
-        SetWindowLongPtrA(hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
+        SetWindowLongPtrA(hwnd, GWL_STYLE, nb_win_style() | WS_VISIBLE);
         SetWindowPos(hwnd, HWND_NOTOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top,
                      SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
     }
     s_state.fullscreen = on;
+    if (on) nb_refresh_apply(hwnd); else nb_refresh_restore();
 }
 
 /* ---------------------------------------------------------------------------
@@ -75,6 +172,82 @@ static void nb_set_fullscreen(HWND hwnd, int on)
  * -----------------------------------------------------------------------*/
 
 static int s_present_suppressed = 0;
+
+/* Start-up screen (rsx_null_backend_splash): while the RPCS3 renderer compiles
+ * its shader cache before the first frame, nothing has been presented and the
+ * GPU swap chain shows nothing, so this window paints a dark progress screen
+ * with GDI. Written from the render thread, read on the window thread.
+ *   step  -1 dark screen (renderer starting), 1..steps progress, 0 off */
+static volatile LONG s_splash_step = 0, s_splash_steps = 0, s_splash_done = 0, s_splash_total = 0;
+static volatile LONG s_splash_skip = 0, s_splash_blank_once = 0;
+static volatile LONGLONG s_splash_t0 = 0, s_splash_inval = 0;
+static HFONT s_splash_font[3];
+/* rsx_null_backend_splash_gdi(0): the renderer presents the start-up screen into its swap chain
+ * (VKGSRender.cpp preload_shaders, PORT_OSD), which exclusive fullscreen shows and GDI does not.
+ * This window then keeps the splash state, the skip keys, the caption and the exit-on-close, but
+ * never paints over the swap chain. */
+static volatile LONG s_splash_gdi_off = 0;
+
+static void nb_splash_paint(HWND hwnd, HDC hdc)
+{
+    RECT rc; GetClientRect(hwnd, &rc);
+    const int w = rc.right - rc.left, h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0) return;
+    HDC mdc = CreateCompatibleDC(hdc);
+    HBITMAP bm = CreateCompatibleBitmap(hdc, w, h);
+    HGDIOBJ obm = SelectObject(mdc, bm);
+    HBRUSH bg = CreateSolidBrush(RGB(14, 15, 18));
+    FillRect(mdc, &rc, bg); DeleteObject(bg);
+
+    const LONG step = s_splash_step;
+    if (step > 0) {
+        const unsigned done = (unsigned)s_splash_done, total = (unsigned)s_splash_total;
+        const unsigned pct = total ? (unsigned)((unsigned long long)(done < total ? done : total) * 100 / total) : 0;
+        const unsigned secs = (unsigned)((GetTickCount64() - (ULONGLONG)s_splash_t0) / 1000);
+        int fh = h / 22; if (fh < 18) fh = 18; if (fh > 44) fh = 44;
+        if (!s_splash_font[0]) {
+            s_splash_font[0] = CreateFontW(-fh, 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+            s_splash_font[1] = CreateFontW(-(fh * 3 / 5), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+            s_splash_font[2] = CreateFontW(-(fh / 2 < 13 ? 13 : fh / 2), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        }
+        SetBkMode(mdc, TRANSPARENT);
+        const int bw = w * 6 / 10, bx = (w - bw) / 2, cy = h / 2;
+        wchar_t t[192];
+        HGDIOBJ of = SelectObject(mdc, s_splash_font[0]);
+        SetTextColor(mdc, RGB(235, 236, 240));
+        swprintf(t, 192, L"Compiling shaders\u2026   %u / %u   (%u%%)", done, total, pct);
+        RECT r1 = { bx, cy - fh * 3, bx + bw, cy - fh };
+        DrawTextW(mdc, t, -1, &r1, DT_CENTER | DT_BOTTOM | DT_SINGLELINE | DT_NOPREFIX);
+
+        RECT bar = { bx, cy - fh / 2, bx + bw, cy - fh / 2 + (fh / 2 > 8 ? fh / 2 : 8) };
+        HBRUSH back = CreateSolidBrush(RGB(48, 52, 62)); FillRect(mdc, &bar, back); DeleteObject(back);
+        if (total) {
+            RECT fill = bar; fill.right = bar.left + (LONG)((bar.right - bar.left) * (double)pct / 100.0);
+            HBRUSH fb = CreateSolidBrush(RGB(90, 160, 230)); FillRect(mdc, &fill, fb); DeleteObject(fb);
+        }
+
+        SelectObject(mdc, s_splash_font[1]);
+        SetTextColor(mdc, RGB(175, 180, 190));
+        swprintf(t, 192, L"Step %ld of %ld: %s   \u00B7   %u:%02u", (long)step, (long)(s_splash_steps ? s_splash_steps : step),
+                 step == 1 && s_splash_steps > 1 ? L"shader programs" : L"pipelines", secs / 60, secs % 60);
+        RECT r2 = { bx, bar.bottom + fh / 2, bx + bw, bar.bottom + fh * 3 / 2 };
+        DrawTextW(mdc, t, -1, &r2, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+        SelectObject(mdc, s_splash_font[2]);
+        SetTextColor(mdc, RGB(130, 135, 145));
+        RECT r3 = { bx - bw / 6, r2.bottom + fh, bx + bw + bw / 6, r2.bottom + fh * 4 };
+        DrawTextW(mdc, s_splash_skip
+                  ? L"Skipping: the remaining shaders compile while you play\u2026"
+                  : L"The first start after a graphics driver or game update takes longer.\n"
+                    L"Esc, Space or a click: skip (the rest compile while you play)   \u00B7   F10: PC menu / quit",
+                  -1, &r3, DT_CENTER | DT_WORDBREAK | DT_NOPREFIX);
+        SelectObject(mdc, of);
+    }
+    BitBlt(hdc, 0, 0, w, h, mdc, 0, 0, SRCCOPY);
+    SelectObject(mdc, obm);
+    DeleteObject(bm);
+    DeleteDC(mdc);
+}
 
 /* Hooks for a port's PC front-end layer (set from the game project; NULL = none):
  *  g_port_ui_tick(hwnd)    -- every pump of this window's message loop
@@ -93,7 +266,12 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         DestroyWindow(hwnd);
         return 0;
 
+    case WM_ACTIVATEAPP:   /* PORT_REFRESH_SWITCH: the desktop rate while another app has focus */
+        if (wp) nb_refresh_apply(hwnd); else nb_refresh_restore();
+        break;
+
     case WM_DESTROY:
+        nb_refresh_restore();
         PostQuitMessage(0);
         return 0;
 
@@ -102,12 +280,17 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
          * brush flashes the window colour over the last presented frame (and
          * a GDI write knocks a fullscreen flip model out of independent flip,
          * which the monitor shows as flicker / a mode change). */
-        if (s_present_suppressed) return 1;
+        if (s_present_suppressed || s_splash_step || s_splash_gdi_off) return 1;
         break;
 
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
+        if (s_splash_step || InterlockedExchange(&s_splash_blank_once, 0)) {
+            if (!s_splash_gdi_off) nb_splash_paint(hwnd, hdc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
         if (s_present_suppressed) {
             /* Validate only; the swap chain repaints on the next flip. */
             EndPaint(hwnd, &ps);
@@ -139,12 +322,13 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_SIZE:
+        if (wp == SIZE_MINIMIZED) nb_refresh_restore();
         if (LOWORD(lp) && HIWORD(lp)) { s_state.width = LOWORD(lp); s_state.height = HIWORD(lp); }
         break;
 
     case WM_SYSKEYDOWN:
         if (wp == VK_RETURN && (lp & (1 << 29))) {      /* Alt+Enter */
-            if (!(lp & (1 << 30))) nb_set_fullscreen(hwnd, !s_state.fullscreen);
+            if (!(lp & (1 << 30)) && nb_env_on("RSX_ALT_ENTER")) nb_set_fullscreen(hwnd, !s_state.fullscreen);
             return 0;
         }
         if (wp == VK_F10) return 0;                     /* F10 is a game key, not the menu bar */
@@ -156,7 +340,21 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == VK_RETURN) return 0;                  /* no beep for Alt+Enter */
         break;
 
+    case WM_LBUTTONDOWN:
+        if (s_splash_step > 0 && !InterlockedExchange(&s_splash_skip, 1)) {
+            printf("[RSX null] start-up shader compile: skip requested (click)\n");
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        break;
+
     case WM_KEYDOWN:
+        if (s_splash_step > 0 && (wp == VK_ESCAPE || wp == VK_SPACE || wp == VK_RETURN)) {
+            if (!InterlockedExchange(&s_splash_skip, 1)) {
+                printf("[RSX null] start-up shader compile: skip requested (key)\n");
+                InvalidateRect(hwnd, NULL, FALSE);
+            }
+            return 0;
+        }
         /* Esc is the in-game Start/Pause key; only quit when explicitly asked. */
         if (wp == VK_ESCAPE && getenv("ESC_CLOSES")) {
             s_state.window_closed = 1;
@@ -345,7 +543,7 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     wc.hIcon = LoadIconA(GetModuleHandle(NULL), MAKEINTRESOURCEA(1));
     wc.hIconSm = (HICON)LoadImageA(GetModuleHandle(NULL), MAKEINTRESOURCEA(1), IMAGE_ICON,
                                    GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON), 0);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);   /* never a white flash before the first frame */
     wc.lpszClassName = "ps3recomp_null";
     RegisterClassExA(&wc);
 
@@ -374,7 +572,7 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
           else printf("[RSX null] RSX_MONITOR=%d: no such monitor, using the primary one\n", want);
       } }
     RECT wr = {0, 0, (LONG)width, (LONG)height};
-    AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+    AdjustWindowRect(&wr, nb_win_style(), FALSE);
     int ww = wr.right - wr.left, wh = wr.bottom - wr.top;
     if (ww > work.right - work.left) ww = work.right - work.left;
     if (wh > work.bottom - work.top) wh = work.bottom - work.top;
@@ -383,7 +581,7 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     s_state.hwnd = CreateWindowExA(
         0, "ps3recomp_null",
         title ? title : "ps3recomp",
-        WS_OVERLAPPEDWINDOW | (start_full ? 0 : WS_VISIBLE),
+        nb_win_style() | (start_full ? 0 : WS_VISIBLE),
         wx, wy, ww, wh,
         NULL, NULL, GetModuleHandle(NULL), NULL);
     if (s_state.hwnd && start_full) nb_set_fullscreen(s_state.hwnd, 1);
@@ -431,20 +629,47 @@ void rsx_null_backend_shutdown(void)
            (unsigned long long)s_state.frame_count);
 }
 
+/* Closed during the start-up shader compile: the render thread and its workers
+ * are inside the GPU driver, and ExitProcess would run the driver's DLL detach
+ * while they are frozen mid-call. End the process outright; nothing of the
+ * game has started yet. */
+static void nb_exit_if_splash(void)
+{
+    if (s_splash_step == 0) return;
+    printf("[RSX null] window closed during the start-up shader compile: exiting\n");
+    fflush(stdout); fflush(stderr);
+    nb_refresh_restore();
+    TerminateProcess(GetCurrentProcess(), 0);
+}
+
 int rsx_null_backend_pump_messages(void)
 {
     MSG msg;
     while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
-        if (msg.message == WM_QUIT)
+        if (msg.message == WM_QUIT) {
+            nb_exit_if_splash();
             return -1;
+        }
         TranslateMessage(&msg);
         DispatchMessageA(&msg);
     }
+    if (s_state.window_closed) nb_exit_if_splash();
     { void (*t)(void*) = g_port_ui_tick; if (t && s_state.hwnd && !s_state.window_closed) t(s_state.hwnd); }
+    ULONGLONG now = GetTickCount64();
+    if (s_state.hwnd && s_splash_step > 0 && now - s_state.title_time >= 250) {
+        const unsigned done = (unsigned)s_splash_done, total = (unsigned)s_splash_total;
+        char tb[256];
+        snprintf(tb, sizeof(tb), "%s | Compiling shaders %u%% (step %ld of %ld)", s_state.title,
+                 total ? (unsigned)((unsigned long long)(done < total ? done : total) * 100 / total) : 0,
+                 (long)s_splash_step, (long)(s_splash_steps ? s_splash_steps : s_splash_step));
+        SetWindowTextA(s_state.hwnd, tb);
+        s_state.title_time = now;
+        s_state.title_frames = s_state.frame_count;
+        return s_state.window_closed ? -1 : 0;
+    }
     /* RPCS3-style caption, once a second: guest FPS (flips), draws in the last
      * live-draw frame, window size. Here on the window's own thread, so the
      * WM_SETTEXT never blocks the renderer. */
-    ULONGLONG now = GetTickCount64();
     if (s_state.hwnd && now - s_state.title_time >= 1000) {
         extern u32 rsx_live_draw_get_last_draws(void);
         extern double rsx_live_draw_get_present_fps(void);
@@ -474,6 +699,45 @@ void* rsx_null_backend_get_hwnd(void)
 void rsx_null_backend_suppress_present(int on)
 {
     s_present_suppressed = on;
+}
+
+int rsx_null_backend_splash(int step, int steps, unsigned done, unsigned total)
+{
+    const LONG prev = s_splash_step;
+    if (step == 0) {
+        if (prev == 0) return s_state.hwnd != NULL;
+        InterlockedExchange(&s_splash_step, 0);
+        InterlockedExchange(&s_splash_blank_once, 1);   /* one dark repaint, no stale 100% text */
+        if (s_state.hwnd) {
+            if (!s_splash_gdi_off) InvalidateRect(s_state.hwnd, NULL, FALSE);
+            s_state.title_time = 0;                     /* the normal caption at the next pump */
+        }
+        return s_state.hwnd != NULL;
+    }
+    if (step > 0 && prev <= 0) {
+        s_splash_t0 = (LONGLONG)GetTickCount64();
+        InterlockedExchange(&s_splash_skip, 0);
+    }
+    InterlockedExchange(&s_splash_steps, steps);
+    InterlockedExchange(&s_splash_done, (LONG)done);
+    InterlockedExchange(&s_splash_total, (LONG)total);
+    InterlockedExchange(&s_splash_step, step);
+    const LONGLONG now = (LONGLONG)GetTickCount64();
+    if (s_state.hwnd && !s_splash_gdi_off && (step != prev || done >= total || now - s_splash_inval >= 100)) {
+        s_splash_inval = now;
+        InvalidateRect(s_state.hwnd, NULL, FALSE);
+    }
+    return s_state.hwnd != NULL;
+}
+
+int rsx_null_backend_splash_skip(void)
+{
+    return s_splash_skip != 0;
+}
+
+void rsx_null_backend_splash_gdi(int on)
+{
+    InterlockedExchange(&s_splash_gdi_off, on ? 0 : 1);
 }
 
 #else /* !_WIN32 */
@@ -858,6 +1122,9 @@ int rsx_null_backend_pump_messages(void) { return 0; }
 void rsx_null_backend_present(void) { nullsw_present(NULL, 0); }
 void* rsx_null_backend_get_hwnd(void) { return 0; }
 void  rsx_null_backend_suppress_present(int on) { (void)on; }
+int   rsx_null_backend_splash(int step, int steps, unsigned done, unsigned total) { (void)step; (void)steps; (void)done; (void)total; return 0; }
+int   rsx_null_backend_splash_skip(void) { return 0; }
+void  rsx_null_backend_splash_gdi(int on) { (void)on; }
 
 u32 rsx_null_backend_debug_color(void) { return s_soft.clear_argb; }
 

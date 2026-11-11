@@ -19,6 +19,7 @@
 #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
 #define PPU_NO_INLINE_STORES  /* likewise for the vm_write* family */
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: HLE spans */
+#include "ps3emu/port_tracy.h"   /* PORT_TRACY build only */
 #include <chrono>
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
@@ -274,6 +275,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                         if (t1 - t0 >= ps3_ft_min_ns())
                             ps3_ft_span(PS3_FT_SYSCALL, (uint32_t)c->thread_id, 0x10000u | (nid & 0xFFFFu), lr, t0, t1); } }
     } _hft{ ctx, nid, (uint32_t)ctx->lr, PS3_FT_ON() ? ps3_ft_now() : 0 };
+#ifdef PORT_TRACY
+    struct _PtGuard { ~_PtGuard() { PT_END(); } } _ptg;
+    PT_BEGIN(PT_HLE, nid);
+#endif
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
      * run here so guest code never executes concurrently on the ticker thread. */

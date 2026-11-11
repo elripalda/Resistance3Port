@@ -23,6 +23,14 @@ int ps3_perf_on(const char* name, int def);
  * thread is waiting. Also callable through the g_guest_mem_notify pointer. */
 extern volatile long g_guest_mem_seq;
 void ps3_guest_mem_notify(uint32_t ea);
+void ps3_guest_mem_notify_put(uint32_t ea);   /* SPU plain PUT; PS3_USLEEP_NOTIFY_PUT */
+
+/* R3_SEMLOG: bumped when an RSX label acquire has waited 250 ms. A PPU thread
+ * in a guest wait (usleep / lwmutex / lwcond) that sees a new value prints its
+ * guest call chain once ([CHAIN:semstall-*]). */
+extern volatile long g_ps3_stall_seq;
+void ps3_stall_chain(const char* tag);
+#define PS3_STALL_CHAIN(tag) do { if (g_ps3_stall_seq) ps3_stall_chain(tag); } while (0)
 extern void (*volatile g_guest_mem_notify)(uint32_t ea);
 
 /* Per-host-thread wait accounting (the [thrcpu] table in debugtools.inc):

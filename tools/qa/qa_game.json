@@ -1,0 +1,53 @@
+{
+ "game": "r3",
+ "exe": ["build_qa\\Resistance3.exe", "build\\Resistance3.exe"],
+ "game_process": "Resistance3.exe",
+ "args": ["{root}\\game\\EBOOT.elf"],
+ "env_from": ["run.bat", "settings.bat"],
+ "env": {"R2_BACKGROUND": "run", "R3_BACKGROUND": "run"},
+ "capture": "renderer",
+ "capture_env": {},
+ "fps_regex": "\\[r2rsx-prof\\] [0-9.]+s: ([0-9.]+) fps",
+ "logs": ["{run}\\out.log", "{run}\\run.log", "{root}\\logs\\rpcs3_rsx.log"],
+ "capture_steps": [
+  "wait 100",
+  "capture title 4 30",
+  "pad 4000 8", "pad 4000 8", "pad 0008 8",
+  "capture menu_main 4 30",
+  "pad 4000 8", "pad 4000 60", "pad 0008 3", "pad 4000 30",
+  "capture haven_start 6 20",
+  "wait 8",
+  "capture haven_settle 6 20"
+ ],
+ "soak_boot_steps": [
+  "wait 100",
+  "pad 4000 8", "pad 4000 8", "pad 0008 8", "pad 4000 8", "pad 4000 60", "pad 0008 3", "pad 4000 30"
+ ],
+ "soak": {
+  "env": {"R2_RSX_PROF": "1"},
+  "inputs": [
+   "pad 0000 128 0 128 128 2500",
+   "pad 0000 128 128 210 128 700",
+   "pad 0800 128 128 128 128 500",
+   "pad 0000 0 128 128 128 1500",
+   "pad 0000 128 128 128 80 400",
+   "pad 4000 128 128 128 128 200",
+   "pad 0000 128 255 128 128 1500",
+   "pad 0000 128 128 50 128 700",
+   "pad 0800 128 128 128 128 900",
+   "pad 0000 255 128 128 128 1500",
+   "pad 0000 128 128 128 180 400",
+   "pad 0400 128 128 128 128 300"
+  ],
+  "patterns": {
+   "fifo_recover": {"rx": "FIFO: recovering", "in": "rpcs3_rsx.log"},
+   "invalid_rsx_method": {"rx": "Invalid RSX method", "in": "rpcs3_rsx.log"},
+   "sema_timeout": {"rx": "^\\[SEMA\\].*timed out|[Ss]emaphore.*(timed out|timeout)"},
+   "wcb_timeout": {"rx": "WCB: flush .* timed out"},
+   "hang_watchdog": {"rx": "^\\[hang\\] no game frame"},
+   "crash": {"rx": "^\\[crash\\] .*code 0x"},
+   "freeze_relaunch": {"rx": "^\\[freeze\\] stuck"}
+  },
+  "thresholds": {"mem_mb_per_min": 4.0, "mem_growth_mb": 150, "handles_per_min": 20}
+ }
+}

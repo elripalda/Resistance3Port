@@ -21,8 +21,10 @@
 #include <stdint.h>
 #include <math.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/port_hitch.h"   /* [hitch] audio late-block wait */
 #include "../../runtime/ps3_log.h"   /* ps3_diag_enabled (R2_DIAG) */
 #include "audio_stretch.h"
+#include "audio_out.h"
 
 /* Event-queue push/lookup (runtime/syscalls/sys_event.c). Forward-declared
  * rather than including sys_event.h to avoid pulling PPU context/syscall
@@ -417,6 +419,17 @@ static void audio_backend_shutdown(void)
 /* PC port: silence the output while the window is in the background
  * (project/r2_pcport.cpp, R2_BACKGROUND). */
 volatile int g_port_audio_mute = 0;
+/* Set by the port while it parks the game loop (focus pause / quit prompt,
+ * sys_ppu_thread.c). No guest blocks arrive then: waiting for them only
+ * drained the host buffer into 0.5x stretching ("static") and slipped the
+ * clock by seconds. PORT_AUDIO_PAUSE_AWARE=0 restores the old behaviour. */
+extern volatile int g_ps3_host_paused;
+static int audio_host_paused(void)
+{
+    static int on = -1;
+    if (on < 0) { const char* e = getenv("PORT_AUDIO_PAUSE_AWARE"); on = !(e && *e == '0'); }
+    return on && g_ps3_host_paused;
+}
 static void audio_backend_submit(const float* stereo_samples, u32 num_samples)
 {
     if (!s_wasapi_render) return;
@@ -980,7 +993,7 @@ static void audio_mix_one_block(void)
             pst[s * 2 + 0] = left;
             pst[s * 2 + 1] = right;
         }
-        if (out_miss && lt_fill_on && s_lt_seen[p]) {
+        if (out_miss && lt_fill_on && s_lt_seen[p] && !audio_host_paused()) {
             const unsigned v0 = s_lt_run[p] * CELL_AUDIO_BLOCK_SAMPLES;
             for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++)
                 lt_conceal_sample(s_lt_last[p], v0 + s, &pst[s * 2], &pst[s * 2 + 1]);
@@ -1205,6 +1218,53 @@ static void audio_notify_event_queues(void)
 }
 
 #ifdef _WIN32
+/* Keep the mixer off the cores the affinity keeper (project/debugtools.inc)
+ * reserves for the main guest thread (PORT_MAIN_CPU, default 2), the RSX
+ * FIFO / rsx::thread (PORT_FIFO_CPU, default 4) and rawSPU0 (PORT_SPU0_CPU,
+ * default 6): all three are ~100% busy, and a mixer sharing their core waits
+ * for its time slice even with MMCSS. Same conditions as the keeper (>= 12
+ * logical CPUs or PORT_MAIN_CPU set, PORT_MAIN_CORE=0 off), so with the
+ * keeper on this is the mask it gives every other thread anyway -- set here
+ * from the start instead of up to 5 s later. PORT_AUDIO_CPU=<n> pins to
+ * logical CPU n instead, -1 leaves the affinity alone. `def_on` = the
+ * default applies (the SoundTouch output stage is on). */
+static void audio_thread_affinity(int def_on, char* desc, size_t dn)
+{
+    snprintf(desc, dn, "any CPU");
+    const char* e = getenv("PORT_AUDIO_CPU");
+    DWORD_PTR proc = 0, sys = 0;
+    if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) || !proc) return;
+    if (e && *e) {
+        const int c = atoi(e);
+        if (c < 0 || c >= 64 || !(proc >> c & 1)) return;
+        if (SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)1 << c)) snprintf(desc, dn, "CPU %d (PORT_AUDIO_CPU)", c);
+        return;
+    }
+    if (!def_on) return;
+    { const char* k = getenv("PORT_MAIN_CORE"); if (k && *k && atoi(k) == 0) return; }
+    const char* me = getenv("PORT_MAIN_CPU");
+    int n = 0; for (DWORD_PTR m = proc; m; m &= m - 1) n++;
+    if (n < 12 && !me) return;
+    SYSTEM_LOGICAL_PROCESSOR_INFORMATION buf[256];
+    DWORD len = sizeof buf;
+    const int topo = GetLogicalProcessorInformation(buf, &len) != 0;
+    DWORD_PTR mask = proc;
+    const char* names[3] = { "PORT_MAIN_CPU", "PORT_FIFO_CPU", "PORT_SPU0_CPU" };
+    const int defs[3] = { 2, 4, n >= 12 ? 6 : -1 };
+    for (int i = 0; i < 3; i++) {
+        const char* v = getenv(names[i]);
+        const int c = (v && *v) ? atoi(v) : defs[i];
+        if (c < 0 || c >= 64) continue;
+        DWORD_PTR core = ((DWORD_PTR)1 << c) | ((DWORD_PTR)1 << (c ^ 1));
+        if (topo)
+            for (DWORD j = 0; j < len / sizeof buf[0]; j++)
+                if (buf[j].Relationship == RelationProcessorCore && (buf[j].ProcessorMask >> c & 1)) { core = buf[j].ProcessorMask; break; }
+        if ((mask & ~core) != 0) mask &= ~core;
+    }
+    if (mask != proc && SetThreadAffinityMask(GetCurrentThread(), mask))
+        snprintf(desc, dn, "mask 0x%llX (off the main/FIFO/SPU0 cores)", (unsigned long long)mask);
+}
+
 typedef HANDLE (WINAPI* audio_avset_fn)(LPCWSTR, LPDWORD);
 typedef BOOL   (WINAPI* audio_avrevert_fn)(HANDLE);
 static unsigned __stdcall audio_mix_thread_func(void* arg)
@@ -1290,14 +1350,46 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
      *    blocks. */
     static AudioStretch s_as;
     as_init(&s_as);
+    /* PORT_AUDIO_STRETCH (default 1): the SoundTouch output stage
+     * (audio_out.h) -- a ring buffer of PORT_AUDIO_BUFFER_MS fed to the
+     * device through SoundTouch, slowed (pitch kept) while the buffer is
+     * below PORT_AUDIO_STRETCH_THRESHOLD % of it, faded to silence if it
+     * still runs dry. PORT_AUDIO_STRETCH=0: the previous output path, as
+     * shipped before (FIFO + the WSOLA stretcher above, PORT_AUDIO_WSOLA=0
+     * turns that off too). */
+    AudioOut* ao = NULL;
+    int ao_want;
+    { const char* e = getenv("PORT_AUDIO_STRETCH"); ao_want = !(e && *e && atoi(e) == 0); }
+    char aff[96];
+    audio_thread_affinity(ao_want, aff, sizeof aff);
+    if (ao_want && steady && audio_backend_room() >= 0) {
+        AudioOutConfig cfg;
+        audio_out_default_config(&cfg, CELL_AUDIO_SAMPLE_RATE, audio_buffer_ms());
+        unsigned period = 0;
+#if AUDIO_BACKEND_WASAPI
+        period = (unsigned)(s_wasapi_period_100ns * CELL_AUDIO_SAMPLE_RATE / 10000000);
+#endif
+        audio_out_env_config(&cfg, period);
+        /* never more than the WASAPI buffer can hold */
+        { const int room = audio_backend_room() + (int)audio_backend_queued_samples();
+          if (room > 0 && cfg.device_frames > (unsigned)room) cfg.device_frames = (unsigned)room; }
+        ao = audio_out_create(&cfg);
+    }
+    static float ao_buf[4096 * 2];
+    int ao_log_ms = 5000;
+    { const char* e = getenv("PORT_AUDIO_LOG"); const char* p = getenv("R2_RSX_PROF");
+      if (e && *e) ao_log_ms = atoi(e) == 0 ? 0 : (atoi(e) == 1 ? 1000 : atoi(e) < 100 ? 1000 : atoi(e));
+      else if (p && *p && atoi(p)) ao_log_ms = 1000; }
+    ULONGLONG ao_t0 = GetTickCount64();
+    __typeof__(s_ah) ah_prev; memset(&ah_prev, 0, sizeof ah_prev);
     int stretch_on, late_ms, health_log; double smin;
-    { const char* e = getenv("PORT_AUDIO_STRETCH"); stretch_on = !(e && *e && atoi(e) == 0);
+    { const char* e = getenv("PORT_AUDIO_WSOLA"); stretch_on = !(e && *e && atoi(e) == 0);
       e = getenv("PORT_AUDIO_STRETCH_MIN"); smin = (e && *e) ? atof(e) : 0.70;
       if (!(smin >= 0.5)) smin = 0.5; if (smin > 1.0) smin = 1.0;
       e = getenv("PORT_AUDIO_LATE_WAIT_MS");
       if (e && *e) late_ms = atoi(e);
       else if (late_us > 0) late_ms = (late_us + 999) / 1000;
-      else late_ms = stretch_on ? 22 : 0;
+      else late_ms = (stretch_on || ao) ? 22 : 0;
       if (late_ms < 0) late_ms = 0; if (late_ms > 40) late_ms = 40;
       e = getenv("PORT_AUDIO_LOG"); health_log = !(e && *e && atoi(e) == 0); }
     double tempo = 1.0;
@@ -1322,10 +1414,16 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
       if (mmcss) snprintf(mm, sizeof mm, "Pro Audio");
       else if (!mm_want) snprintf(mm, sizeof mm, "off");
       else snprintf(mm, sizeof mm, "FAILED (%ld)", (long)mm_err);
-      fprintf(stderr, "[audio] output: %s; target buffer %u ms, read delay %u blocks, stretch %s (min tempo %.2f), "
-              "late-block wait %d ms, mixer %s, MMCSS %s, %s pacing, %d logical CPUs, prio boost %s%c",
-              dev, audio_buffer_ms(), audio_read_delay_blocks(32), stretch_on ? "on" : "off", smin, late_ms,
-              prio_s, mm, steady ? "steady" : "device", audio_host_cpus(), ps3_host_prio_boost() ? "on" : "off", 10); }
+      char outs[200];
+      if (ao) { const AudioOutConfig* c = audio_out_config(ao);
+                snprintf(outs, sizeof outs, "SoundTouch stretch (below %.0f%% of the target, min tempo %.2f, device queue %u ms, fade %u ms)",
+                         c->threshold * 100.0, c->min_tempo, c->device_frames * 1000 / c->rate, c->fade_frames * 1000 / c->rate); }
+      else snprintf(outs, sizeof outs, "legacy FIFO, WSOLA stretch %s (min tempo %.2f)%s", stretch_on ? "on" : "off", smin,
+                    ao_want ? "" : " [PORT_AUDIO_STRETCH=0]");
+      fprintf(stderr, "[audio] output: %s; target buffer %u ms, read delay %u blocks, %s, "
+              "late-block wait %d ms, mixer %s, MMCSS %s, affinity %s, %s pacing, %d logical CPUs, prio boost %s%c",
+              dev, audio_buffer_ms(), audio_read_delay_blocks(32), outs, late_ms,
+              prio_s, mm, aff, steady ? "steady" : "device", audio_host_cpus(), ps3_host_prio_boost() ? "on" : "off", 10); }
     while (s_mix_thread_running) {
         if (steady) {
             /* the device itself ran dry since the last pass (it played a hole) */
@@ -1335,7 +1433,28 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 else dev_dry_flag = 0;
             }
             /* 1. drain the FIFO into the device as far as it has room --
-             * through the stretcher when it is on */
+             * through the stretcher when it is on. With the SoundTouch
+             * stage: keep the device topped up to its queue cap from the
+             * ring (the rest of the buffer stays in the ring, where the
+             * tempo still applies to it) */
+            if (ao) {
+                if (audio_backend_room() >= 0) {
+                    const unsigned cap = audio_out_config(ao)->device_frames;
+                    for (;;) {
+                        const int room = audio_backend_room();
+                        if (room <= 0) break;
+                        const unsigned dq = audio_backend_queued_samples();
+                        if (dq >= cap) break;
+                        unsigned n = cap - dq;
+                        if (n > (unsigned)room) n = (unsigned)room;
+                        if (n > 4096) n = 4096;
+                        const unsigned got = audio_out_render(ao, ao_buf, n, dq);
+                        if (!got) break;
+                        audio_backend_submit(ao_buf, got);
+                    }
+                    if (!audio_out_is_dry(ao)) primed = 1;   /* playing: device dry from now on is a real glitch */
+                }
+            } else
             if (stretch_on && audio_backend_room() >= 0) {
                 for (;;) {
                     const int room = audio_backend_room();
@@ -1356,11 +1475,13 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             }
             /* host-side audio not yet played: device queue + FIFO */
             const int dev = audio_backend_room() >= 0;
-            const unsigned qdev = dev ? audio_backend_queued_samples() + fcount * CELL_AUDIO_BLOCK_SAMPLES : 0;
-            const unsigned queued = qdev + (dev && stretch_on ? (unsigned)as_pending(&s_as) : 0u);
+            const unsigned qdev = dev ? audio_backend_queued_samples() + (ao ? 0u : fcount * CELL_AUDIO_BLOCK_SAMPLES) : 0;
+            const unsigned queued = ao ? (dev ? audio_out_level(ao, qdev) : 0u)
+                                       : qdev + (dev && stretch_on ? (unsigned)as_pending(&s_as) : 0u);
             /* prime the buffer with silence at start and after a device
-             * underrun, so there is a cushion to wait into right away */
-            if (dev && (!primed || qdev < CELL_AUDIO_BLOCK_SAMPLES)) {
+             * underrun, so there is a cushion to wait into right away (the
+             * SoundTouch stage primes with real audio and conceals itself) */
+            if (!ao && dev && (!primed || qdev < CELL_AUDIO_BLOCK_SAMPLES)) {
                 static const float zero[CELL_AUDIO_BLOCK_SAMPLES * 2] = { 0.0f };
                 unsigned n = (target_frames - (queued < target_frames ? queued : target_frames)) / CELL_AUDIO_BLOCK_SAMPLES;
                 if (primed) { n /= 2; lt_reprimes++; s_ah.reprimes++; }
@@ -1389,6 +1510,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             /* 3. late guest block (see PORT_AUDIO_LATE_WAIT_MS): armed for 5 s
              * after a concealment; waits in 0.5 ms steps (not spinning: the
              * producer needs the cores) while the host buffer keeps 4 blocks */
+            if (audio_host_paused()) last_conceal_q = 0;   /* nothing is late while parked */
             if (dev && late_ms && !wait_suspended && last_conceal_q &&
                 now.QuadPart - last_conceal_q < qf.QuadPart * 5) {
                 if (audio_pending_ports()) {
@@ -1415,6 +1537,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                 const unsigned us = (unsigned)(slip * 1000000 / qf.QuadPart);
                 lt_slip_us += us; s_ah.slip_us += us;
                 s_lt_wait_us_sum += us; if (us > s_lt_wait_us_max) s_lt_wait_us_max = us;
+                port_hitch_add_ns(PH_AUDIO, (uint64_t)us * 1000u);
                 wait_q0 = 0;
             }
             if (dev) { if (queued < lt_q_min) lt_q_min = queued; lt_q_sum += queued; lt_q_n++;
@@ -1430,13 +1553,13 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
             { static FILE* _wf = (FILE*)-1;   /* AUDIO_WAV=<file>: raw f32le stereo 48 kHz of the final mix */
               if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
               if (_wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); }
-            if (fcount == FIFO_N) { fcount--; s_ah.fifo_drops++; } /* device stalled: drop the oldest */
+            if (!ao && fcount == FIFO_N) { fcount--; s_ah.fifo_drops++; } /* device stalled: drop the oldest */
             if (s_ah.concealed != conceal_seen) { conceal_seen = s_ah.concealed; last_conceal_q = now.QuadPart; }
             /* stretcher tempo, after RPCS3's frequency ratio: below 75% of
              * the target buffer, tempo follows fill / 0.75 (smoothed over
              * ~50 ms, floored at PORT_AUDIO_STRETCH_MIN); above it, ramps
              * back to 1 over ~0.25 s */
-            if (stretch_on && dev) {
+            if (!ao && stretch_on && dev) {
                 const double fill = (double)queued / (double)target_frames;
                 if (fill < 0.75) { double req = fill / 0.75; if (req < smin) req = smin; tempo += (req - tempo) * 0.1; }
                 else tempo = tempo + 0.02 > 0.9995 ? 1.0 : tempo + 0.02;
@@ -1453,7 +1576,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                   const int was_suspended = wait_suspended;
                   /* the wait is only worth its slip if it catches blocks */
                   wait_suspended = !was_suspended && s_ah.waits >= 100 && s_ah.caught * 10 < s_ah.waits;
-                  if (health_log && (bad || tn - ah_quiet0 >= 60000)) {
+                  if (health_log && !ao && (bad || tn - ah_quiet0 >= 60000)) {
                       fprintf(stderr, "[audio] underruns %u in last 10 s (device dry %u, buffer refilled %u) | "
                               "guest blocks late: %u concealed, %u rescued | waits %u (caught %u, gave up %u, slip %.0f ms)%s | "
                               "stretched %.0f%% of the time (min tempo %.2f) | host buffer avg %.0f ms, min %.0f ms (target %u) | "
@@ -1469,10 +1592,35 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
                       ah_quiet0 = tn;
                   }
                   memset(&s_ah, 0, sizeof(s_ah)); s_ah.tempo_min = 1.0; s_ah.q_min = ~0u;
+                  memset(&ah_prev, 0, sizeof ah_prev);
                   conceal_seen = 0; ah_t0 = tn;
               } }
-            memcpy(fifo[fhead], s_mix_buffer, sizeof(fifo[0]));
-            fhead = (fhead + 1) % FIFO_N; fcount++;
+            if (ao) {
+                audio_out_push(ao, s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+                audio_out_tick(ao, qdev);
+                /* [audio] every 5 s (1 s with PORT_AUDIO_LOG=1 or
+                 * R2_RSX_PROF=1, PORT_AUDIO_LOG=<ms> any period, 0 off).
+                 * Good: buffer min well above 0, tempo avg ~1.00, underruns 0,
+                 * device dry 0. */
+                const ULONGLONG tn = GetTickCount64();
+                if (ao_log_ms && tn - ao_t0 >= (ULONGLONG)ao_log_ms) {
+                    AudioOutStats st; audio_out_take_stats(ao, &st);
+                    fprintf(stderr, "[audio] %.1f s: buffer min %.0f avg %.0f ms (target %u) | tempo min %.2f avg %.3f "
+                            "(stretched %.0f%%) | underruns %u (silence %.0f ms, device dry %u) | guest blocks late: "
+                            "%u concealed, %u rescued, waits %u (caught %u, gave up %u, slip %.0f ms) | mixer wake late max %.1f ms%s%c",
+                            (tn - ao_t0) / 1000.0, st.level_min_ms, st.level_avg_ms, audio_buffer_ms(),
+                            st.tempo_min, st.tempo_avg, st.ticks ? 100.0 * st.stretch_ticks / st.ticks : 0.0,
+                            st.underruns, st.silence_ms, s_ah.dev_dry - ah_prev.dev_dry,
+                            s_ah.concealed - ah_prev.concealed, s_ah.rescued - ah_prev.rescued,
+                            s_ah.waits - ah_prev.waits, s_ah.caught - ah_prev.caught,
+                            s_ah.wait_timeouts - ah_prev.wait_timeouts, (s_ah.slip_us - ah_prev.slip_us) / 1000.0,
+                            s_ah.late_max_ms, st.overflow_frames ? " | ring overflow" : "", 10);
+                    ah_prev = s_ah; ao_t0 = tn;
+                }
+            } else {
+                memcpy(fifo[fhead], s_mix_buffer, sizeof(fifo[0]));
+                fhead = (fhead + 1) % FIFO_N; fcount++;
+            }
             if (!g_audio_held_tick) audio_notify_event_queues();
             g_audio_held_tick = 0;
             /* [audio-late] every 5 s: the waits, what they caught, what had
@@ -1550,6 +1698,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
         audio_notify_event_queues();
     }
 
+    if (ao) audio_out_destroy(ao);
     if (mmcss && av_revert) av_revert(mmcss);
     printf("[cellAudio] Mixing thread stopped\n");
     return 0;

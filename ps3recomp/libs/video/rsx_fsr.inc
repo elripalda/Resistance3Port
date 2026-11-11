@@ -494,11 +494,11 @@ static int fsr_ensure(u32 w, u32 h, DXGI_FORMAT colour_fmt)
     cd.maxRenderSize.width = w; cd.maxRenderSize.height = h;
     cd.maxUpscaleSize.width = w; cd.maxUpscaleSize.height = h;
     /* v165c: auto exposure (AMD's recommendation; without an exposure input the
-     * first build came out black). Debug checking on unless RSX_FSR_DEBUG=0. */
+     * first build came out black). Debug checking only with RSX_FSR_DEBUG=1. */
     cd.flags = s_fsr_ab == 1 ? 0u : FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
     s_fsr_ab_ctx = s_fsr_ab == 1;
     { const char* e = getenv("RSX_FSR_LINEAR"); if (!(e && atoi(e))) cd.flags |= FFX_UPSCALE_ENABLE_NON_LINEAR_COLORSPACE; }
-    { const char* e = getenv("RSX_FSR_DEBUG"); if (!e || atoi(e)) cd.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING; }
+    { const char* e = getenv("RSX_FSR_DEBUG"); if (e && atoi(e)) cd.flags |= FFX_UPSCALE_ENABLE_DEBUG_CHECKING; }
     cd.fpMessage = fsr_msg;
     ffxReturnCode_t rc = p_ffxCreateContext(&s_fsr_ctx, &cd.header, NULL);
     if (rc != FFX_API_RETURN_OK || !s_fsr_ctx) {

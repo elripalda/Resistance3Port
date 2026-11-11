@@ -643,6 +643,9 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     return CELL_OK;
 }
 
+/* The runtime-owned ring (cellGcmSetupContext), for the segmented recycle. */
+static u32 s_ring_base_ea = 0, s_ring_size = 0;
+
 /* Reusable _cellGcmInitBody core (NID 0x15BAE46B). See cellGcmSys.h for why the
  * guest vm is injected as callbacks. The CellGcmContextData layout here is the
  * one proven in the shipping Simpsons port (begin@0/end@4/current@8/callback@C);
@@ -672,6 +675,8 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
     }
 
     u32 cmdbuf = ioAddress;                 /* FIFO lives at the IO region start */
+    s_ring_base_ea = cmdbuf;
+    s_ring_size = cmdSize;
     u32 cdata  = galloc ? galloc(16, 16) : 0;
     if (cdata && gwrite32) {
         gwrite32(cdata + 0x0, cmdbuf);              /* begin   */
@@ -5112,7 +5117,51 @@ static u32 gcm_ea2io(u32 ea)
     return ((u32)io_page << 20) | (ea & 0xFFFFFu);
 }
 
+/* RPCS3 mode, GCM_RING_SEGMENT (default on; 0 = the full drain below): the
+ * runtime ring is used in 32 KB segments, as RPCS3's cellGcmCallback does.
+ * Flush up to `current`, jump to the next segment and wait only while the RSX
+ * is still reading that segment. The full drain jumped back to begin and waited
+ * for GET to reach it: the guest thread then waited for every command queued
+ * before the wrap -- label waits on SPU jobs and the flip included ([hitch]
+ * "ring"). Returns 0 when the context is not the runtime ring (full drain). */
+#define GCM_RING_SEG 0x8000u
+static int gcm_ring_segmented(void)
+{
+    static int v = -1;
+    if (v < 0) { const char* e = getenv("GCM_RING_SEGMENT"); v = !(e && *e == '0'); }
+    return v;
+}
+
+static int gcm_r2rsx_recycle_segment(u32 ctx_ea, u32 cur, u32 count)
+{
+    const u32 base = s_ring_base_ea, nseg = s_ring_size / GCM_RING_SEG;
+    if (!base || nseg < 2 || cur < base || cur > base + s_ring_size) return 0;
+    if (count > (GCM_RING_SEG - 8) / 4) return 0;   /* reservation larger than a segment */
+    u32 next = (cur - base) / GCM_RING_SEG + 1;
+    if (next >= nseg) next = 0;
+    const u32 nb = base + next * GCM_RING_SEG, ne = nb + GCM_RING_SEG - 4;   /* 4 bytes for the next jump */
+    const u32 io_cur = gcm_ea2io(cur), io_nb = gcm_ea2io(nb), io_ne = gcm_ea2io(ne);
+    if (io_cur == 0xFFFFFFFFu || io_nb == 0xFFFFFFFFu || io_ne == 0xFFFFFFFFu || io_ne - io_nb != GCM_RING_SEG - 4)
+        return 0;
+    /* put stops the RSX in front of the jump; the title's next flush lets it through */
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, io_cur);
+    atomic_thread_fence(memory_order_release);
+    vm_write32(cur, 0x20000000u | io_nb);
+    vm_write32(ctx_ea + 0x0, nb);
+    vm_write32(ctx_ea + 0x4, ne);
+    vm_write32(ctx_ea + 0x8, nb);
+    r2rsx_wait_get_outside(io_nb, io_ne + 4, 60000);
+    return 1;
+}
+
+void cellGcm_fifo_recycle_count(u32 ctx_ea, u32 count);
 void cellGcm_fifo_recycle(u32 ctx_ea)
+{
+    cellGcm_fifo_recycle_count(ctx_ea, 0);
+}
+
+/* count = the words the title is reserving (r4 of the SDK callback). */
+void cellGcm_fifo_recycle_count(u32 ctx_ea, u32 count)
 {
     if (!ctx_ea) return;
     u32 begin   = vm_read32(ctx_ea + 0x0);
@@ -5137,6 +5186,17 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
      * for the guest to write from begin (that region was consumed long ago). */
     u32 io_begin = gcm_ea2io(begin);
     if (s_r2rsx) {
+        if (gcm_ring_segmented()) {
+            if (gcm_r2rsx_recycle_segment(ctx_ea, current, count))
+                return;
+            /* Full drain over the whole runtime ring, not the current segment. */
+            if (s_ring_base_ea && begin >= s_ring_base_ea && begin < s_ring_base_ea + s_ring_size) {
+                begin = s_ring_base_ea;
+                io_begin = gcm_ea2io(begin);
+                vm_write32(ctx_ea + 0x0, begin);
+                vm_write32(ctx_ea + 0x4, s_ring_base_ea + s_ring_size);
+            }
+        }
         /* RPCS3 mode: flush the tail, jump back to begin and wait for the RSX
          * to get there (what RPCS3's cellGcmCallback waits for). */
         if (io_begin != 0xFFFFFFFFu) {

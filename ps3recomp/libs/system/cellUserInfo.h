@@ -80,6 +80,10 @@ s32 cellUserInfoSelectUser_ListSet(u32 listType,
 s32 cellUserInfoSelectUser_ListGet(u32* selectedUser);
 s32 cellUserInfoEnableOverlay(s32 enable);
 s32 cellUserInfoGetHomeDir(u32 id, char* homePath, u32 homePathSize);
+/* Real-signature user selection (guest EAs); see cellUserInfo.c. */
+s32 cellUserInfoSelectUser_ListType(u32 type_ea, u32 func_opd, u32 container, u32 userdata);
+s32 cellUserInfoSelectUser_SetList(u32 set_ea, u32 func_opd, u32 container, u32 userdata);
+void cellUserInfo_register_select(void);
 
 #ifdef __cplusplus
 }

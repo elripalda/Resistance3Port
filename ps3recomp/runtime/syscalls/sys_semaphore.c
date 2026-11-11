@@ -3,6 +3,7 @@
  */
 
 #include "sys_semaphore.h"
+#include "ps3emu/port_hitch.h"   /* [hitch] */
 #include "../ps3_log.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
@@ -327,7 +328,17 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
 /* SEM_ERRDBG=1: report non-OK returns. PSGL's PlatformDevice asserts on one of
  * these once per frame, and naming the failing call beats inferring it. */
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
+static int64_t sys_semaphore_wait_body(ppu_context* ctx);
 int64_t sys_semaphore_wait(ppu_context* ctx)
+{
+    /* [hitch]: blocking waits of the game's frame-loop thread */
+    if (!port_hitch_on_main()) return sys_semaphore_wait_body(ctx);
+    const uint64_t ht = port_hitch_t0();
+    const int64_t r = sys_semaphore_wait_body(ctx);
+    port_hitch_end(PH_SYNC, ht);
+    return r;
+}
+static int64_t sys_semaphore_wait_body(ppu_context* ctx)
 {
     int64_t r = sys_semaphore_wait_impl(ctx);
     static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;

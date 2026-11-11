@@ -44,3 +44,31 @@ logs_build_*.txt
 /scratch/
 /gamefiles*/
 /logs_build*.txt
+
+# installer output and test builds
+/dist/
+/build_dist/
+
+# Generated and local-only: every build_* tree (test, profile and per-feature builds), the XeSS SDK that
+# Setup downloads, scratch work and run-time folders
+/build_*/
+/build_*.log
+/tools/xess/
+/screenshots/
+/mods/
+/portable.txt
+/tools/installer/setup_exe/obj/
+
+# downloaded by build.bat (tools\get_shaderscan.ps1) from the shaderscan repo's pinned release
+/tools/shaderscan.exe
+/tools/shaderscan.exe.download
+# local copies of earlier builds
+/backup_build_*/
+
+# Setup.exe is attached to the GitHub release, not committed
+/Setup.exe
+/scratch/RSXFIFOCommands*.pdf
+
+# local save backups (launcher) and the NVIDIA Streamline SDK that Setup downloads after licence acceptance
+/save_backups/
+/tools/streamline/

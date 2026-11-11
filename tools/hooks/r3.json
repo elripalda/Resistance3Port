@@ -1027,6 +1027,76 @@
      "        r2_menu_icon(ctx);"
     ]
    }
+  ],
+  "func_00744A18": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_00744A18(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r3_fx_pass(int kind, uint32_t p);   /* R3: post-effect toggles, film grain (r3_pcextra.cpp) */",
+     "void func_00744A18(ppu_context* ctx) {",
+     "        r3_fx_pass(0, (uint32_t)ctx->gpr[3]);"
+    ]
+   }
+  ],
+  "func_007424F8": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_007424F8(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r3_fx_pass(int kind, uint32_t p);   /* R3: post-effect toggles, camera motion blur (r3_pcextra.cpp) */",
+     "void func_007424F8(ppu_context* ctx) {",
+     "        r3_fx_pass(1, (uint32_t)ctx->gpr[3]);"
+    ]
+   }
+  ],
+  "func_00855A98": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_00855A98(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r3_fx_pass(int kind, uint32_t p);   /* R3: post-effect toggles, object motion blur (r3_pcextra.cpp) */",
+     "void func_00855A98(ppu_context* ctx) {",
+     "        r3_fx_pass(2, (uint32_t)ctx->gpr[5]);"
+    ]
+   }
+  ],
+  "func_008557A8": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_008557A8(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" void r3_fx_pass(int kind, uint32_t p);   /* R3: post-effect toggles, depth of field (r3_pcextra.cpp) */",
+     "void func_008557A8(ppu_context* ctx) {",
+     "        r3_fx_pass(3, (uint32_t)ctx->gpr[5]);"
+    ]
+   }
+  ],
+  "func_0074EAB0": [
+   {
+    "at": 0,
+    "ctx": null,
+    "rm": [
+     "void func_0074EAB0(ppu_context* ctx) {"
+    ],
+    "add": [
+     "extern \"C\" int r3_occ_wait(ppu_context* ctx);   /* R3: occlusion report wait (project/r3_hot.cpp, R3_OCC_SKIP) */",
+     "void func_0074EAB0(ppu_context* ctx) {",
+     "        if (r3_occ_wait(ctx)) return;"
+    ]
+   }
   ]
  },
  "preamble": [],

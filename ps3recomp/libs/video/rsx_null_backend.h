@@ -63,6 +63,20 @@ u32 rsx_null_backend_guest_draws(void);
 void* rsx_null_backend_get_hwnd(void);
 void  rsx_null_backend_suppress_present(int on);
 
+/* Start-up screen while the renderer compiles its shader cache before the
+ * first frame (GDI on this window; the GPU swap chain has presented nothing
+ * yet). step -1: dark screen, 1..steps: "Compiling shaders done / total" with
+ * a progress bar and the percentage in the caption, 0: off (any thread).
+ * Returns 1 when a window shows it. Closing the window while it is up ends
+ * the process at once. */
+int   rsx_null_backend_splash(int step, int steps, unsigned done, unsigned total);
+/* 1 once the user pressed Esc / Space / Enter or clicked during the screen. */
+int   rsx_null_backend_splash_skip(void);
+/* 0: the renderer presents the start-up screen into its swap chain itself; this window keeps
+ * the splash state, the skip keys and the caption but paints nothing (no GDI over the swap
+ * chain). 1 (default): GDI paints the screen. */
+void  rsx_null_backend_splash_gdi(int on);
+
 #ifdef __cplusplus
 }
 #endif

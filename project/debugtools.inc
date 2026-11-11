@@ -8,6 +8,9 @@ extern "C" unsigned long rsx_fifo_host_tid(void);
 extern "C" int rsx_perf_render_load(void);   /* v126: last PERF window's render_frame %, -1 none */
 extern "C" uint32_t cellGcm_get_flip_mode(void);
 extern "C" unsigned long spu_raw_host_tid(unsigned n);   /* v127: spu_raw.c */
+extern "C" unsigned long long port_cpu_pmask(void);      /* cpu_profile.inc: P-core CPUs on hybrid, else 0 */
+extern "C" int port_cpu_core_first(int core);             /* cpu_profile.inc: first CPU of core #, P-cores first; -1 none */
+static inline int port_popcount_dt(unsigned long long m) { int n = 0; for (; m; m &= m - 1) n++; return n; }
 extern "C" uint32_t    g_last_hle_nid;
 extern "C" const char* g_last_hle_name;
 
@@ -601,7 +604,16 @@ static void dbg_prof_frame_threads(unsigned sec)
 static DWORD WINAPI main_core_keeper(LPVOID)
 {
     const char* e = getenv("PORT_MAIN_CPU");
-    const int cpu = e ? atoi(e) : 2;   /* not CPU 0: Windows routes most interrupts there */
+    /* Default CPUs come from the real topology (cpu_profile.inc, P-cores
+     * first): main -> first CPU of core 1 (not core 0: Windows routes most
+     * interrupts there), FIFO -> core 2, rawSPU0 -> core 3. On a 6C/12T part
+     * that is CPUs 2, 4, 6 as before; without SMT it is 1, 2, 3 instead of
+     * landing two hot threads on one core. PORT_PIN_TOPO=0 = the old fixed
+     * 2 / 4 / 6. */
+    const char* pt = getenv("PORT_PIN_TOPO");
+    const int topo = !(pt && atoi(pt) == 0);
+    auto topo_cpu = [&](int core, int fixed) -> int { const int c = topo ? port_cpu_core_first(core) : -1; return c >= 0 ? c : fixed; };
+    const int cpu = e ? atoi(e) : topo_cpu(1, 2);
     DWORD_PTR proc = 0, sys = 0;
     if (!GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys)) return 0;
     /* Low-spec: with < 12 logical CPUs, reserving two whole cores leaves every
@@ -624,46 +636,111 @@ static DWORD WINAPI main_core_keeper(LPVOID)
     /* v181: the RSX FIFO thread is the next limiter (F11: ~98% busy in York's
      * slow stretch) -- it gets the next core to itself. PORT_FIFO_CPU=-1 off. */
     const char* fe = getenv("PORT_FIFO_CPU");
-    const int fcpu = fe ? atoi(fe) : 4;
+    const int fcpu = fe ? atoi(fe) : topo_cpu(2, 4);
     DWORD_PTR fmine = 0, fpair = 0;
-    if (fcpu >= 0 && fcpu < 64 && (fcpu >> 1) != (cpu >> 1)) {
+    if (fcpu >= 0 && fcpu < 64 && !(core_of(fcpu) & pair)) {
         fmine = (DWORD_PTR)1 << fcpu; fpair = fmine | core_of(fcpu);
         if (!(proc & fmine)) fmine = fpair = 0;
     }
-    const DWORD_PTR rest = proc & ~pair & ~fpair;
+    /* CPU pass: rawSPU0 (the SPU job kernel the main thread waits on, ~98%
+     * busy) gets the next core to itself as well -- it used to share the rest
+     * mask, and an SMT sibling, with the SPURS lanes and rsx::thread.
+     * PORT_SPU0_CPU=<cpu> (default 6 with >= 12 logical CPUs), -1 off. */
+    int nlog = 0; for (DWORD_PTR m = proc; m; m &= m - 1) nlog++;
+    const char* se = getenv("PORT_SPU0_CPU");
+    const int scpu = se ? atoi(se) : (nlog >= 12 ? topo_cpu(3, 6) : -1);
+    DWORD_PTR smine = 0, spair = 0;
+    if (scpu >= 0 && scpu < 64) {
+        smine = (DWORD_PTR)1 << scpu; spair = smine | core_of(scpu);
+        if (!(proc & smine) || (spair & (pair | fpair))) smine = spair = 0;
+    }
+    /* Intel hybrid: hard pins only onto P-cores (cpu_profile.inc). */
+    const DWORD_PTR pm = port_cpu_pmask();
+    if (pm) {
+        if (!(pm & mine)) { fprintf(stderr, "[affinity] CPU %d is not a P-core: no core pinning%c", cpu, 10); return 0; }
+        if (fmine && !(pm & fmine)) fmine = fpair = 0;
+        if (smine && !(pm & smine)) smine = spair = 0;
+    }
+    DWORD_PTR rest = proc & ~pair & ~fpair & ~spair;
+    if (smine && (pm ? port_popcount_dt(rest & pm) : port_popcount_dt(rest)) < 4) {
+        rest |= spair; smine = spair = 0;   /* keep >= 4 CPUs for everything else */
+    }
+    /* PORT_REST_SMT: what the "other threads" (SPURS lanes, rawSPU1, RSX
+     * workers, driver, audio) may run on. 0 (default) = only whole cores no
+     * hot thread owns -- every pinned hot thread keeps its SMT sibling idle.
+     * 1 = also the siblings of the rawSPU0 and FIFO cores (2 more logical
+     * CPUs on 6C/12T); 2 = also the main thread's sibling. More room for the
+     * SPURS lanes, at the cost of SMT contention on those hot threads. */
+    const char* rs = getenv("PORT_REST_SMT");
+    const int rest_smt = rs ? atoi(rs) : 0;
+    if (rest_smt >= 1) rest |= (fpair & ~fmine) | (spair & ~smine);
+    if (rest_smt >= 2) rest |= pair & ~mine;
     if (!(proc & mine) || !rest) return 0;
-    fprintf(stderr, "[affinity] main thread %lu -> CPU %d, RSX FIFO thread -> CPU %d, other threads -> mask 0x%llX%c",
-            (unsigned long)s_dbg_main_tid, cpu, fmine ? fcpu : -1, (unsigned long long)rest, 10);
-    DWORD fifo_done = 0;
-    static DWORD done[512]; int nd = 0;
+    /* Thread snapshot every 1 s while threads keep appearing, then every
+     * PORT_KEEPER_MS (default 5000) -- each snapshot walks every thread of the
+     * system, and at 1 Hz the two keepers were 4-7% CPU each. */
+    const char* ke = getenv("PORT_KEEPER_MS");
+    const DWORD idle_ms = ke && atoi(ke) >= 250 ? (DWORD)atoi(ke) : 5000;
+    fprintf(stderr, "[affinity] main thread %lu -> CPU %d, RSX FIFO/rsx::thread -> CPU %d, rawSPU0 -> CPU %d, other threads -> mask 0x%llX (rescan %lu ms, PORT_PIN_TOPO=%d PORT_REST_SMT=%d)%c",
+            (unsigned long)s_dbg_main_tid, cpu, fmine ? fcpu : -1, smine ? scpu : -1, (unsigned long long)rest,
+            (unsigned long)idle_ms, topo, rest_smt, 10);
+    typedef HRESULT (WINAPI* gtd_t)(HANDLE, PWSTR*);
+    static gtd_t gtd = (gtd_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "GetThreadDescription");
+    DWORD fifo_done = 0, spu0_done = 0;
+    static DWORD done[512]; static BYTE tries[512]; int nd = 0;
     const DWORD pid = GetCurrentProcessId();
+    int quiet = 0;
     for (;;) {
+        int fresh = 0;
+        /* the d3d12 backend reports its FIFO thread; in RPCS3 mode the
+         * equivalent is the thread named "rsx::thread" (below) */
+        DWORD ftid = fmine ? (DWORD)rsx_fifo_host_tid() : 0;
+        const DWORD stid = smine ? (DWORD)spu_raw_host_tid(0) : 0;
+        if (stid && stid != spu0_done) {
+            HANDLE sh = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, stid);
+            if (sh) { SetThreadAffinityMask(sh, smine); CloseHandle(sh); spu0_done = stid; fresh = 1;
+                      fprintf(stderr, "[affinity] rawSPU0 thread %lu pinned to CPU %d%c", (unsigned long)stid, scpu, 10); }
+        }
         HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
         THREADENTRY32 te; te.dwSize = sizeof te;
         if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te)) {
             do {
                 if (te.th32OwnerProcessID != pid) continue;
-                const DWORD ftid = fmine ? (DWORD)rsx_fifo_host_tid() : 0;
-                if (ftid && te.th32ThreadID == ftid) {
+                const DWORD tid = te.th32ThreadID;
+                if (tid == stid) continue;
+                if (ftid && tid == ftid) {
                     if (fifo_done != ftid) {
                         HANDLE fh = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, ftid);
-                        if (fh) { SetThreadAffinityMask(fh, fmine); CloseHandle(fh); fifo_done = ftid;
+                        if (fh) { SetThreadAffinityMask(fh, fmine); CloseHandle(fh); fifo_done = ftid; fresh = 1;
                                   fprintf(stderr, "[affinity] RSX FIFO thread %lu pinned to CPU %d%c", (unsigned long)ftid, fcpu, 10); }
                     }
                     continue;
                 }
-                int seen = 0;
-                for (int i = 0; i < nd; i++) if (done[i] == te.th32ThreadID) { seen = 1; break; }
-                if (seen) continue;
-                HANDLE th = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+                int k = 0;
+                while (k < nd && done[k] != tid) k++;
+                if (k < nd && tries[k] == 0) continue;            /* placed for good */
+                HANDLE th = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, tid);
                 if (!th) continue;
-                SetThreadAffinityMask(th, te.th32ThreadID == s_dbg_main_tid ? mine : rest);
+                /* threads name themselves just after they start: an unnamed
+                 * one is looked at again for a few rounds */
+                int named = 0, is_rsx = 0;
+                PWSTR d = NULL;
+                if (gtd && SUCCEEDED(gtd(th, &d)) && d && d[0]) { named = 1; is_rsx = !wcscmp(d, L"rsx::thread"); }
+                if (d) LocalFree(d);
+                if (is_rsx && fmine && !fifo_done) {
+                    SetThreadAffinityMask(th, fmine); fifo_done = tid;
+                    fprintf(stderr, "[affinity] rsx::thread %lu pinned to CPU %d%c", (unsigned long)tid, fcpu, 10);
+                } else if (k == nd) {
+                    SetThreadAffinityMask(th, tid == s_dbg_main_tid ? mine : rest);
+                }
                 CloseHandle(th);
-                if (nd < 512) done[nd++] = te.th32ThreadID;
+                if (k == nd && nd < 512) { done[nd] = tid; tries[nd] = (BYTE)(named || tid == s_dbg_main_tid ? 0 : 5); nd++; fresh = 1; }
+                else if (k < nd) tries[k] = named ? 0 : (BYTE)(tries[k] - 1);
             } while (Thread32Next(snap, &te));
         }
         if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
-        Sleep(1000);
+        quiet = fresh ? 0 : quiet + 1;
+        Sleep(quiet >= 5 ? idle_ms : 1000);
     }
 }
 /* v147: F6 = 10 s "pad watch". Hardware data breakpoints (debug registers)
@@ -889,6 +966,21 @@ static DWORD WINAPI hw_watch_thread(LPVOID)
     InterlockedExchange(&s_hw_busy, 0);
     return 0;
 }
+/* R3_SEMLOG: arm a hardware write watch on one guest word from code (the RSX
+ * semaphore-timeout path), so lifted PPU stores to a stuck label are caught
+ * too. Returns 0 if a watch is already running. */
+extern "C" int port_hwwatch_arm(uint32_t ea, unsigned secs)
+{
+    if (!vm_base || s_pw_on || InterlockedExchange(&s_hw_busy, 1)) return 0;
+    s_hw_ea[0] = ea; s_hw_ea[1] = s_hw_ea[2] = s_hw_ea[3] = 0;
+    s_hw_secs = secs ? secs : 10; s_hw_rw = 1;
+    HANDLE t = CreateThread(NULL, 0, hw_watch_thread, NULL, 0, NULL);
+    if (!t) { InterlockedExchange(&s_hw_busy, 0); return 0; }
+    CloseHandle(t);
+    return 1;
+}
+extern "C" int (*g_semlog_hwwatch_hook)(uint32_t ea, unsigned secs);   /* spu_channels.c */
+static const struct semlog_hw_init { semlog_hw_init() { g_semlog_hwwatch_hook = port_hwwatch_arm; } } s_semlog_hw_init;
 static DWORD WINAPI debug_console(LPVOID param)
 {
     const char* path = (const char*)param;

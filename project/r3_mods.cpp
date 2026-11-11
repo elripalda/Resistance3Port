@@ -9,8 +9,18 @@
 // A file there is opened in place of the game's own copy, by every file layer of the runtime
 // (cellFs, sys_fs: the g_vfs_override_hook in runtime/syscalls/sys_fs.c). Mods are applied in
 // alphabetical order of their folder names; when two replace the same file the later one wins.
-// A folder whose name starts with '_' or '-' is skipped (disabled). Only whole files can be
-// replaced (no texture replacement). The overrides are listed in the log at start-up.
+// A folder whose name starts with '_' or '-' is skipped (disabled). The overrides are listed in
+// the log at start-up.
+//
+// Single members of a .psarc archive: a FOLDER named like the archive holds the members to
+// replace, by their path inside it, and single assets of a level .dat file by tuid
+// (mods_psarc.h, docs/MODDING.md):
+//
+//     mods\MyMod\USRDIR\packed\levels\<lvl>\level_cached.psarc\built\levels\<lvl>\mobys.dat
+//     mods\MyMod\USRDIR\packed\levels\<lvl>\level_cached.psarc\built\levels\<lvl>\shaders.dat.tuid\<tuid>.bin
+//
+// The game then opens a patched copy of the archive, built on first use and kept in
+// mods\.cache\ until the archive or a mod file changes.
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <cstdio>
@@ -21,12 +31,24 @@
 #include <vector>
 #include <algorithm>
 #include <mutex>
+#include "mods_psarc.h"
 
 extern "C" void (*volatile g_vfs_override_hook)(char* path, size_t cap);   // runtime/syscalls/sys_fs.c
 
 namespace {
 
 std::map<std::string, std::string> s_index;   // "usrdir/x/y.bin" (lower case, '/') -> host path
+std::string s_root;
+
+// Archives with member / tuid overrides: "usrdir/.../x.psarc" -> member path in it -> host path.
+struct ArchivePlan {
+    std::map<std::string, std::string> files;
+    modpsarc::Plan plan;
+    std::string built;   // patched copy, once made
+    bool tried = false;
+};
+std::map<std::string, ArchivePlan> s_archives;
+std::mutex s_archive_mtx;
 
 std::string lower_slash(std::string s)
 {
@@ -68,12 +90,33 @@ void build_index(const std::string& root)
         scan(root + "\\" + m, "", files);
         fprintf(stderr, "[mods] %s: %zu file(s)\n", m.c_str(), files.size());
         for (auto& [k, v] : files) {
+            const size_t a = k.find(".psarc/");
+            if (a != std::string::npos) {
+                auto& f = s_archives[k.substr(0, a + 6)].files;
+                const std::string member = k.substr(a + 7);
+                if (f.count(member)) fprintf(stderr, "[mods]   %s overrides the same archive member from an earlier mod\n", k.c_str());
+                f[member] = v;
+                continue;
+            }
             if (s_index.count(k)) fprintf(stderr, "[mods]   %s overrides the same file from an earlier mod\n", k.c_str());
             s_index[k] = v;
         }
     }
     for (const auto& [k, v] : s_index) fprintf(stderr, "[mods] override: %s -> %s\n", k.c_str(), v.c_str());
-    fprintf(stderr, "[mods] %zu mod(s), %zu file override(s) from %s\n", mods.size(), s_index.size(), root.c_str());
+    size_t members = 0;
+    for (auto it = s_archives.begin(); it != s_archives.end();) {
+        for (const auto& [m, f] : it->second.files) {
+            std::string why;
+            if (modpsarc::plan_add(it->second.plan, m, f, &why))
+                fprintf(stderr, "[mods] archive override: %s : %s -> %s\n", it->first.c_str(), m.c_str(), f.c_str());
+            else fprintf(stderr, "[mods] ignored %s/%s: %s\n", it->first.c_str(), m.c_str(), why.c_str());
+        }
+        members += it->second.plan.members.size() + it->second.plan.tuids.size();
+        if (it->second.plan.empty()) it = s_archives.erase(it);
+        else ++it;
+    }
+    fprintf(stderr, "[mods] %zu mod(s), %zu file override(s), %zu archive member/asset override(s) from %s\n",
+            mods.size(), s_index.size(), members, root.c_str());
 }
 
 // The part of a resolved game path a mod replaces: from "PS3_GAME/" on (without it), else from "USRDIR/".
@@ -90,9 +133,50 @@ const char* game_rel(const char* p)
     return nullptr;
 }
 
+// The patched copy of archive `key` (base: the resolved game path, or a whole-file override).
+const std::string* archive_copy(const std::string& key, const std::string& base)
+{
+    const auto it = s_archives.find(key);
+    if (it == s_archives.end()) return nullptr;
+    std::lock_guard<std::mutex> lk(s_archive_mtx);
+    ArchivePlan& ap = it->second;
+    if (!ap.tried) {
+        ap.tried = true;
+        std::string name = key;
+        for (auto& c : name) if (c == '/' || c == ':') c = '_';
+        const std::string dir = s_root + "\\.cache";
+        char hex[24];
+        snprintf(hex, sizeof hex, "%016llx", (unsigned long long)modpsarc::plan_key(base, ap.plan));
+        const std::string out = dir + "\\" + name + "." + hex + ".psarc";
+        if (GetFileAttributesA(out.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            fprintf(stderr, "[mods] %s: using the patched copy %s\n", key.c_str(), out.c_str());
+            ap.built = out;
+        } else {
+            CreateDirectoryA(dir.c_str(), nullptr);
+            // older copies of this archive
+            WIN32_FIND_DATAA fd;
+            HANDLE h = FindFirstFileA((dir + "\\" + name + ".*.psarc").c_str(), &fd);
+            if (h != INVALID_HANDLE_VALUE) {
+                do DeleteFileA((dir + "\\" + fd.cFileName).c_str());
+                while (FindNextFileA(h, &fd));
+                FindClose(h);
+            }
+            std::string log;
+            const DWORD t0 = GetTickCount();
+            const bool ok = modpsarc::build(base, ap.plan, out, &log);
+            fprintf(stderr, "[mods] %s: building the patched copy from %s\n%s", key.c_str(), base.c_str(), log.c_str());
+            if (ok) {
+                ap.built = out;
+                fprintf(stderr, "[mods] %s: done in %lu ms\n", key.c_str(), (unsigned long)(GetTickCount() - t0));
+            } else fprintf(stderr, "[mods] %s: failed, the archive is used unchanged\n", key.c_str());
+        }
+    }
+    return ap.built.empty() ? nullptr : &ap.built;
+}
+
 void override_hook(char* path, size_t cap)
 {
-    if (s_index.empty()) return;
+    if (s_index.empty() && s_archives.empty()) return;
     const char* rel = game_rel(path);
     if (!rel) return;
     std::string key = lower_slash(rel);
@@ -104,14 +188,18 @@ void override_hook(char* path, size_t cap)
         k2 += key[i];
     }
     const auto it = s_index.find(k2);
-    if (it == s_index.end() || it->second.size() + 1 > cap) return;
+    const std::string* to = it == s_index.end() ? nullptr : &it->second;
+    if (!s_archives.empty() && k2.size() > 6 && !k2.compare(k2.size() - 6, 6, ".psarc")) {
+        if (const std::string* copy = archive_copy(k2, to ? *to : std::string(path))) to = copy;
+    }
+    if (!to || to->size() + 1 > cap) return;
     static std::mutex mtx;
     static std::map<std::string, int> said;
     {
         std::lock_guard<std::mutex> lk(mtx);
-        if (!said[k2]++) fprintf(stderr, "[mods] using %s\n", it->second.c_str());
+        if (!said[k2]++) fprintf(stderr, "[mods] using %s\n", to->c_str());
     }
-    snprintf(path, cap, "%s", it->second.c_str());
+    snprintf(path, cap, "%s", to->c_str());
 }
 
 std::string exe_dir()
@@ -139,8 +227,9 @@ struct ModsInit {
             fprintf(stderr, "[mods] R2_MODS=%s: folder %s not found, no mods\n", e, root.c_str());
             return;
         }
+        s_root = root;
         build_index(root);
-        if (!s_index.empty()) g_vfs_override_hook = override_hook;
+        if (!s_index.empty() || !s_archives.empty()) g_vfs_override_hook = override_hook;
     }
 } s_mods_init;
 

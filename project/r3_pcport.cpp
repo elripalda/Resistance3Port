@@ -17,12 +17,15 @@
  *        controls.txt). The game's own pause / main menus are Scaleform movies
  *        the port does not edit; a small hint ("F10: PC menu") is shown while
  *        the pause menu is up and once at start (R2_MENU_PC_HINT=0 hides it;
- *        off by default in exclusive fullscreen).
+ *        off by default in exclusive fullscreen unless the swapchain OSD is on).
  *   F12 / PrtScn  screenshot of the game window -> screenshots\R3_<date>_<time>.png
  *   Focus loss    R2_BACKGROUND = pause (default: the game's frame loop is held
  *                 in stubs.cpp r2_frame_period and the sound muted) | mute | run.
  *                 The cursor is always released (unclipped, shown) while the
  *                 window is in the background, paused or showing the prompt.
+ * The menu, prompts and toasts are drawn into the game's swapchain image once the
+ * renderer presents (port_osd.h; layered windows before that or with
+ * PORT_OSD=layered), so exclusive fullscreen shows them too.
  * No guest code is touched here. */
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -37,6 +40,7 @@
 #include <math.h>
 #include <vector>
 #include <string>
+#include "port_osd.h"
 #pragma comment(lib, "xinput.lib")
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "ole32.lib")
@@ -227,7 +231,11 @@ static void opt_step(int i, int d)
     }
     opt_apply(i);
 }
-static int menu_rows(void) { return s_menu_page == 0 ? 3 : OPT_COUNT + 1; }
+extern "C" void r2x_open_menu(void);   /* r3_pcextra.cpp: More PC Options */
+extern "C" int r2x_menu_open(void);
+extern "C" void r2x_ui_tick(void* hwnd, int focused, int other_prompt);
+extern "C" int r2x_want_pause(void);
+static int menu_rows(void) { return s_menu_page == 0 ? 4 : OPT_COUNT + 1; }
 static std::wstring menu_value(int row)
 {
     if (s_menu_page == 0 || row >= OPT_COUNT) return L"";
@@ -241,7 +249,7 @@ static std::wstring menu_value(int row)
 }
 static const wchar_t* menu_label(int row)
 {
-    static const wchar_t* main_rows[] = { L"Resume", L"PC Options", L"Quit to Desktop" };
+    static const wchar_t* main_rows[] = { L"Resume",     L"PC Options", L"More PC Options", L"Quit to Desktop" };
     if (s_menu_page == 0) return main_rows[row];
     return row < OPT_COUNT ? s_opt[row].title : L"Back";
 }
@@ -249,6 +257,7 @@ static std::wstring menu_help(void)
 {
     if (s_menu_page == 0) {
         static const wchar_t* h[] = { L"Back to the game.", L"Frame rate, upscaler, mouse, field of view, button prompts.",
+                                              L"Colour filter, crosshair, HDR, Reflex, key bindings, controller layout.",
                                       L"Waits for any save in progress, then closes the game." };
         return h[s_menu_sel];
     }
@@ -297,6 +306,55 @@ static void paint_menu(HDC dc, const RECT& rc)
 }
 
 static void menu_activate(int dir);
+static void ov_refresh(void);
+/* The mouse over the PC menu (y in menu coordinates): from the layered window, or
+ * from the game window while the menu is an OSD layer. 1 = handled. */
+static int menu_mouse(UINT m, int y)
+{
+    if (s_ov_kind != KIND_MENU || s_ov_state != OV_MENU) return 0;
+    const int row = y >= s_menu_row_top && s_menu_row_h > 0 ? (y - s_menu_row_top) / s_menu_row_h : -1;
+    /* The menu opens centred, right under the mouse-look cursor (the
+     * window centre is on "Quit to Desktop"): the mouse only takes
+     * over once it has really moved, and an unmoved click only selects. */
+    int armed = s_menu_mouse_armed;
+    if (!armed) {
+        POINT p; GetCursorPos(&p);
+        if (m != WM_MOUSEMOVE || abs(p.x - s_menu_mouse0.x) + abs(p.y - s_menu_mouse0.y) >= 8) s_menu_mouse_armed = 1;
+        if (!s_menu_mouse_armed) return 1;
+    }
+    if (row >= 0 && row < menu_rows()) {
+        if (row != s_menu_sel) { s_menu_sel = row; ov_refresh(); }
+        if (!armed) return 1;
+        if (m == WM_LBUTTONDOWN) menu_activate(1);   /* left click: OK / next value */
+        if (m == WM_RBUTTONDOWN && s_menu_page == 1 && row < OPT_COUNT) menu_activate(-1);   /* right click: previous value */
+    }
+    return 1;
+}
+static void ov_draw(HDC mdc, const RECT& rc)
+{
+    HBRUSH bg = CreateSolidBrush(RGB(16, 16, 20)); FillRect(mdc, &rc, bg); DeleteObject(bg);
+    HBRUSH fr = CreateSolidBrush(s_ov_toast ? RGB(90, 90, 100) : RGB(190, 40, 30));
+    for (int i = 0; i < 2; i++) { RECT r = { rc.left + i, rc.top + i, rc.right - i, rc.bottom - i }; FrameRect(mdc, &r, fr); }
+    DeleteObject(fr);
+    SetBkMode(mdc, TRANSPARENT);
+    if (s_ov_kind == KIND_MENU) paint_menu(mdc, rc);
+    else {
+        const int H = rc.bottom - rc.top;
+        HFONT f1 = CreateFontW(-(s_ov_toast ? H * 30 / 100 : H * 24 / 100), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
+                               OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        HFONT f2 = CreateFontW(-(s_ov_toast ? H * 20 / 100 : H * 14 / 100), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+                               OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+        HGDIOBJ of = SelectObject(mdc, f1);
+        RECT r1 = { rc.left + 8, rc.top + H * 12 / 100, rc.right - 8, rc.top + H * 55 / 100 };
+        SetTextColor(mdc, RGB(255, 255, 255));
+        DrawTextW(mdc, s_ov_l1, -1, &r1, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(mdc, f2);
+        RECT r2 = { rc.left + 8, rc.top + H * 55 / 100, rc.right - 8, rc.bottom - H * 10 / 100 };
+        SetTextColor(mdc, RGB(200, 200, 205));
+        DrawTextW(mdc, s_ov_l2, -1, &r2, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(mdc, of); DeleteObject(f1); DeleteObject(f2);
+    }
+}
 static LRESULT CALLBACK ov_proc(HWND h, UINT m, WPARAM w, LPARAM l)
 {
     switch (m) {
@@ -305,26 +363,7 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     case WM_MOUSEMOVE:
     case WM_LBUTTONDOWN:
     case WM_RBUTTONDOWN:
-        if (s_ov_kind == KIND_MENU && s_ov_state == OV_MENU) {
-            const int y = (short)HIWORD(l);
-            const int row = y >= s_menu_row_top ? (y - s_menu_row_top) / s_menu_row_h : -1;
-            /* The menu opens centred, right under the mouse-look cursor (the
-             * window centre is on "Quit to Desktop"): the mouse only takes
-             * over once it has really moved, and an unmoved click only selects. */
-            int armed = s_menu_mouse_armed;
-            if (!armed) {
-                POINT p; GetCursorPos(&p);
-                if (m != WM_MOUSEMOVE || abs(p.x - s_menu_mouse0.x) + abs(p.y - s_menu_mouse0.y) >= 8) s_menu_mouse_armed = 1;
-                if (!s_menu_mouse_armed) return 0;
-            }
-            if (row >= 0 && row < menu_rows()) {
-                if (row != s_menu_sel) { s_menu_sel = row; InvalidateRect(h, NULL, FALSE); }
-                if (!armed) return 0;
-                if (m == WM_LBUTTONDOWN) menu_activate(1);   /* left click: OK / next value */
-                if (m == WM_RBUTTONDOWN && s_menu_page == 1 && row < OPT_COUNT) menu_activate(-1);   /* right click: previous value */
-            }
-            return 0;
-        }
+        if (menu_mouse(m, (short)HIWORD(l))) return 0;
         break;
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc = BeginPaint(h, &ps);
@@ -333,28 +372,7 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT m, WPARAM w, LPARAM l)
         HDC mdc = CreateCompatibleDC(dc);
         HBITMAP bm = CreateCompatibleBitmap(dc, rc.right - rc.left, rc.bottom - rc.top);
         HGDIOBJ obm = SelectObject(mdc, bm);
-        HBRUSH bg = CreateSolidBrush(RGB(16, 16, 20)); FillRect(mdc, &rc, bg); DeleteObject(bg);
-        HBRUSH fr = CreateSolidBrush(s_ov_toast ? RGB(90, 90, 100) : RGB(190, 40, 30));
-        for (int i = 0; i < 2; i++) { RECT r = { rc.left + i, rc.top + i, rc.right - i, rc.bottom - i }; FrameRect(mdc, &r, fr); }
-        DeleteObject(fr);
-        SetBkMode(mdc, TRANSPARENT);
-        if (s_ov_kind == KIND_MENU) paint_menu(mdc, rc);
-        else {
-            const int H = rc.bottom - rc.top;
-            HFONT f1 = CreateFontW(-(s_ov_toast ? H * 30 / 100 : H * 24 / 100), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
-                                   OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-            HFONT f2 = CreateFontW(-(s_ov_toast ? H * 20 / 100 : H * 14 / 100), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                                   OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-            HGDIOBJ of = SelectObject(mdc, f1);
-            RECT r1 = { rc.left + 8, rc.top + H * 12 / 100, rc.right - 8, rc.top + H * 55 / 100 };
-            SetTextColor(mdc, RGB(255, 255, 255));
-            DrawTextW(mdc, s_ov_l1, -1, &r1, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            SelectObject(mdc, f2);
-            RECT r2 = { rc.left + 8, rc.top + H * 55 / 100, rc.right - 8, rc.bottom - H * 10 / 100 };
-            SetTextColor(mdc, RGB(200, 200, 205));
-            DrawTextW(mdc, s_ov_l2, -1, &r2, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
-            SelectObject(mdc, of); DeleteObject(f1); DeleteObject(f2);
-        }
+        ov_draw(mdc, rc);
         BitBlt(dc, 0, 0, rc.right - rc.left, rc.bottom - rc.top, mdc, 0, 0, SRCCOPY);
         SelectObject(mdc, obm); DeleteObject(bm); DeleteDC(mdc);
         EndPaint(h, &ps);
@@ -363,12 +381,49 @@ static LRESULT CALLBACK ov_proc(HWND h, UINT m, WPARAM w, LPARAM l)
     return DefWindowProcW(h, m, w, l);
 }
 
+/* Shown as an OSD layer in the game's swapchain (port_osd.h) when that is up, so
+ * exclusive fullscreen shows it too; else as the layered window. Placement in
+ * game-window client coordinates. */
+static int s_ovr_shown = 0, s_ovr_osd = 0, s_ovr_x = 0, s_ovr_y = 0, s_ovr_w = 0, s_ovr_h = 0, s_ovr_cw = 0, s_ovr_ch = 0;
 static void ov_show_kind(const wchar_t* l1, const wchar_t* l2, int kind)
 {
     if (l1) wcsncpy_s(s_ov_l1, l1, _TRUNCATE);
     if (l2) wcsncpy_s(s_ov_l2, l2, _TRUNCATE);
     s_ov_kind = kind;
     s_ov_toast = kind == KIND_TOAST || kind == KIND_HINT;
+    RECT rc; GetClientRect(s_game, &rc);
+    const int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
+    int w, h, x, y;
+    if (kind == KIND_MENU) {
+        const int rh = ch * 55 / 1000 < 34 ? 34 : ch * 55 / 1000;
+        w = cw * 44 / 100; if (w < 560) w = 560;
+        h = rh * (menu_rows() + 4);
+        if (w > cw) w = cw;
+        if (h > ch) h = ch;
+        x = (cw - w) / 2; y = (ch - h) / 2;
+    } else if (kind == KIND_HINT) {
+        w = cw * 30 / 100; if (w < 380) w = 380;
+        h = ch * 7 / 100; if (h < 54) h = 54;
+        x = (cw - w) / 2; y = ch - h - ch * 4 / 100;
+    } else {
+        const int toast = kind == KIND_TOAST;
+        w = toast ? cw * 30 / 100 : cw * 46 / 100; h = toast ? ch * 9 / 100 : ch * 22 / 100;
+        if (w < (toast ? 260 : 420)) w = toast ? 260 : 420;
+        if (h < (toast ? 60 : 130)) h = toast ? 60 : 130;
+        x = (cw - w) / 2; y = toast ? ch * 6 / 100 : (ch - h) / 2;
+    }
+    s_ovr_shown = 1; s_ovr_x = x; s_ovr_y = y; s_ovr_w = w; s_ovr_h = h; s_ovr_cw = cw; s_ovr_ch = ch;
+    s_ovr_osd = posd_on();
+    if (s_ovr_osd) {
+        if (s_ov && IsWindowVisible(s_ov)) ShowWindow(s_ov, SW_HIDE);
+        PosdCanvas c;
+        if (!c.begin(w, h)) return;
+        const RECT r = { 0, 0, w, h };
+        ov_draw(c.dc, r);
+        c.commit(POSD_PCMENU, x, y, cw, ch, 235 / 255.f);
+        return;
+    }
+    r2rsx_osd_hide(POSD_PCMENU);
     if (!s_ov) {
         WNDCLASSEXW wc = { sizeof wc };
         wc.lpfnWndProc = ov_proc; wc.hInstance = GetModuleHandleW(NULL);
@@ -379,34 +434,32 @@ static void ov_show_kind(const wchar_t* l1, const wchar_t* l2, int kind)
         if (s_ov) SetLayeredWindowAttributes(s_ov, 0, 235, LWA_ALPHA);
     }
     if (!s_ov) return;
-    RECT rc; GetClientRect(s_game, &rc);
     POINT tl = { 0, 0 }; ClientToScreen(s_game, &tl);
-    const int cw = rc.right - rc.left, ch = rc.bottom - rc.top;
-    int w, h, x, y;
-    if (kind == KIND_MENU) {
-        const int rh = ch * 55 / 1000 < 34 ? 34 : ch * 55 / 1000;
-        w = cw * 44 / 100; if (w < 560) w = 560;
-        h = rh * (menu_rows() + 4);
-        if (w > cw) w = cw;
-        if (h > ch) h = ch;
-        x = tl.x + (cw - w) / 2; y = tl.y + (ch - h) / 2;
-    } else if (kind == KIND_HINT) {
-        w = cw * 30 / 100; if (w < 380) w = 380;
-        h = ch * 7 / 100; if (h < 54) h = 54;
-        x = tl.x + (cw - w) / 2; y = tl.y + ch - h - ch * 4 / 100;
-    } else {
-        const int toast = kind == KIND_TOAST;
-        w = toast ? cw * 30 / 100 : cw * 46 / 100; h = toast ? ch * 9 / 100 : ch * 22 / 100;
-        if (w < (toast ? 260 : 420)) w = toast ? 260 : 420;
-        if (h < (toast ? 60 : 130)) h = toast ? 60 : 130;
-        x = tl.x + (cw - w) / 2; y = toast ? tl.y + ch * 6 / 100 : tl.y + (ch - h) / 2;
-    }
-    SetWindowPos(s_ov, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetWindowPos(s_ov, HWND_TOPMOST, tl.x + x, tl.y + y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     InvalidateRect(s_ov, NULL, TRUE);
     UpdateWindow(s_ov);
 }
 static void ov_show(const wchar_t* l1, const wchar_t* l2, int toast) { ov_show_kind(l1, l2, toast ? KIND_TOAST : KIND_DIALOG); }
-static void ov_hide(void) { if (s_ov) ShowWindow(s_ov, SW_HIDE); s_ov_toast = 0; s_toast_until = 0; s_ov_kind = KIND_DIALOG; }
+static void ov_hide(void)
+{
+    if (s_ov) ShowWindow(s_ov, SW_HIDE);
+    r2rsx_osd_hide(POSD_PCMENU);
+    s_ovr_shown = 0; s_ov_toast = 0; s_toast_until = 0; s_ov_kind = KIND_DIALOG;
+}
+/* the content changed (menu selection, a value) */
+static void ov_refresh(void)
+{
+    if (!s_ovr_shown) return;
+    if (s_ovr_osd) ov_show_kind(NULL, NULL, s_ov_kind);
+    else if (s_ov) InvalidateRect(s_ov, NULL, FALSE);
+}
+/* per tick: follow a change of the client size or of the OSD becoming ready */
+static void ov_follow(void)
+{
+    if (!s_ovr_shown) return;
+    RECT rc; GetClientRect(s_game, &rc);
+    if (posd_on() != s_ovr_osd || rc.right - rc.left != s_ovr_cw || rc.bottom - rc.top != s_ovr_ch) ov_show_kind(NULL, NULL, s_ov_kind);
+}
 static void menu_show(void) { ov_show_kind(NULL, NULL, KIND_MENU); }
 static int s_menu_prev = 0, s_prev_in = 0, s_hint_on = 0;
 static void menu_close(void) { s_ov_state = OV_RELEASE; ov_hide(); }
@@ -419,7 +472,8 @@ static void menu_activate(int dir)
         switch (s_menu_sel) {
         case 0: menu_close(); break;
         case 1: s_menu_page = 1; s_menu_sel = 0; menu_show(); break;
-        case 2:
+        case 2: s_ov_state = OV_NONE; ov_hide(); r2x_open_menu(); break;   /* r3_pcextra.cpp holds the input from here */
+        case 3:
             s_ask_from_menu = 1; s_ov_state = OV_ASK; s_prev_in = s_menu_prev | 1 /* IN_YES */;
             ov_show(L"Quit to desktop?", L"Enter / A = Yes        Esc / B = No", 0);
             fprintf(stderr, "[pcport] quit prompt (PC menu)%c", 10);
@@ -429,7 +483,7 @@ static void menu_activate(int dir)
     }
     if (s_menu_sel >= OPT_COUNT) { if (dir > 0) { s_menu_page = 0; s_menu_sel = 1; menu_show(); } return; }
     opt_step(s_menu_sel, dir);
-    InvalidateRect(s_ov, NULL, FALSE);
+    ov_refresh();
 }
 
 /* ---- screenshots -------------------------------------------------------- */
@@ -468,6 +522,8 @@ static void take_screenshot(void)
     const int w = rc.right - rc.left, h = rc.bottom - rc.top;
     if (w <= 0 || h <= 0 || IsIconic(s_game)) return;
     POINT tl = { 0, 0 }; ClientToScreen(s_game, &tl);
+    const int osd = posd_on();
+    if (osd) posd_suppress_for_capture();   /* a frame without the OSD layers on screen */
     HDC sdc = GetDC(NULL); HDC mdc = CreateCompatibleDC(sdc);
     BITMAPINFO bi = {};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
@@ -478,7 +534,7 @@ static void take_screenshot(void)
     if (bm && bits) {
         HGDIOBJ ob = SelectObject(mdc, bm);
         /* the screen as the desktop composes it (no CAPTUREBLT: our own
-         * layered prompt/toast windows are left out) */
+         * layered prompt/toast windows are left out; the OSD is off above) */
         if (BitBlt(mdc, 0, 0, w, h, sdc, tl.x, tl.y, SRCCOPY)) {
             GdiFlush();
             s = new Shot; s->w = w; s->h = h;
@@ -492,6 +548,7 @@ static void take_screenshot(void)
         }
         SelectObject(mdc, ob);
     }
+    if (osd) r2rsx_osd_suppress(0);
     if (bm) DeleteObject(bm);
     DeleteDC(mdc); ReleaseDC(NULL, sdc);
     if (!s) { fprintf(stderr, "[pcport] screenshot: could not read the screen%c", 10); return; }
@@ -530,29 +587,10 @@ static void close_hook(void* hwnd)
 }
 
 /* ---- input for the prompt ----------------------------------------------- */
-/* All controllers' XInput buttons, at most every 15 ms; an empty slot (slow to
- * query) is retried once a second. */
-static WORD xi_buttons(void)
-{
-    static ULONGLONG next = 0, retry[XUSER_MAX_COUNT]; static int conn[XUSER_MAX_COUNT]; static WORD last = 0;
-    const ULONGLONG now = GetTickCount64();
-    if (now < next) return last;
-    next = now + 15;
-    WORD b = 0;
-    for (DWORD i = 0; i < XUSER_MAX_COUNT; i++) {
-        if (!conn[i] && now < retry[i]) continue;
-        XINPUT_STATE xs;
-        conn[i] = XInputGetState(i, &xs) == ERROR_SUCCESS;
-        if (!conn[i]) { retry[i] = now + 1000; continue; }
-        b |= xs.Gamepad.wButtons;
-        /* the left stick as the d-pad (PC menu navigation) */
-        if (xs.Gamepad.sThumbLY > 20000) b |= XINPUT_GAMEPAD_DPAD_UP;
-        if (xs.Gamepad.sThumbLY < -20000) b |= XINPUT_GAMEPAD_DPAD_DOWN;
-        if (xs.Gamepad.sThumbLX < -20000) b |= XINPUT_GAMEPAD_DPAD_LEFT;
-        if (xs.Gamepad.sThumbLX > 20000) b |= XINPUT_GAMEPAD_DPAD_RIGHT;
-    }
-    return last = b;
-}
+/* All controllers' buttons (XInput bits), the left stick as the d-pad; at most
+ * every 15 ms. */
+extern "C" unsigned cellpad_menu_buttons(int* any_connected);   /* cellPad.c: SDL3 or XInput */
+static WORD xi_buttons(void) { return (WORD)cellpad_menu_buttons(NULL); }
 enum { IN_YES = 1, IN_NO = 2, IN_ANY = 4, IN_UP = 8, IN_DOWN = 16, IN_LEFT = 32, IN_RIGHT = 64 };
 static int prompt_input(int focused)
 {
@@ -619,6 +657,12 @@ static LRESULT CALLBACK game_subproc(HWND h, UINT m, WPARAM w, LPARAM l)
         if (LOWORD(l) == HTCLIENT && (g_r2pc_paused || g_port_ui_modal || !host_focused())) {
             SetCursor(LoadCursor(NULL, IDC_ARROW)); return TRUE; }
         break;
+    case WM_MOUSEMOVE: case WM_LBUTTONDOWN: case WM_RBUTTONDOWN:
+        if (s_ovr_shown && s_ovr_osd) {                /* the PC menu as an OSD layer: the clicks land here */
+            const int x = (short)LOWORD(l), y = (short)HIWORD(l);
+            if (x >= s_ovr_x && x < s_ovr_x + s_ovr_w && y >= s_ovr_y && y < s_ovr_y + s_ovr_h) menu_mouse(m, y - s_ovr_y);
+        }
+        break;
     case WM_ACTIVATEAPP:
         if (!w) ClipCursor(NULL);
         break;
@@ -663,7 +707,7 @@ static void ui_tick(void* hwnd_)
         const char* e = getenv("R2_MENU_PC");
         s_menu_on = (e && *e) ? atoi(e) != 0 : 1;
         const char* h = getenv("R2_MENU_PC_HINT"); const char* dm = getenv("RSX_DISPLAY");
-        s_hint_on = !s_menu_on ? 0 : (h && *h) ? atoi(h) != 0 : !(dm && !_stricmp(dm, "exclusive"));
+        s_hint_on = !s_menu_on ? 0 : (h && *h) ? atoi(h) != 0 : (!(dm && !_stricmp(dm, "exclusive")) || r2rsx_osd_wanted());
         fprintf(stderr, "[pcport] PC menu (F10 / hold View+Menu): %s, hint %s%c", s_menu_on ? "on" : "off (quit prompt only)",
                 s_hint_on ? "on" : "off", 10);
     }
@@ -671,7 +715,7 @@ static void ui_tick(void* hwnd_)
     switch (s_ov_state) {
     case OV_NONE: {
         static int was = 0; const int d = focused && (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
-        const int open = (d && !was) || pad_quit_combo();
+        const int open = ((d && !was) || pad_quit_combo()) && !r2x_menu_open();
         was = d;
         if (open) {
             g_port_ui_modal = 1;
@@ -692,8 +736,8 @@ static void ui_tick(void* hwnd_)
     case OV_MENU: {
         const int edge = menu_edges(in, &s_menu_prev);
         const int n = menu_rows();
-        if (edge & IN_UP) { s_menu_sel = (s_menu_sel + n - 1) % n; InvalidateRect(s_ov, NULL, FALSE); }
-        else if (edge & IN_DOWN) { s_menu_sel = (s_menu_sel + 1) % n; InvalidateRect(s_ov, NULL, FALSE); }
+        if (edge & IN_UP) { s_menu_sel = (s_menu_sel + n - 1) % n; ov_refresh(); }
+        else if (edge & IN_DOWN) { s_menu_sel = (s_menu_sel + 1) % n; ov_refresh(); }
         else if (edge & (IN_LEFT | IN_RIGHT)) {
             if (s_menu_page == 1 && s_menu_sel < OPT_COUNT) menu_activate(edge & IN_LEFT ? -1 : 1);
         }
@@ -732,6 +776,7 @@ static void ui_tick(void* hwnd_)
         break;
     }
 
+    ov_follow();
     const int prompt = s_ov_state != OV_NONE;
 
     /* the hint: while the game's pause menu is up (a pause press during
@@ -754,8 +799,9 @@ static void ui_tick(void* hwnd_)
         else if (!want && s_ov_kind == KIND_HINT && !prompt) ov_hide();
     }
 
+    r2x_ui_tick(hwnd, focused, prompt);   /* r3_pcextra.cpp: extras menu, photo mode, pad-loss pause, cutscene skip */
     const int bg_pause = !focused && s_bg == BG_PAUSE;
-    g_r2pc_paused = (prompt || bg_pause) ? 1 : 0;
+    g_r2pc_paused = (prompt || bg_pause || r2x_want_pause()) ? 1 : 0;
     g_port_audio_mute = (g_r2pc_paused || (!focused && s_bg != BG_RUN)) ? 1 : 0;
     { static int was = 0;
       if (g_r2pc_paused != was) { was = g_r2pc_paused; fprintf(stderr, "[pcport] game %s%c", was ? "paused" : "resumed", 10);

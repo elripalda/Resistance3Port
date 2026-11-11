@@ -2248,4 +2248,50 @@ static inline __attribute__((always_inline)) u128 spu_fsmh(u128 a) { return spu_
 static inline __attribute__((always_inline)) u128 spu_fsmb(u128 a) { return spu_fsmb_ref(a); }
 #endif
 
+/* Resistance port: inline channel fast path for the lifted SPU code
+ * (CMake PORT_SPU_INLINE_CH -> SPU_INLINE_CH; only the lifted SPU TUs get it).
+ * About 70% of the lifted wrch sites are the plain MFC parameter latches
+ * (LSA/EAH/EAL/Size/TagID/WrTagMask) and most rdch MFC sites read a status
+ * word; spu_wrch/spu_rdch answer those as field stores/loads anyway. Inline,
+ * the call, its u128 hidden-pointer traffic and the _SRC_RL reload of every
+ * live register after it go away (the stores do not alias ctx->gpr, so the
+ * compiler forwards the reloads). Every other channel still goes through the
+ * runtime. g_spu_inline_ch = 0 (env SPU_INLINE_CH=0, or SPU_CHHIST /
+ * SPU_POLLTRACE, whose counters live in the runtime) takes the old path. */
+#if defined(SPU_INLINE_CH) && !defined(SPU_INLINE_CH_RUNTIME)
+extern int g_spu_inline_ch;
+u128 spu_rdch(spu_context* ctx, uint32_t channel);
+void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
+static inline __attribute__((always_inline)) void spu_wrch_fast(spu_context* ctx, uint32_t ch, u128 value)
+{
+    if (__builtin_expect(g_spu_inline_ch, 1)) {
+        const uint32_t v = value._u32[0];
+        switch (ch) {
+        case MFC_LSA:       ctx->mfc_lsa = v;        return;
+        case MFC_EAH:       ctx->mfc_eah = v;        return;
+        case MFC_EAL:       ctx->mfc_eal = v;        return;
+        case MFC_Size:      ctx->mfc_size = v;       return;
+        case MFC_TagID:     ctx->mfc_tag = v & 0x1F; return;
+        case MFC_WrTagMask: ctx->mfc_tag_mask = v;   return;
+        default: break;
+        }
+    }
+    (spu_wrch)(ctx, ch, value);
+}
+static inline __attribute__((always_inline)) u128 spu_rdch_fast(spu_context* ctx, uint32_t ch)
+{
+    if (__builtin_expect(g_spu_inline_ch, 1)) {
+        switch (ch) {
+        case MFC_RdAtomicStat: return spu_make_preferred_u32(ctx->atomic_stat);
+        case MFC_RdTagStat:    return spu_make_preferred_u32(ctx->mfc_tag_status);
+        case MFC_RdTagMask:    return spu_make_preferred_u32(ctx->mfc_tag_mask);
+        default: break;
+        }
+    }
+    return (spu_rdch)(ctx, ch);
+}
+#define spu_wrch(c, ch, v) spu_wrch_fast((c), (ch), (v))
+#define spu_rdch(c, ch)    spu_rdch_fast((c), (ch))
+#endif
+
 #endif /* SPU_HELPERS_H */

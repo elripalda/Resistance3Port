@@ -30,6 +30,19 @@ void r2rsx_set_zcull(uint32_t i, uint32_t o, uint32_t w, uint32_t h, uint32_t cs
 { (void)i; (void)o; (void)w; (void)h; (void)cs; (void)zf; (void)af; (void)zd; (void)zcf;
   (void)sf; (void)sr; (void)sm; (void)bound; }
 void r2rsx_wait_get(uint32_t put, unsigned max_ms) { (void)put; (void)max_ms; }
+void r2rsx_wait_get_outside(uint32_t lo, uint32_t hi, unsigned max_ms) { (void)lo; (void)hi; (void)max_ms; }
+int  r2rsx_osd_wanted(void) { return 0; }
+int  r2rsx_osd_ready(void) { return 0; }
+void r2rsx_osd_layer(int s, const void* p, int w, int h, int x, int y, int rw, int rh, float a)
+{ (void)s; (void)p; (void)w; (void)h; (void)x; (void)y; (void)rw; (void)rh; (void)a; }
+void r2rsx_osd_hide(int s) { (void)s; }
+int  r2rsx_osd_visible(int s) { (void)s; return 0; }
+void r2rsx_osd_suppress(int on) { (void)on; }
+unsigned r2rsx_osd_presents(void) { return 0; }
+void r2rsx_osd_refresh(void) {}
 void r2rsx_prof_enable(int on) { (void)on; }
 int  r2rsx_prof_sample(double* f, double* d, double* u) { (void)f; (void)d; (void)u; return 0; }
+/* PC extras (VKR2PcExtras.cpp in the RPCS3 library) */
+volatile int g_pc_cvd_mode = 0, g_pc_hdr_active = 0, g_pc_reflex_active = 0;
+void r2pc_reflex_sleep(void) {}
 #endif

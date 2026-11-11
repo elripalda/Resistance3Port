@@ -12,6 +12,7 @@
 #include "Emu/RSX/Core/RSXContext.h"
 #include "Emu/RSX/Core/RSXRendererFactory.h"
 #include "Emu/RSX/port_prof.h"
+#include "../../../include/ps3emu/port_hitch.h" // R2PORT: [hitch] logger
 #include "util/logs.hpp"
 #include "util/fixed_typemap.hpp"
 
@@ -59,6 +60,7 @@ namespace rsx
 {
 	extern std::function<bool(u32 addr, bool is_writing)> g_access_violation_handler;
 }
+namespace r2qa { void on_screenshot(std::vector<u8>&& data, u32 w, u32 h, bool bgra); } // R2PORT QA: rpcs3_shim/r2_qa_capture.cpp
 
 namespace
 {
@@ -128,7 +130,7 @@ namespace
 		display_handle_t handle() const override { return s_hwnd; }
 		bool can_consume_frame() const override { return false; }
 		void present_frame(std::vector<u8>&&, u32, u32, u32, bool) const override {}
-		void take_screenshot(std::vector<u8>&&, u32, u32, bool) override {}
+		void take_screenshot(std::vector<u8>&& d, u32 w, u32 h, bool bgra) override { r2qa::on_screenshot(std::move(d), w, h, bgra); } // R2PORT QA: R2_QA_CAPTURE
 		void update_title(double) override {}
 	};
 
@@ -203,6 +205,7 @@ namespace
 	// Shader compilation and logging defaults (env overrides, applied over rpcs3_config.yml).
 	//  R2_SHADER_MODE = async (default: async recompiler, draws skipped until ready)
 	//                 | interp (async recompiler + shader interpreter until ready; untested) | sync | interpreter
+	//  R2_SHADER_INTERP=1 (default 0): same as R2_SHADER_MODE=interp; R2_SHADER_MODE wins when set.
 	//  R2_SHADER_CACHE=0 disables the on-disk shader cache (shadercache\rpcs3\shaders_cache).
 	void apply_shader_defaults()
 	{
@@ -213,6 +216,10 @@ namespace
 			if (!_stricmp(m, "interp")) mode = shader_mode::async_with_interpreter;
 			else if (!_stricmp(m, "sync") || !_stricmp(m, "legacy")) mode = shader_mode::recompiler;
 			else if (!_stricmp(m, "interpreter")) mode = shader_mode::interpreter_only;
+		}
+		else if (const char* i = std::getenv("R2_SHADER_INTERP"); i && *i && *i != '0' && _stricmp(i, "off"))
+		{
+			mode = shader_mode::async_with_interpreter;
 		}
 		g_cfg.video.shadermode.set(mode);
 		const char* c = std::getenv("R2_SHADER_CACHE");
@@ -287,7 +294,7 @@ namespace
 
 	// RPCS3's vblank / frame limit follow R2_FPS the way project/main.cpp sets them for the other
 	// renderers (frame_clock): above 60 fps the vblank rate is the target, uncapped uses
-	// max(display refresh, 240) Hz; the frame limit is one vblank ("Auto") up to 60 fps and off above,
+	// max(display refresh, 240) Hz; the frame limit is one vblank ("Auto") at 30 fps and off otherwise,
 	// where the game limiter (r2_frame_period) paces. RSX_VBLANK_US, RSX_CFG_LEGACY,
 	// GCM_VBLANK_FOLLOW_FPS=0 and GCM_FRAME_LIMIT=off|vblank|<Hz> override as they do there.
 	void apply_pacing()
@@ -334,12 +341,17 @@ namespace
 			g_cfg.video.frame_limit.set(frame_limit_type::none);
 			g_cfg.video.second_frame_limit.set(std::min(std::atof(fl), 1000.0));
 		}
-		else if (!(fps > 0.0 && fps <= 60.5))
+		else if (!(fps > 0.0 && fps <= 60.5) || (fps != 30.0 && !(fl && *fl)))
 		{
+			// Above 60 fps / uncapped: the game limiter paces. R2PORT: also 31..60 fps -- there the game
+			// limiter (r2_frame_period) already paces the frame loop, and the RSX flip limiter on top of it
+			// was a second 60 Hz clock: the RSX thread slept in the flip while the PPU waited on its labels
+			// ([hitch] guestwait ~30 ms, then a frame of limiter debt run at once). GCM_FRAME_LIMIT=vblank:
+			// the old double pacing.
 			g_cfg.video.frame_limit.set(frame_limit_type::none);
 			g_cfg.video.second_frame_limit.set(0);
 		}
-		// else: up to 60 fps keep the yml limit (Auto = one vblank), main.cpp's min(1/fps, vblank)
+		// else: 30 fps (the game's own vsync wait paces) keeps the yml limit (Auto = one vblank)
 
 		std::printf("[r2rsx] pacing: R2_FPS %.1f -> vblank %d Hz%s, frame limit %d, second limit %.1f\n",
 			fps, static_cast<int>(g_cfg.video.vblank_rate.get()), g_cfg.video.vblank_ntsc.get() ? " (NTSC 59.94)" : "",
@@ -402,6 +414,7 @@ namespace
 		apply_pacing();
 
 		r2prof::enabled = penv_bool("R2_RSX_PROF") == 1 || s_prof_overlay;
+		r2prof::census_on = r2prof::enabled && penv_bool("R2_RSX_CENSUS") == 1; // R2PORT round 9
 
 		std::printf("[r2rsx] perf: cpu %s%s (%d threads, %.1f cores), shader compilers %d, MTRSX %d, async tex %d, "
 			"WCB %d, ZCULL accurate %d relaxed %d off %d, host labels %d | MSAA %d, high-precision Z %d, LOD bias %.2f, "
@@ -699,6 +712,76 @@ namespace
 					dx(r2prof::lk_fresh_noexist) / fr, dx(r2prof::lk_fresh_unlocked) / fr, dx(r2prof::lk_fresh_ctx) / fr,
 					dx(r2prof::lk_superseded) / fr, dx(r2prof::inval_isect_ns) / ms, dx(r2prof::inval_unprot_ns) / ms, dx(r2prof::inval_discards) / fr);
 			}
+			// Round-8: end-of-draw split, Vulkan recording share, uploads saved, cache misses, FIFO redundancy
+			{
+				const double us = 1000.0 * dr;
+				const double vk_ns = dx(r2prof::vk_bind_ns) + dx(r2prof::vk_dyn_ns) + dx(r2prof::vk_draw_ns);
+				const double meth = std::max(dx(r2prof::fifo_methods), 1.0);
+				bp("[r2rsx-prof]   r8 us/draw: decode state %.2f, resolve programs %.2f (texture env load %.2f), write barriers %.2f, "
+					"texture bind %.2f, on_write %.2f | Vulkan recording %.2f = pipeline+descriptors %.2f + dyn state/renderpass %.2f + draw %.2f | "
+					"vertex: index %.2f (%.0f B/draw), layout %.2f, attribute data %.0f B/draw\n",
+					dx(r2prof::dr_decode_ns) / us, dx(r2prof::dr_resolve_ns) / us, dx(r2prof::tex_load_ns) / us, dx(r2prof::dr_barrier_ns) / us,
+					dx(r2prof::tex_bind_ns) / us, dx(r2prof::dr_onwrite_ns) / us, vk_ns / us, dx(r2prof::vk_bind_ns) / us,
+					dx(r2prof::vk_dyn_ns) / us, dx(r2prof::vk_draw_ns) / us, dx(r2prof::vtx_idx_ns) / us, dx(r2prof::vtx_idx_bytes) / dr,
+					dx(r2prof::vtx_layout_ns) / us, dx(r2prof::vtx_data_bytes) / dr);
+				bp("[r2rsx-prof]   r8 per frame: pipeline slow lookups %.1f, in-memory misses %.2f, draws skipped (program not ready) %.2f | "
+					"FIFO methods %.0f (same value %.0f%%), draws merged %.1f (R2_FIFO_MERGE) | xform memo hits %.1f (%.1f KB skipped) | "
+					"index dedup hits %.1f (%.1f KB not re-copied, verify misses %.1f) | texture uploads %.1f (%.1f us each, async %.1f)\n",
+					dx(r2prof::pipe_slow) / fr, dx(r2prof::pipe_miss) / fr, dx(r2prof::pipe_not_ready) / fr,
+					dx(r2prof::fifo_methods) / fr, dx(r2prof::fifo_same) * 100.0 / meth, dx(r2prof::fifo_merged) / fr,
+					dx(r2prof::xc_memo_hits) / fr, dx(r2prof::xc_memo_bytes) / 1024.0 / fr,
+					dx(r2prof::idx_dedup_hits) / fr, dx(r2prof::idx_dedup_bytes) / 1024.0 / fr, dx(r2prof::idx_dedup_stale) / fr,
+					dx(r2prof::tex_up_count) / fr, dx(r2prof::tex_up_count) ? dx(r2prof::tex_up_ns) / 1000.0 / dx(r2prof::tex_up_count) : 0.0, dx(r2prof::tex_up_async) / fr);
+			}
+			// Round-9: usage census (R2_RSX_CENSUS=1): what to specialise for
+			if (r2prof::census_on)
+			{
+				static std::vector<u32> s_prev(0x4000 * 2 + 32 + 8 + 256 + 5 + 2);
+				std::vector<u32> cur(s_prev.size());
+				auto& c = r2prof::census;
+				usz k = 0;
+				for (auto& v : c.meth) cur[k++] = v.load(std::memory_order_relaxed);
+				for (auto& v : c.meth_same) cur[k++] = v.load(std::memory_order_relaxed);
+				for (auto& v : c.color_fmt) cur[k++] = v.load(std::memory_order_relaxed);
+				for (auto& v : c.depth_fmt) cur[k++] = v.load(std::memory_order_relaxed);
+				for (auto& v : c.tex_fmt) cur[k++] = v.load(std::memory_order_relaxed);
+				for (auto& v : c.mrt) cur[k++] = v.load(std::memory_order_relaxed);
+				cur[k++] = c.cond_render.load(std::memory_order_relaxed);
+				cur[k++] = c.draws.load(std::memory_order_relaxed);
+				std::vector<double> d(cur.size());
+				for (usz j = 0; j < cur.size(); ++j) d[j] = static_cast<double>(cur[j] - s_prev[j]);
+				s_prev = std::move(cur);
+				const double cdr = std::max(d[d.size() - 1], 1.0);
+
+				std::vector<u32> order(0x4000);
+				for (u32 j = 0; j < 0x4000; ++j) order[j] = j;
+				std::partial_sort(order.begin(), order.begin() + 24, order.end(), [&](u32 a, u32 b) { return d[a] > d[b]; });
+				std::string ms;
+				for (u32 j = 0; j < 24 && d[order[j]] > 0; ++j)
+				{
+					char b[64];
+					std::snprintf(b, sizeof(b), "%s%04x %.0f (%.0f%% same)", j ? ", " : "", order[j] * 4, d[order[j]] / fr, d[0x4000 + order[j]] * 100.0 / d[order[j]]);
+					ms += b;
+				}
+				bp("[r2rsx-prof]   r9 census FIFO methods/f by register (byte offset): %s\n", ms.c_str());
+
+				const auto list = [&](usz base, usz n, const char* fmt) {
+					std::string s;
+					for (usz j = 0; j < n; ++j)
+					{
+						if (d[base + j] <= 0) continue;
+						char b[48];
+						std::snprintf(b, sizeof(b), fmt, s.empty() ? "" : ", ", static_cast<unsigned>(j), d[base + j] * 100.0 / cdr);
+						s += b;
+					}
+					return s.empty() ? std::string("-") : s;
+				};
+				const usz cb = 0x8000;
+				bp("[r2rsx-prof]   r9 census per draw: colour fmt %s | depth fmt %s | MRT count %s | conditional-render draws %.1f%% | "
+					"texture fmt (per 100 draws) %s\n",
+					list(cb, 32, "%s%u %.0f%%").c_str(), list(cb + 32, 8, "%s%u %.0f%%").c_str(), list(cb + 40 + 256, 5, "%s%u %.0f%%").c_str(),
+					d[cb + 40 + 256 + 5] * 100.0 / cdr, list(cb + 40, 256, "%s0x%02x %.0f").c_str());
+			}
 			// Round-7: the monitor's own cost (previous cycle's print included)
 			const u64 mon_cpu1 = self_cpu_ns();
 			bp("[r2rsx-prof]   monitor: cpu %.1f ms/5s (thread scans %llu, %.1f ms), last print %.1f ms wall\n",
@@ -751,6 +834,10 @@ namespace
 
 		g_cfg.video.renderer.set(video_renderer::vulkan);
 		g_cfg.misc.use_native_interface.set(false);
+		// R2PORT OSD (r2rsx_osd.cpp): the overlay manager may exist for the port's own layers; keep RPCS3's
+		// own boot music and shader hints off
+		g_cfg.misc.play_music_during_boot.set(false);
+		g_cfg.misc.show_shader_compilation_hint.set(false);
 		apply_shader_defaults();
 		apply_launcher_overrides();
 		apply_port_perf(); // R2PORT perf
@@ -796,6 +883,7 @@ extern "C" void r2rsx_prof_enable(int on)
 {
 	s_prof_overlay = on != 0;
 	r2prof::enabled = s_prof_overlay || penv_bool("R2_RSX_PROF") == 1;
+	r2prof::census_on = r2prof::enabled && penv_bool("R2_RSX_CENSUS") == 1; // R2PORT round 9
 }
 
 // Deltas since the previous call: RSX frames, draws per frame and average draw time (us,
@@ -827,8 +915,13 @@ extern "C" int r2rsx_enabled(void)
 	return s_enabled;
 }
 
+extern "C" int rsx_null_backend_splash(int step, int steps, unsigned done, unsigned total);
+
 extern "C" void r2rsx_set_window(void* hwnd, uint32_t, uint32_t)
 {
+	// Dark start-up screen until the renderer's on_init (shader preload) is done: nothing is presented before
+	// that, and the unpainted window showed white (VKGSRender.cpp preload_shaders shows the progress on it).
+	if (hwnd) rsx_null_backend_splash(-1, 0, 0, 0);
 	{
 		std::lock_guard lock(s_win_mtx);
 		s_hwnd = static_cast<HWND>(hwnd);
@@ -1104,9 +1197,25 @@ extern "C" void r2rsx_set_zcull(uint32_t index, uint32_t offset, uint32_t width,
 extern "C" void r2rsx_wait_get(uint32_t put, unsigned max_ms)
 {
 	if (!s_up || !s_render->ctrl) return;
+	const u64 hitch_t0 = port_hitch_t0(); // R2PORT: [hitch] ring wrap: the guest thread waits for the RSX to drain
 	const u64 deadline = GetTickCount64() + max_ms;
 	while (s_render->ctrl->get != put && GetTickCount64() < deadline)
 	{
 		Sleep(0);
 	}
+	port_hitch_end_ppu_rsx(PH_RING, hitch_t0);
+}
+
+extern "C" void r2rsx_wait_get_outside(uint32_t lo, uint32_t hi, unsigned max_ms)
+{
+	if (!s_up || !s_render->ctrl) return;
+	const u64 hitch_t0 = port_hitch_t0();
+	const u64 deadline = GetTickCount64() + max_ms;
+	for (;;)
+	{
+		const u32 get = s_render->ctrl->get;
+		if (get < lo || get >= hi || GetTickCount64() >= deadline) break;
+		Sleep(0);
+	}
+	port_hitch_end_ppu_rsx(PH_RING, hitch_t0);
 }

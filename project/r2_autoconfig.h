@@ -56,6 +56,8 @@ struct Hardware
     bool strong = false;          // RTX 4070 class or better (or the AMD equivalent)
     int gpu_class = 0;            // 0 very weak / iGPU, 1 weak (2-4 GB), 2 mid, 3 high, 4 strong
     double eff_cores = 0;         // cores the game can use well (hybrid: P + E/2), as cpu_profile.inc
+    bool wine = false;            // running under Wine / Proton
+    bool deck = false;            // Steam Deck (Proton)
 };
 
 struct Settings
@@ -241,12 +243,25 @@ inline void detect_screen(Hardware& h)
     if (h.screen_w <= 0 || h.screen_h <= 0) { h.screen_w = GetSystemMetrics(SM_CXSCREEN); h.screen_h = GetSystemMetrics(SM_CYSCREEN); }
 }
 
+// Wine / Proton (Linux, Steam Deck): ntdll exports wine_get_version. Steam sets SteamDeck=1 on the Deck;
+// its APU also reports as "AMD Custom GPU 0405" (LCD) / "0932" (OLED) or "VanGogh".
+inline void detect_platform(Hardware& h)
+{
+    HMODULE nt = GetModuleHandleA("ntdll.dll");
+    h.wine = nt && GetProcAddress(nt, "wine_get_version") != NULL;
+    char v[8] = "";
+    h.deck = (GetEnvironmentVariableA("SteamDeck", v, sizeof v) && v[0] == '1') ||
+             has(h.gpu, "Custom GPU 0405") || has(h.gpu, "Custom GPU 0932") || has(h.gpu, "VanGogh");
+    if (h.deck) h.integrated = true;
+}
+
 inline void detect(Hardware& h)
 {
     detect_gpu(h);
     detect_cpu(h);
     detect_screen(h);
     classify(h);
+    detect_platform(h);
 }
 
 // RSX_RES_SCALE for an output height (the scale's 720p steps that the launcher offers).
@@ -275,7 +290,7 @@ inline Settings recommend(const Hardware& h, int tier = T_AUTO)
     s.cpu = h.eff_cores <= 4.0 ? "low" : h.eff_cores < 8.0 ? "mid" : "high";
     s.shader = "async";       // async recompiler: no compile stalls; the interpreter mode is untested
     s.vsync = "auto";         // FIFO when the target matches the display, tear-free MAILBOX otherwise
-    const char* aa = h.rtx ? "2" : "1";
+    const char* aa = h.rtx && !h.wine ? "2" : "1";   // DLSS under Proton needs extra setup: FSR there
     const char* screen = res_for_height(sh);
 
     switch (cls) {
@@ -311,6 +326,10 @@ inline Settings recommend(const Hardware& h, int tier = T_AUTO)
     s.window = "1280x720";
     for (const char* w : wins)
         if (atoi(w) < h.screen_w && atoi(strchr(w, 'x') + 1) < sh) { s.window = w; break; }
+    if (h.deck && tier == T_AUTO) {   // Steam Deck: PS3 resolution, FSR 1 to the 1280x800 screen, 30 fps
+        s.tier = T_LOW; s.res = "1"; s.fsr = "0"; s.upscale = "1"; s.aniso = "0";
+        s.filter = "fsr"; s.sharpen = "0.25"; s.fps = "30"; s.window = "1280x800";
+    }
     return s;
 }
 
@@ -323,7 +342,8 @@ inline void describe_hw(const Hardware& h, char* out, size_t n)
     char gpu[48];
     if (h.integrated) snprintf(gpu, sizeof gpu, "integrated");
     else snprintf(gpu, sizeof gpu, "%.0f GB%s", h.vram_gb, h.rtx ? ", RTX" : "");
-    snprintf(out, n, "%s (%s), %s, %.0f GB RAM, %dx%d @ %d Hz", h.gpu, gpu, cpu, h.ram_gb, h.screen_w, h.screen_h, h.refresh);
+    snprintf(out, n, "%s (%s), %s, %.0f GB RAM, %dx%d @ %d Hz%s", h.gpu, gpu, cpu, h.ram_gb, h.screen_w, h.screen_h, h.refresh,
+             h.deck ? ", Steam Deck" : h.wine ? ", Wine / Proton" : "");
 }
 inline const char* aa_text(const Settings& s)
 {

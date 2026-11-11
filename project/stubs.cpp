@@ -249,6 +249,8 @@ extern "C" void port_joblist_reset(uint32_t list)
  * poll a command job's status word). Recorded as SYSCALL spans with
  * a = 0x20000 | (tag & 0xFFFF), b = tag. */
 #include "ps3emu/ps3_ftrace.h"
+#define PORT_HITCH_IMPLEMENTATION
+#include "ps3emu/port_hitch.h"   /* [hitch] frame hitch logger (PORT_HITCH_LOG=0 off) */
 extern "C" unsigned long long port_ftw_now(void) { return PS3_FT_ON() ? ps3_ft_now() : 0ull; }
 extern "C" void port_ftw_span(unsigned tag, unsigned long long t0, ppu_context* ctx)
 {
@@ -457,7 +459,7 @@ extern "C" int port_frame_wait(uint64_t target, uint32_t last_ea)
       prev = now;
       if (!t0) t0 = now;
       if (now - t0 >= 5ull * 79800000ull && n) {
-          fprintf(stderr, "[fps] 5 s: %u frames, %.1f fps, frame %.2f ms avg, %.2f ms worst (target %d)\n",
+          port_log_async(1, "[fps] 5 s: %u frames, %.1f fps, frame %.2f ms avg, %.2f ms worst (target %d)\n",
                   n, n * 79800000.0 / (double)(now - t0), sum / n / 79800.0, (double)worst / 79800.0, (int)s_rf_mode);
           t0 = now; n = 0; sum = 0; worst = 0;
       } }
@@ -872,6 +874,17 @@ static DWORD WINAPI ptrace_key_thread(LPVOID) {
 }
 static int s_ptrace_key_init = (CloseHandle(CreateThread(NULL, 0, ptrace_key_thread, NULL, 0, NULL)), 0);
 static ULONGLONG s_ml_script_until;   /* v169: scripted camera active until (ms) */
+/* Local co-op: how many local players are in the game (split-screen when 2).
+ * The direct mouse look below is for one player; with two it is off and the
+ * mouse turns the keyboard player's right stick instead. */
+extern "C" int port_local_players(void)
+{
+    /* player slots' active flags (0x11E0B90/91; the join code at 0x3BADCC counts them) */
+    const int n = (vm_read8(0x11E0B90u) ? 1 : 0) + (vm_read8(0x11E0B91u) ? 1 : 0);
+    static int last = -1;
+    if (n != last) { if (last >= 0 || n > 1) fprintf(stderr, "[coop] local players: %d%c", n, 10); last = n; }
+    return n;
+}
 extern "C" void port_mouselook_pre(uint32_t player)
 {
     fall_watch(player);   /* v168 */
@@ -968,6 +981,7 @@ extern "C" void port_mouselook_pre(uint32_t player)
                   if (f) { fprintf(f, "t=%llu diff=%u d %.3f -> %.3f\n", GetTickCount64(), diff, d, base); fclose(f); } }
           } } }
     if (!g_ml_mode || !player) return;
+    if (port_local_players() > 1) return;   /* split-screen: the mouse is a right stick */
     ml_load();
     if (!ml_stick_is_mouse()) return;   /* controller / look keys: the stick turns the view as on PS3 */
     ml_check(g_ml_fed_rx, ml_rdf(player + 980), &s_ml_sx, &s_ml_bad_x, "yaw");
@@ -997,6 +1011,7 @@ extern "C" void port_mouselook(uint32_t player)
       g_port_opts_ea = c ? vm_read32(c + 6848) : 0; }
     const ULONGLONG now = GetTickCount64();
     long dx = InterlockedExchange(&g_kbm_ml_dx, 0), dy = InterlockedExchange(&g_kbm_ml_dy, 0);
+    if (port_local_players() > 1) return;   /* split-screen: the mouse is a right stick */
     /* counts gathered while the look code was not running (menus, pause,
      * cutscenes, a vehicle) are dropped, not applied in one jump */
     if (now - s_ml_last > 150 || !g_kbm_capture || !ml_stick_is_mouse()) dx = dy = 0;
@@ -1157,15 +1172,25 @@ extern "C" double r2_fps_target(void)
     const int near_refresh = f > 0.0 && fabs(f - hz) < 1.0;
     const char* v = getenv("RSX_VSYNC");
     if (v && !_stricmp(v, "auto")) {
-        _putenv_s("RSX_VSYNC", near_refresh ? "1" : "adaptive");
+        /* FIFO whenever the cap is at or under the refresh: it then never waits, and it is the mode G-Sync /
+         * FreeSync follow (the old "adaptive" picked MAILBOX, which on Windows presents at the fixed refresh:
+         * a 60 cap on a 144 Hz VRR screen juddered 2/3 refreshes). Uncapped / above refresh: adaptive. */
+        _putenv_s("RSX_VSYNC", (f > 0.0 && f <= hz + 1.0) ? "1" : "adaptive");
         v = getenv("RSX_VSYNC");
     }
     const int full_vsync = v && _stricmp(v, "adaptive") && atoi(v) > 0;
     const char* sn = getenv("R2_FPS_SNAP");
     if (near_refresh && full_vsync && f != 30.0 && !(sn && *sn == '0')) f = hz;
     fps = f;
+    { char fb[32]; snprintf(fb, sizeof fb, "%.3f", f); _putenv_s("PORT_FPS_EFFECTIVE", fb); snprintf(fb, sizeof fb, "%.3f", hz); _putenv_s("PORT_DISPLAY_HZ", fb); }   /* PORT_REFRESH_SWITCH (rsx_null_backend.c) */
     fprintf(stderr, "[fps] target %s%.3f (display %.3f Hz, RSX_VSYNC=%s)\n",
             f > 0.0 ? "" : "uncapped ", f, hz, v ? v : "(unset)");
+    if (f > 0.0 && f != 30.0) {   /* a fixed-refresh display only paces evenly at a divisor of its rate */
+        const double q = hz / f;
+        if (fabs(q - floor(q + 0.5)) > 0.03)
+            fprintf(stderr, "[fps] note: %.0f fps on a %.0f Hz display holds frames for alternating %d / %d refreshes (judder) unless VRR / G-Sync is on; even rates: %.0f or %.0f (R2_FPS); exclusive fullscreen switches to an even refresh (PORT_REFRESH_SWITCH)\n",
+                    f, hz, (int)floor(q), (int)ceil(q), hz / ceil(q), floor(q) >= 1.0 ? hz / floor(q) : hz);
+    }
     return fps;
 }
 
@@ -1214,11 +1239,54 @@ extern "C" volatile int g_ps3_host_paused; /* sys_ppu_thread.c: idle the SPU / R
 static volatile double s_r3_eff_fps = -1.0;
 static double r3_eff_fps(void) { const double e = s_r3_eff_fps; return e >= 0.0 ? e : r2_fps_target(); }
 
+/* PORT_DT_SMOOTH (default on, 0 = off): the game clock (func_007EEA44) steps by
+ * the real time since its last update, clamped to [r3_dt_floor, r3_dt_ceil].
+ * When the frame loop runs in uneven pairs -- a frame blocked ~2 periods on the
+ * RSX, then one that runs at once (one frame of limiter debt) -- the [hitch]
+ * logs show 0.3 + 31 ms frames on even 16.7 ms presents, and the clock stepped
+ * 8.3 (floor) then 31 ms: objects visibly jerk although the display is even.
+ * Here the step is the mean of the last 8 frame-loop intervals instead (same
+ * total time, no jerk). Only while the clock is updated a stable 1..4 times
+ * per frame, so a clock driven elsewhere (loading loops) keeps real time. */
+#define R3_DT_N 8
+static volatile double s_r3_dt = 0.0;   /* smoothed step, s; 0 = use the real time */
+static volatile LONG s_r3_dt_calls = 0;
+static void r3_dt_smooth_frame(uint64_t now, double fps, int discard)
+{
+    static int on = -1;
+    static uint64_t prev = 0;
+    static double ring[R3_DT_N]; static int n = 0, k = 0;
+    static LONG calls_prev = -1;
+    if (on < 0) {
+        const char* e = getenv("PORT_DT_SMOOTH"); on = !(e && *e == '0');
+        fprintf(stderr, "[fps] game clock step: %s\n", on ? "smoothed over 8 frames (PORT_DT_SMOOTH=0: raw)" : "raw (PORT_DT_SMOOTH=0)");
+    }
+    const LONG calls = InterlockedExchange(&s_r3_dt_calls, 0);
+    const LONG cp = calls_prev; calls_prev = calls;
+    if (!on || fps <= 30.0 || discard || !prev || calls < 1 || calls > 4 || calls != cp) {
+        prev = now; n = 0; k = 0; s_r3_dt = 0.0;
+        return;
+    }
+    double iv = (double)(now - prev) / 79800000.0;
+    prev = now;
+    const double ceil_s = 2.0 / (fps > 500.0 ? 500.0 : fps);
+    if (iv > ceil_s) iv = ceil_s;   /* a stall loses its time, as the clamp did */
+    ring[k] = iv; k = (k + 1) % R3_DT_N; if (n < R3_DT_N) n++;
+    if (n < R3_DT_N) { s_r3_dt = 0.0; return; }
+    double s = 0.0; for (int i = 0; i < R3_DT_N; i++) s += ring[i];
+    s_r3_dt = s / R3_DT_N;
+}
+
 extern "C" void r2pf_frame_tick(void);       /* r3_pcfeat.cpp: F3 overlay frame times */
+extern "C" void r2x_frame_tick(void);        /* r3_pcextra.cpp: benchmark, Reflex, photo mode */
 extern "C" double r2_frame_period(double f1)
 {
     InterlockedIncrement(&r2_game_frames);
-    r2pf_frame_tick();
+    int hitch_discard = 0;
+    { const uint64_t ht = port_hitch_t0();
+      r2pf_frame_tick();
+      r2x_frame_tick();
+      port_hitch_end(PH_TICK, ht); }
     /* PC port: hold the game's frame loop here while paused (window in the
      * background, R2_BACKGROUND=pause, or the quit prompt is up). The hang
      * watchdog is fed so a long pause is not taken for a hang. */
@@ -1227,6 +1295,7 @@ extern "C" double r2_frame_period(double f1)
         g_ps3_host_paused = 1;
         while (g_r2pc_paused) { Sleep(5); InterlockedIncrement(&r2_game_frames); }
         g_ps3_host_paused = 0;
+        hitch_discard = 1;
     }
     static int init = 0;
     static double fps = 30.0;
@@ -1252,9 +1321,10 @@ extern "C" double r2_frame_period(double f1)
         if (!t0) t0 = now;
         n++;
         if (now - t0 >= 5ull * 79800000ull) {
-            fprintf(stderr, "[fps] 5 s: %.1f fps (target 30)\n", n * 79800000.0 / (double)(now - t0));
+            port_log_async(1, "[fps] 5 s: %.1f fps (target 30)\n", n * 79800000.0 / (double)(now - t0));
             t0 = now; n = 0;
         }
+        port_hitch_frame(30.0, hitch_discard);
         return f1;
     }
 
@@ -1276,6 +1346,8 @@ extern "C" double r2_frame_period(double f1)
     if (pfps > 0.0) {
         const double step = 79800000.0 / pfps;
         if (next > 0.0 && (double)now < next) {
+            const uint64_t ht = port_hitch_t0();
+            struct hitch_scope { uint64_t t; ~hitch_scope() { port_hitch_end(PH_LIMIT, t); } } hs{ ht };
             if (precise) r2_pace_wait((uint64_t)next);
             else for (;;) {
                 now = ppu_timebase_now();
@@ -1299,10 +1371,12 @@ extern "C" double r2_frame_period(double f1)
       if (!t0) t0 = now;
       n++;
       if (now - t0 >= 5ull * 79800000ull) {
-          fprintf(stderr, "[fps] 5 s: %.1f fps (target %s%.3f)\n", n * 79800000.0 / (double)(now - t0),
+          port_log_async(1, "[fps] 5 s: %.1f fps (target %s%.3f)\n", n * 79800000.0 / (double)(now - t0),
                   fps > 0.0 ? "" : "uncapped ", fps);
           t0 = now; n = 0;
       } }
+    r3_dt_smooth_frame(now, pfps, hitch_discard);
+    port_hitch_frame(pfps, hitch_discard);
     return 0.0001;   /* the game's own wait then never holds the frame */
 }
 
@@ -1315,7 +1389,10 @@ extern "C" double r3_dt_floor(uint32_t bits)
     const double fps = r3_eff_fps();   /* 0 = uncapped */
     if ((fps > 0.0 && fps <= 30.0) || !(v > 0.0f)) return (double)v;
     const float m = 0.5f / (float)(fps <= 0.0 || fps > 500.0 ? 500.0 : fps);
-    return (double)(m < v ? m : v);
+    InterlockedIncrement(&s_r3_dt_calls);
+    const double r = (double)(m < v ? m : v);
+    const double sm = s_r3_dt;   /* PORT_DT_SMOOTH: floor = ceiling = the smoothed step */
+    return sm > r ? sm : r;
 }
 /* ...and obj+8 is the ceiling. Cinematics set floor = ceiling (1/30 or 1/75:
  * a fixed step per frame), which at 60 fps plays them 2x / 0.8x speed. Above
@@ -1326,7 +1403,9 @@ extern "C" double r3_dt_ceil(uint32_t bits)
     const double fps = r3_eff_fps();   /* 0 = uncapped: assume >= 60 fps */
     if ((fps > 0.0 && fps <= 30.0) || !(v > 0.0f)) return (double)v;
     const float m = 2.0f / (float)(fps <= 0.0 ? 60.0 : (fps > 500.0 ? 500.0 : fps));
-    return (double)(m > v ? m : v);
+    const double r = (double)(m > v ? m : v);
+    const double sm = s_r3_dt;
+    return (sm > 0.0 && sm < r) ? sm : r;
 }
 /* the hero's controller is controller 0 (pad port 0 = keyboard & mouse)? */
 static int r2ml_is_pad0(uint32_t slot)
@@ -1434,6 +1513,35 @@ static void r3ml_check(int fed, float rate, int* sign, int* bad, const char* wha
     }
 }
 extern "C" volatile double g_ml_sens_y;   /* cellPad.c: PAD_MOUSE_SENS_Y */
+/* cellPad.c (SDL3): gyro aiming with player 1's controller, taken here like
+ * the mouse so it is not limited to the stick's resolution. */
+extern "C" int cellpad_gyro_active(void);
+extern "C" int cellpad_gyro_take(double* yaw_deg, double* pitch_deg);
+static int s_r3ml_gyro = 0;   /* this frame's call takes the gyro, not the mouse */
+/* the game's aim multipliers (func_0017A458 -> sp+0x228 / sp+0x22C: the
+ * weapon's zoom sensitivity blended by the zoom amount); the largest
+ * value seen is unzoomed */
+static void r3ml_note_aim(uint32_t sp)
+{
+    const float m = ml_rdf(sp + 0x228);
+    if (m > 0.0f && m <= 10.0f) { if (m > s_r3ml_m1) s_r3ml_m1 = m;
+                                  s_r3ml_m = m; }
+    else s_r3ml_m = 0.0f;
+}
+/* zoom: this frame's aim multiplier against the unzoomed one */
+static void r3ml_update_zoom(void)
+{
+    s_r3ml_zoom = 1.0f;
+    if (s_r3ml_m > 0.0f && s_r3ml_m1 > 0.0f && s_r3ml_m < s_r3ml_m1) {
+      static double zs = -1.0; if (zs < 0.0) { const char* e = getenv("R2_ZOOM_SENS"); zs = e ? atof(e) : 1.0;
+                                               if (zs < 0.0) zs = 0.0; if (zs > 2.0) zs = 2.0; }
+      const double z = (double)s_r3ml_m / (double)s_r3ml_m1;
+      if (z > 0.01) s_r3ml_zoom = (float)pow(z, zs);
+      /* R2_ADS_SENS: extra multiplier while aiming / scoped (1 = as before) */
+      static double ads = -1.0; if (ads < 0.0) { const char* e = getenv("R2_ADS_SENS"); ads = e && *e ? atof(e) : 1.0;
+                                                 if (ads < 0.1) ads = 0.1; if (ads > 3.0) ads = 3.0; }
+      if (z < 0.99) s_r3ml_zoom = (float)(s_r3ml_zoom * ads); }
+}
 extern "C" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp)
 {
     (void)ctx;
@@ -1442,7 +1550,17 @@ extern "C" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp)
     if (!g_ml_mode || !hero) return;
     r3ml_load();
     const int dbg = r3ml_dbg();
-    if (!dbg && !ml_stick_is_mouse()) return;   /* controller / look keys: the stick turns the view as on PS3 */
+    const int mouse = ml_stick_is_mouse();
+    /* a controller with gyro aiming (one local player): the stick still turns
+     * as on PS3, and the gyro adds to it */
+    if (!dbg && !mouse && port_local_players() <= 1 && cellpad_gyro_active()) {
+        r3ml_note_aim(sp);
+        s_r3ml_gyro = 1;
+        s_r3ml_hero = hero;
+        return;
+    }
+    s_r3ml_gyro = 0;
+    if (!dbg && !mouse) return;   /* controller / look keys: the stick turns the view as on PS3 */
     const float ra = ml_rdf(hero + 0x52C), rb = ml_rdf(hero + 0x530);
     const int fx = g_ml_fed_rx, fy = g_ml_fed_ry;
     const int ax = fx >= 0 ? fx : -fx, ay = fy >= 0 ? fy : -fy;
@@ -1464,13 +1582,7 @@ extern "C" void r3_mouselook_pre(ppu_context* ctx, uint32_t hero, uint32_t sp)
         if (n++ < 40) fprintf(stderr, "[mouselook] pre hero 0x%08X 52C %+.4f 530 %+.4f fed %d,%d AD0 %.3f 9F8 %.3f sp228 %.3f sp22C %.3f%c",
                               hero, (double)ra, (double)rb, fx, fy, (double)ml_rdf(hero + 0xAD0), (double)ml_rdf(hero + 0x9F8),
                               (double)ml_rdf(sp + 0x228), (double)ml_rdf(sp + 0x22C), 10); }
-    /* the game's aim multipliers (func_0017A458 -> sp+0x228 / sp+0x22C: the
-     * weapon's zoom sensitivity blended by the zoom amount); the largest
-     * value seen is unzoomed */
-    { const float m = ml_rdf(sp + 0x228);
-      if (m > 0.0f && m <= 10.0f) { if (m > s_r3ml_m1) s_r3ml_m1 = m;
-                                    s_r3ml_m = m; }
-      else s_r3ml_m = 0.0f; }
+    r3ml_note_aim(sp);
     /* input locked (scripted sequence): a clearly deflected fed stick gives no rate */
     { const int big = ax >= 40 || ay >= 40;
       if (big && ra == 0.0f && rb == 0.0f) { if (++s_r3ml_lock_n >= 3) s_r3ml_lock_until = GetTickCount64() + 300; }
@@ -1485,21 +1597,21 @@ extern "C" void r3_mouselook(ppu_context* ctx, uint32_t hero)
     const ULONGLONG now = GetTickCount64();
     const int mine = hero == s_r3ml_hero; s_r3ml_hero = 0;
     if (!mine) return;
+    if (s_r3ml_gyro) {
+        double gy, gp;
+        if (!cellpad_gyro_take(&gy, &gp) || (gy == 0.0 && gp == 0.0)) return;
+        r3ml_update_zoom();
+        const double k = (double)s_r3ml_zoom * (3.14159265358979323846 / 180.0);
+        const double yaw = (double)s_r3ml_sx * gy * k, pitch = (double)s_r3ml_sy * gp * k;
+        if (!s_r3ml_swap) { ctx->fpr[31] = (double)(float)(ctx->fpr[31] + yaw);   ctx->fpr[30] = (double)(float)(ctx->fpr[30] + pitch); }
+        else              { ctx->fpr[31] = (double)(float)(ctx->fpr[31] + pitch); ctx->fpr[30] = (double)(float)(ctx->fpr[30] + yaw); }
+        return;
+    }
     long dx = InterlockedExchange(&g_kbm_ml_dx, 0), dy = InterlockedExchange(&g_kbm_ml_dy, 0);
     if (now - s_r3ml_last > 150 || !g_kbm_capture || now < s_r3ml_lock_until) dx = dy = 0;
     s_r3ml_last = now;
     if (!dx && !dy) return;
-    /* zoom: this frame's aim multiplier against the unzoomed one */
-    s_r3ml_zoom = 1.0f;
-    if (s_r3ml_m > 0.0f && s_r3ml_m1 > 0.0f && s_r3ml_m < s_r3ml_m1) {
-      static double zs = -1.0; if (zs < 0.0) { const char* e = getenv("R2_ZOOM_SENS"); zs = e ? atof(e) : 1.0;
-                                               if (zs < 0.0) zs = 0.0; if (zs > 2.0) zs = 2.0; }
-      const double z = (double)s_r3ml_m / (double)s_r3ml_m1;
-      if (z > 0.01) s_r3ml_zoom = (float)pow(z, zs);
-      /* R2_ADS_SENS: extra multiplier while aiming / scoped (1 = as before) */
-      static double ads = -1.0; if (ads < 0.0) { const char* e = getenv("R2_ADS_SENS"); ads = e && *e ? atof(e) : 1.0;
-                                                 if (ads < 0.1) ads = 0.1; if (ads > 3.0) ads = 3.0; }
-      if (z < 0.99) s_r3ml_zoom = (float)(s_r3ml_zoom * ads); }
+    r3ml_update_zoom();
     const double k = g_ml_deg_per_count * (double)s_r3ml_zoom * (3.14159265358979323846 / 180.0);
     if (g_ml_invert_y) dy = -dy;
     const double yaw = (double)s_r3ml_sx * (double)dx * k, pitch = (double)s_r3ml_sy * (double)dy * k * g_ml_sens_y;
@@ -1603,13 +1715,14 @@ static inline uint32_t be32p(const uint8_t* q) { return (uint32_t)((q[0] << 24) 
  * presses Start (cellPad.c); cleared as soon as the player's look code runs,
  * so in play Space is only jump and never pauses. */
 extern "C" volatile int g_port_space_start;
+extern "C" unsigned cellpad_menu_buttons(int* any_connected);   /* cellPad.c */
 extern "C" void port_text_patch(uint32_t file_obj)
 {
     static int en = -1;
     if (en < 0) { const char* e = getenv("PORT_KEY_PROMPTS"); en = e ? atoi(e) : 1; }
     if (!en || !file_obj) return;
     int pad = 0;   /* controller: keep the PS3 icons, only reword the grapple line (v157) */
-    { XINPUT_STATE xs; if (XInputGetState(0, &xs) == ERROR_SUCCESS) pad = 1; }
+    cellpad_menu_buttons(&pad);   /* any controller (SDL3 or XInput) */
     const uint32_t base = vm_read32(file_obj + 4);
     if (!base || vm_read32(base) != 0x49474857u) return;        /* "IGHW" */
     const uint32_t n = vm_read32(base + 8);
@@ -1917,54 +2030,12 @@ static void r2_input_mode(int mode)
     s_r2_mode = kbm;
 }
 extern "C" void (*volatile g_r2_input_mode_cb)(int kbm);
-/* PC port: console wording in the English text (core_text_tags) -> PC wording,
- * in place (every replacement is shorter than what it replaces; the rest of
- * the string's bytes become NULs). Runs on each text file as it is registered,
- * before the button glyphs are handled. R2_PC_TEXT=0 turns this off. Rules
- * that match no Resistance 3 string change nothing. */
-static int r2_pc_text(uint8_t* p, uint32_t end)
-{
-    static int en = -1;
-    if (en < 0) { const char* e = getenv("R2_PC_TEXT"); en = e ? atoi(e) : 1; }
-    if (!en) return 0;
-    static const struct { const char* find; const char* repl; int to_end; } rules[] = {
-        { "Press and hold the PS button to quit the application.", "Press F10 to quit the game.", 0 },
-        { "Insufficient Hard Disk Drive space.", "Insufficient disk space.", 0 },
-        { "Do not switch off the power when the HDD access indicator is flashing.",
-          "Do not close the game while it is saving.", 0 },
-        { "install data on your hard disk drive.", "install data on your disk.", 0 },
-        { "A wireless controller or navigation controller is not connected.", "A controller is not connected.", 0 },
-        { "Press START on the second wireless controller", "Press START on the second controller", 0 },
-        { "Wireless controller %d has been disconnected.", "Controller %d has been disconnected.", 0 },
-        { "Insufficient hard disk space.", "Insufficient disk space.", 0 },
-        { "Your HDD has insufficient space.", "Insufficient disk space.", 0 },
-    };
-    int n = 0;
-    for (uint32_t i = 1; i < end; i++) {
-        if (p[i - 1] != 0 || p[i] == 0) continue;
-        uint32_t m = 0; while (i + m < end && p[i + m]) m++;
-        if (i + m >= end) break;
-        for (auto& r : rules) {
-            const size_t fl = strlen(r.find), rl = strlen(r.repl);
-            if (fl > m) continue;
-            uint8_t* s = p + i; uint32_t len = m;
-            for (uint32_t k = 0; k + fl <= len; k++) {
-                if (memcmp(s + k, r.find, fl)) continue;
-                const uint32_t tail = r.to_end ? 0 : (uint32_t)(len - k - fl);
-                if (k + rl + tail > len) break;
-                memmove(s + k + rl, s + k + fl, tail);
-                memcpy(s + k, r.repl, rl);
-                memset(s + k + rl + tail, 0, len - (k + rl + tail));
-                len = (uint32_t)(k + rl + tail);
-                n++;
-                break;
-            }
-        }
-        i += m;
-    }
-    if (n) { static int said = 0; if (said++ < 4) fprintf(stderr, "[prompts] text file: %d console wording(s) -> PC wording%c", n, 10); }
-    return n;
-}
+/* PC port: console wording -> PC wording in every text file (all languages),
+ * in place; see r3_pctext.cpp (R3_PC_TEXT=0 turns it off; R2_PC_TEXT is used
+ * when it is unset). Runs on each text file as it is registered, before the
+ * button glyphs are handled. */
+extern "C" int port_pc_text(uint8_t* p, uint32_t end);
+static int r2_pc_text(uint8_t* p, uint32_t end) { return port_pc_text(p, end); }
 extern "C" void r2_text_patch(uint32_t file_obj)
 {
     static int en = -1;
@@ -2962,12 +3033,14 @@ static void hle_r3_kb_read(ppu_context* ctx)
     ctx->gpr[3] = 0;
 }
 
+extern "C" void cellUserInfo_register_select(void);   /* libs/system/cellUserInfo.c */
 extern "C" void ps3_load_prx_modules(void)
 {
     ps3_hle_register_ctx(0xFC52A7A9u, "sys_game_process_exitspawn", hle_game_process_exitspawn);
     ps3_hle_register_ctx(0x26090058u, "sys_prx_load_module", hle_r3_prx_load);
     ps3_hle_register_ctx(0xAA6D9BFFu, "sys_prx_load_module_on_memcontainer", hle_r3_prx_load);
     ps3_hle_register_ctx(0xFF0A21B7u, "cellKbRead", hle_r3_kb_read);
+    cellUserInfo_register_select();   /* local co-op: player 2 sign-in dialogs */
     menu_probe_start();   /* v160b diag */
 #ifdef _WIN32
     { static char dbgpath[1024];
@@ -3047,6 +3120,9 @@ extern "C" void ps3_load_prx_modules(void)
    func_007E9C30. With spare cores that is harmless; on a 4-core CPU it holds the core the SPU
    worker it waits on needs. Offer the core to any ready thread first (returns at once if none). */
 extern "C" int ps3_host_prio_boost(void);
+#ifdef PORT_TRACY
+#include "ps3emu/port_tracy.h"
+#endif
 /* On many-core hosts one PAUSE per lap frees the shared core for its SMT sibling (often an
    SPU worker on a 6c/12t CPU); the SPU's store still shows within one lap. R2_SPIN_PAUSE=0
    restores the bare loop. */
@@ -3054,6 +3130,9 @@ extern "C" void r3_spin_relax(void)
 {
     static const bool low = !ps3_host_prio_boost();
     static const bool pause = [] { const char* e = getenv("R2_SPIN_PAUSE"); return !e || atoi(e) != 0; }();
+#ifdef PORT_TRACY
+    PT_SPIN_LAP(PT_SPIN);   /* laps merge into one "spin" zone */
+#endif
     if (low) SwitchToThread();
     else if (pause) YieldProcessor();
 }

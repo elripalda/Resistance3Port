@@ -490,6 +490,42 @@ static int spurs_snr_hook(uint32_t tid, uint32_t num, uint32_t val)
 static SRWLOCK s_inst_directory_lock = SRWLOCK_INIT;
 static SRWLOCK s_workload_registry_lock = SRWLOCK_INIT;
 
+/* R3_SEMWAKE (default on; R3_SEMWAKE=0 or R2_SEMWAKE=0 off): an RSX label
+ * write (and a waiting RSX semaphore acquire, every ms) wakes SPURS at once:
+ * idle workloads lose their poll back-off (up to 16 kernel passes) and an SPU
+ * holding a reservation on the label's line gets its lost-reservation event
+ * now instead of at its next 10 ms poll. Idea from gow-ascension-pc's
+ * ps3recomp-0026-spurs-wake-on-gpu-report (MIT). */
+static void spurs_rsx_label_event(uint32_t ea)
+{
+    if (ea && spu_coh_is_reserved(ea)) {
+        spu_lockline_lock();
+        spu_coh_notify_write(ea);
+        spu_lockline_unlock();
+    }
+    for (int i = 0; i < MAX_SPURS_INST; i++) {
+        struct SpursInst* si = &s_inst[i];
+        if (!__atomic_load_n(&si->ea, __ATOMIC_ACQUIRE) || !si->kernel_live) continue;
+        if (TryAcquireSRWLockExclusive(&si->lock)) {
+            memset(si->idle, 0, sizeof si->idle);
+            ReleaseSRWLockExclusive(&si->lock);
+        }
+        WakeAllConditionVariable(&si->wake);
+    }
+}
+static void spurs_rsx_label_event_install(void)
+{
+    extern void (*volatile g_rsx_label_wake_hook)(uint32_t ea);
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("R3_SEMWAKE");
+        if (!e) e = getenv("R2_SEMWAKE");
+        on = (e && atoi(e) == 0) ? 0 : 1;
+        fprintf(stderr, "[cellSpurs] RSX label writes wake SPURS: %s\n", on ? "on (R3_SEMWAKE=0 to disable)" : "off");
+    }
+    if (on) g_rsx_label_wake_hook = spurs_rsx_label_event;
+}
+
 static s32 spurs_scheduler_start(struct SpursInst* si);
 static s32 spurs_scheduler_stop(struct SpursInst* si, u32 ea);
 static void spurs_scheduler_retire(u32 ea);
@@ -557,6 +593,7 @@ static s32 spurs_initialize_common(u32 spurs_ea, u32 nspus, const char* prefix)
     __atomic_store_n(&si->ea, spurs_ea, __ATOMIC_RELEASE);
     ReleaseSRWLockExclusive(&si->lock);
     ReleaseSRWLockExclusive(&s_inst_directory_lock);
+    spurs_rsx_label_event_install();
     si->nspus = (nspus > 0 && nspus <= CELL_SPURS_MAX_SPU) ? nspus : 1;
     /* Resistance port: extra host lanes. A SPURS kernel cannot preempt, so a
      * workload pinned to one SPU waits until whatever holds that SPU returns.

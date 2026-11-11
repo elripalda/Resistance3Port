@@ -1,0 +1,2 @@
+SDL 3.5.0 (git 8b6ae5d72496c04723fd3016ea7a5c138a156422, 2026-11-09), built static with clang-cl /MD Release from D:\Games\refs\SDL.
+Subsystems: video(events only)/joystick/haptic/hidapi/sensor. Rebuild: scratch\sdl3work\build_sdl3.bat (R2 port).

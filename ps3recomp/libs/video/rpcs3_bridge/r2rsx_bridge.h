@@ -56,6 +56,25 @@ void r2rsx_set_zcull(uint32_t index, uint32_t offset, uint32_t width, uint32_t h
 
 /* Wait (bounded) until the RSX has consumed the FIFO up to `put`. */
 void r2rsx_wait_get(uint32_t put, unsigned max_ms);
+/* Wait (bounded) until the RSX's GET is outside the IO range [lo, hi). */
+void r2rsx_wait_get_outside(uint32_t lo, uint32_t hi, unsigned max_ms);
+
+/* OSD layers (r2rsx_osd.cpp): port notifications and menus drawn into the swapchain image by
+ * RPCS3's overlay pass, so they show in exclusive fullscreen too (layered windows do not).
+ * PORT_OSD=layered keeps the old windows; default swapchain. Each slot is one BGRA image
+ * (straight alpha, pitch w*4, top-down) placed at x, y in a ref_w x ref_h space (the game
+ * window's client size) that is scaled to the swapchain. bgra NULL keeps the last pixels and
+ * only moves / fades the layer. While nothing flips (game paused) a layer change asks the RSX
+ * for a native UI flip. The last slot is the bridge's own warm-up layer. */
+#define R2RSX_OSD_SLOTS 16
+int  r2rsx_osd_wanted(void);   /* PORT_OSD is swapchain and the RPCS3 renderer is in use */
+int  r2rsx_osd_ready(void);    /* wanted, and the swapchain has presented at least once */
+void r2rsx_osd_layer(int slot, const void* bgra, int w, int h, int x, int y, int ref_w, int ref_h, float alpha);
+void r2rsx_osd_hide(int slot);
+int  r2rsx_osd_visible(int slot);       /* slot < 0: any port layer */
+void r2rsx_osd_suppress(int on);         /* hide every layer (screenshots), keep their state */
+unsigned r2rsx_osd_presents(void);       /* presents that ran the OSD overlay */
+void r2rsx_osd_refresh(void);            /* ask for a present if nothing flipped for ~16 ms */
 
 #ifdef __cplusplus
 }

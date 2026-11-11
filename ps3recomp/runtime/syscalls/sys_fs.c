@@ -36,6 +36,12 @@ char            g_sys_fs_root[512] = ".";
  * skips its boot movies in sys_fs_open instead (SKIP_INTRO), so this stays 0. */
 volatile int    g_port_intro_movie = 0;
 
+/* PC port extras (project r3_pcextra.cpp): told about every opened / closed
+ * file (movies for cutscene skip, level names for Discord). slot -1 = an open
+ * through runtime/ppu/ppu_fs.cpp (no close callback). */
+void (*volatile g_port_file_open_cb)(int slot, const char* path) = 0;
+void (*volatile g_port_file_close_cb)(int slot) = 0;
+
 /* PC port: push every open file's buffered writes to disk (quit path). */
 void sys_fs_flush_all(void)
 {
@@ -506,6 +512,7 @@ int64_t sys_fs_open(ppu_context* ctx)
     f->flags  = flags;
     strncpy(f->path, host_path, sizeof(f->path) - 1);
     f->path[sizeof(f->path) - 1] = '\0';
+    { void (*cb)(int, const char*) = g_port_file_open_cb; if (cb) cb(slot, host_path); }
 
     /* FD is slot + 3 (reserve 0=stdin, 1=stdout, 2=stderr) */
     int32_t fd = slot + 3;
@@ -664,6 +671,7 @@ int64_t sys_fs_close(ppu_context* ctx)
         f->fp = NULL;
     }
     f->active = 0;
+    { void (*cb)(int) = g_port_file_close_cb; if (cb) cb(slot); }
 
     return CELL_OK;
 }

@@ -75,6 +75,53 @@ list(LENGTH RECOMP_SOURCES RECOMP_SOURCE_COUNT)
 message(STATUS "Lifted sources:  ${RECOMP_SOURCE_COUNT} file(s)")
 
 # ---------------------------------------------------------------------------
+# Resistance port: CPU build options (build_cpu.bat; README "CPU build options")
+# ---------------------------------------------------------------------------
+#   PORT_ARCH=AVX2      runtime + hand-written code with /arch:AVX2 as well (the
+#                       lifted PPU/SPU code already is: PORT_PPU_V3/PORT_SPU_AVX2)
+#   PORT_ARCH=baseline  no AVX anywhere (x86-64 + SSE4.1 runtime) for older CPUs;
+#                       forces PORT_PPU_V3=OFF and PORT_SPU_AVX2=OFF
+#   PORT_ARCH=""        (default) the shipped mix, unchanged
+#   PORT_LTO=ON         ThinLTO (clang-cl -flto=thin + lld-link) for the runtime,
+#                       the hand-written and the lifted SPU code. PORT_LTO_PPU=ON
+#                       adds the 1.3 GB of lifted PPU code (hours of link).
+#   PORT_PGO=gen|use    clang instrumentation PGO, same scope (PORT_PGO_PPU=ON
+#                       adds the lifted PPU code). gen: instrumented exe writes
+#                       LLVM_PROFILE_FILE; use: PORT_PGO_PROFILE=<merged .profdata>.
+#   PORT_PPU_PREBUILT_OBJ_DIR=<dir>  link ppu_recomp_NNN.cpp.obj from <dir>
+#                       instead of compiling the lifted PPU code (they must be
+#                       built from the same lift with the same PPU flags).
+set(PORT_ARCH "" CACHE STRING "CPU target: empty (shipped mix) | AVX2 | baseline")
+option(PORT_LTO "ThinLTO for runtime, hand-written and lifted SPU code" OFF)
+option(PORT_LTO_PPU "ThinLTO for the lifted PPU code too" OFF)
+set(PORT_PGO "off" CACHE STRING "Profile-guided optimisation: off | gen | use")
+set(PORT_PGO_PROFILE "" CACHE FILEPATH "Merged .profdata for PORT_PGO=use")
+option(PORT_PGO_PPU "PGO for the lifted PPU code too" OFF)
+set(PORT_PPU_PREBUILT_OBJ_DIR "" CACHE PATH "Link prebuilt lifted PPU objects from this directory")
+if(PORT_ARCH STREQUAL "baseline")
+    set(PORT_PPU_V3 OFF)
+    set(PORT_SPU_AVX2 OFF)
+endif()
+set(RECOMP_PPU_COMPILED ${RECOMP_SOURCES})
+if(PORT_PPU_PREBUILT_OBJ_DIR)
+    set(_kept "")
+    set(_nobj 0)
+    foreach(src IN LISTS RECOMP_SOURCES)
+        get_filename_component(_n "${src}" NAME)
+        if(_n MATCHES "^ppu_recomp_[0-9]+\\.cpp$" AND EXISTS "${PORT_PPU_PREBUILT_OBJ_DIR}/${_n}.obj")
+            list(APPEND _kept "${PORT_PPU_PREBUILT_OBJ_DIR}/${_n}.obj")
+            math(EXPR _nobj "${_nobj} + 1")
+        else()
+            list(APPEND _kept "${src}")
+        endif()
+    endforeach()
+    set(RECOMP_SOURCES ${_kept})
+    set(RECOMP_PPU_COMPILED ${_kept})
+    list(FILTER RECOMP_PPU_COMPILED EXCLUDE REGEX "\\.obj$")
+    message(STATUS "Lifted PPU:      ${_nobj} prebuilt object(s) from ${PORT_PPU_PREBUILT_OBJ_DIR}")
+endif()
+
+# ---------------------------------------------------------------------------
 # ps3recomp runtime library
 # ---------------------------------------------------------------------------
 # Built from source as a subdirectory rather than imported as a prebuilt
@@ -197,9 +244,13 @@ add_executable(${PROJECT_NAME}
     r3_native_aa.cpp
     r3_pcport.cpp
     r3_patches.cpp
+    r3_hot.cpp
     r3_pcfeat.cpp
+    r3_pctext.cpp
     r3_trophies.cpp
     r3_mods.cpp
+    mods_psarc.cpp
+    r3_pcextra.cpp
     ${PS3RECOMP_SCAFFOLD}
     ${HLE_NID_TABLE}
     ${RECOMP_SOURCES}
@@ -242,6 +293,12 @@ if(SPU_SOURCES)
         set(_spu_defs SPU_USE_DISPATCH_MT SPU_LS_NO_DBG SPU_XF_NO_EXACT)
     else()
         set(_spu_defs SPU_USE_DISPATCH_MT)
+    endif()
+    # Resistance port: inline MFC latch writes / status reads in the lifted SPU
+    # code (spu_helpers.h). Runtime opt-out: SPU_INLINE_CH=0.
+    option(PORT_SPU_INLINE_CH "Lifted SPU code: inline MFC parameter/status channel ops" ON)
+    if(PORT_SPU_INLINE_CH)
+        list(APPEND _spu_defs SPU_INLINE_CH)
     endif()
     set_source_files_properties(${SPU_SOURCES} PROPERTIES
         INCLUDE_DIRECTORIES "${PS3RECOMP_DIR}/runtime/spu"
@@ -309,9 +366,14 @@ if(WIN32)
     set(R2_RPCS3_RSX_BUILD "${CMAKE_SOURCE_DIR}/../build_rpcs3" CACHE PATH "rpcs3_rsx build dir")
     if(EXISTS "${R2_RPCS3_RSX_BUILD}/rpcs3_rsx.lib")
         set(_r "${R2_RPCS3_RSX_BUILD}")
+        # build_rpcs3 generates vulkan-1.lib only when no Vulkan SDK is installed; with VULKAN_SDK set it links the SDK's.
+        set(_vk "${_r}/vulkan-1.lib")
+        if(NOT EXISTS "${_vk}" AND DEFINED ENV{VULKAN_SDK} AND EXISTS "$ENV{VULKAN_SDK}/Lib/vulkan-1.lib")
+            set(_vk "$ENV{VULKAN_SDK}/Lib/vulkan-1.lib")
+        endif()
         target_link_libraries(${PROJECT_NAME} PRIVATE
             "${_r}/rpcs3_rsx.lib"
-            "${_r}/vulkan-1.lib"
+            "${_vk}"
             "${_r}/rpcs3_asmjit.lib"
             "${_r}/3rdparty/glslang/glslang/SPIRV/SPIRV.lib"
             "${_r}/3rdparty/glslang/glslang/glslang/glslang.lib"
@@ -325,6 +387,16 @@ if(WIN32)
         target_link_options(${PROJECT_NAME} PRIVATE /STACK:8388608,1048576)
         message(STATUS "RSX:             RPCS3 core linked (${_r})")
     endif()
+endif()
+
+# mods_psarc.cpp (mods folder: PSARC member / asset overrides) uses miniz. rpcs3_rsx.lib
+# already contains it (r2_fossilize); without that library compile it here. The include
+# directory is set on this one file so the other TUs keep their compile commands.
+set(PORT_MINIZ_DIR "${PS3RECOMP_DIR}/third_party/fossilize/miniz")
+set_source_files_properties(mods_psarc.cpp PROPERTIES INCLUDE_DIRECTORIES "${PORT_MINIZ_DIR}")
+if(NOT (DEFINED R2_RPCS3_RSX_BUILD AND EXISTS "${R2_RPCS3_RSX_BUILD}/rpcs3_rsx.lib"))
+    target_sources(${PROJECT_NAME} PRIVATE "${PORT_MINIZ_DIR}/miniz.c")
+    set_source_files_properties("${PORT_MINIZ_DIR}/miniz.c" PROPERTIES COMPILE_OPTIONS "-w")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -385,6 +457,166 @@ elseif(MSVC)
 else()
     set_source_files_properties(${RECOMP_SOURCES} PROPERTIES
         COMPILE_OPTIONS "-w;-ffp-contract=off")
+endif()
+
+# ---------------------------------------------------------------------------
+# Memory-aware build (Setup.exe, docs\INSTALL.md): one lifted ppu_recomp_*.cpp
+# can take up to ~8 GB of RAM in clang-cl, so those files get their own Ninja
+# job pool "ppu" and the rest of the build keeps the normal -j. Pool size:
+# -DPORT_PPU_JOBS=N or the PORT_PPU_JOBS environment variable (Setup.exe sets
+# it from free RAM), else max(1, (total RAM GB - 6) / 8). Per-file pools need
+# CMake 4.2+; older CMake puts the whole game target in the pool (slower, same
+# memory bound). -DPORT_PPU_JOB_POOL=OFF restores the old behaviour.
+# ---------------------------------------------------------------------------
+option(PORT_PPU_JOB_POOL "Limit parallel compiles of the lifted PPU code by RAM (Ninja job pool)" ON)
+if(PORT_PPU_JOB_POOL AND CMAKE_GENERATOR MATCHES "Ninja")
+    if(DEFINED PORT_PPU_JOBS AND NOT "${PORT_PPU_JOBS}" STREQUAL "")
+        set(_ppu_jobs "${PORT_PPU_JOBS}")
+    elseif(NOT "$ENV{PORT_PPU_JOBS}" STREQUAL "")
+        set(_ppu_jobs "$ENV{PORT_PPU_JOBS}")
+    else()
+        cmake_host_system_information(RESULT _ram_mb QUERY TOTAL_PHYSICAL_MEMORY)
+        math(EXPR _ppu_jobs "(${_ram_mb} / 1024 - 6) / 8")
+    endif()
+    if(NOT _ppu_jobs MATCHES "^[0-9]+$" OR _ppu_jobs LESS 1)
+        set(_ppu_jobs 1)
+    endif()
+    set_property(GLOBAL APPEND PROPERTY JOB_POOLS ppu=${_ppu_jobs})
+    set(_ppu_pool_srcs ${RECOMP_SOURCES})
+    list(FILTER _ppu_pool_srcs INCLUDE REGEX "ppu_recomp_[0-9]+\\.cpp$")
+    if(CMAKE_VERSION VERSION_GREATER_EQUAL 4.2)
+        set_property(SOURCE ${_ppu_pool_srcs} PROPERTY JOB_POOL_COMPILE ppu)
+        message(STATUS "PPU job pool:    ${_ppu_jobs} parallel lifted-PPU compile(s)")
+    else()
+        set_property(TARGET ${PROJECT_NAME} PROPERTY JOB_POOL_COMPILE ppu)
+        message(STATUS "PPU job pool:    ${_ppu_jobs} (CMake < 4.2: whole game target)")
+    endif()
+endif()
+# ---------------------------------------------------------------------------
+# Resistance port: optional Tracy timeline (PORT_TRACY=ON; normal builds are
+# unchanged -- no Tracy sources, no PORT_TRACY define). Zones: lv2 syscalls,
+# HLE imports, SPU jobs and blocking channel waits, guest spin-waits (merged
+# laps) and "RSX flip" frame marks; see port_tracy.h / port_tracy.cpp.
+# ---------------------------------------------------------------------------
+option(PORT_TRACY "Build with Tracy profiler zones (connect the Tracy viewer)" OFF)
+set(PORT_TRACY_DIR "D:/Games/refs/tracy" CACHE PATH "Tracy source checkout")
+if(PORT_TRACY)
+    if(NOT EXISTS "${PORT_TRACY_DIR}/CMakeLists.txt")
+        message(FATAL_ERROR "PORT_TRACY=ON: no Tracy checkout at PORT_TRACY_DIR=${PORT_TRACY_DIR}")
+    endif()
+    set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
+    set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
+    # The port's VEH commits guest pages on access violations; Tracy's crash
+    # handler would treat those as crashes.
+    set(TRACY_NO_CRASH_HANDLER ON CACHE BOOL "" FORCE)
+    add_subdirectory("${PORT_TRACY_DIR}" "${CMAKE_BINARY_DIR}/tracy" EXCLUDE_FROM_ALL)
+    target_sources(${PROJECT_NAME} PRIVATE port_tracy.cpp)
+    target_link_libraries(${PROJECT_NAME} PRIVATE Tracy::TracyClient)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE PORT_TRACY)
+    target_compile_definitions(ps3recomp_runtime PRIVATE PORT_TRACY)
+    message(STATUS "Tracy:           ON (${PORT_TRACY_DIR}, on-demand, no crash handler)")
+endif()
+
+# ---------------------------------------------------------------------------
+# Resistance port: CPU build options, applied (see the PORT_ARCH block above)
+# ---------------------------------------------------------------------------
+if(MSVC AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Hand-written sources of the exe = everything but the lifted PPU/SPU code
+    # (taken from the target, so files other agents add are covered too).
+    get_target_property(_all_srcs ${PROJECT_NAME} SOURCES)
+    set(_hand_srcs "")
+    foreach(s IN LISTS _all_srcs)
+        if(s MATCHES "\\.(c|cc|cpp|cxx)$" AND NOT s MATCHES "ppu_recomp_[0-9a-z_]+\\.cpp$")
+            list(FIND SPU_SOURCES "${s}" _i)
+            if(_i EQUAL -1)
+                list(APPEND _hand_srcs "${s}")
+            endif()
+        endif()
+    endforeach()
+    set(_ppu_srcs ${RECOMP_PPU_COMPILED})
+    list(FILTER _ppu_srcs INCLUDE REGEX "ppu_recomp_[0-9]+\\.cpp$")
+    # PORT_FULL_INLINE also covers the hand-written sources added after the
+    # list above (patches, PC features, mods, the HLE NID table); they were
+    # still /Ob1, i.e. only functions spelt `inline` were inlined.
+    if(PORT_FULL_INLINE)
+        foreach(s IN LISTS _hand_srcs)
+            get_source_file_property(_o "${s}" COMPILE_OPTIONS)
+            if(NOT _o MATCHES "/Ob2")
+                set_property(SOURCE "${s}" APPEND PROPERTY COMPILE_OPTIONS "/Ob2")
+            endif()
+        endforeach()
+    endif()
+
+    # clang-cl guards every TLS access with an on-demand-init check
+    # (/Zc:tlsGuards: load + compare + branch + a second TLS address
+    # computation). C has no dynamically initialised thread-locals and every
+    # thread of an exe runs the TLS callback before user code, so in C sources
+    # the guard is dead code -- ~70k sites in the lifted SPU code alone.
+    option(PORT_C_TLS_NOGUARD "Drop clang-cl's TLS init guards in C sources" ON)
+    # /debug makes lld-link default to /OPT:NOREF; REF drops unreferenced
+    # COMDATs only (298 -> 283 MB on R3), relink time unchanged. Nothing in
+    # the port locates code by section or by symbol name. ICF is left off.
+    option(PORT_LINK_OPT_REF "Link with /OPT:REF (drop unreferenced functions/data)" ON)
+    if(PORT_LINK_OPT_REF)
+        target_link_options(${PROJECT_NAME} PRIVATE /OPT:REF)
+    endif()
+    if(PORT_C_TLS_NOGUARD)
+        target_compile_options(ps3recomp_runtime PRIVATE $<$<COMPILE_LANGUAGE:C>:/Zc:tlsGuards->)
+        target_compile_options(${PROJECT_NAME} PRIVATE $<$<COMPILE_LANGUAGE:C>:/Zc:tlsGuards->)
+    endif()
+
+    if(PORT_ARCH STREQUAL "AVX2")
+        # Contraction stays off: the runtime's float paths were validated without FMA.
+        target_compile_options(ps3recomp_runtime PRIVATE /arch:AVX2 /clang:-ffp-contract=off)
+        set_property(SOURCE ${_hand_srcs} APPEND PROPERTY COMPILE_OPTIONS "/arch:AVX2;/clang:-ffp-contract=off")
+        message(STATUS "CPU target:      AVX2 (runtime + hand-written + lifted)")
+    elseif(PORT_ARCH STREQUAL "baseline")
+        message(STATUS "CPU target:      baseline x86-64 (no AVX; PORT_PPU_V3/PORT_SPU_AVX2 off)")
+    endif()
+
+    set(_opt_srcs ${_hand_srcs} ${SPU_SOURCES})
+    if(PORT_LTO)
+        set(_lto_srcs ${_opt_srcs})
+        if(PORT_LTO_PPU)
+            list(APPEND _lto_srcs ${_ppu_srcs})
+        endif()
+        target_compile_options(ps3recomp_runtime PRIVATE -flto=thin)
+        set_property(SOURCE ${_lto_srcs} APPEND PROPERTY COMPILE_OPTIONS "-flto=thin")
+        # lld-link runs the ThinLTO backends; cache them so a relink after a
+        # small change only re-optimises the modules that changed.
+        target_link_options(${PROJECT_NAME} PRIVATE /opt:lldltojobs=all
+            "/lldltocache:${CMAKE_BINARY_DIR}/lto_cache" /INCREMENTAL:NO)
+        message(STATUS "LTO:             ThinLTO (runtime, hand-written, SPU; lifted PPU: ${PORT_LTO_PPU})")
+    endif()
+
+    if(PORT_PGO STREQUAL "gen" OR PORT_PGO STREQUAL "use")
+        set(_pgo_srcs ${_opt_srcs})
+        if(PORT_PGO_PPU)
+            list(APPEND _pgo_srcs ${_ppu_srcs})
+        endif()
+        if(PORT_PGO STREQUAL "gen")
+            set(_pgo_flag "-fprofile-instr-generate")
+            get_filename_component(_llvm_bin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+            file(GLOB _prof_rt "${_llvm_bin}/../lib/clang/*/lib/windows/clang_rt.profile-x86_64.lib")
+            if(NOT _prof_rt)
+                message(FATAL_ERROR "PORT_PGO=gen: clang_rt.profile-x86_64.lib not found under ${_llvm_bin}/../lib/clang")
+            endif()
+            list(GET _prof_rt 0 _prof_rt)
+            target_link_libraries(${PROJECT_NAME} PRIVATE "${_prof_rt}")
+            # main.cpp (cpu_profile.inc) flushes the counters every 30 s and at exit.
+            set_property(SOURCE main.cpp APPEND PROPERTY COMPILE_DEFINITIONS PORT_PGO_GEN)
+            message(STATUS "PGO:             instrumented (writes LLVM_PROFILE_FILE)")
+        else()
+            if(NOT EXISTS "${PORT_PGO_PROFILE}")
+                message(FATAL_ERROR "PORT_PGO=use needs PORT_PGO_PROFILE=<merged .profdata> (got '${PORT_PGO_PROFILE}')")
+            endif()
+            file(TO_NATIVE_PATH "${PORT_PGO_PROFILE}" _pd)
+            set(_pgo_flag "-fprofile-instr-use=${_pd};-Wno-profile-instr-unprofiled;-Wno-profile-instr-out-of-date;-Wno-backend-plugin")
+            message(STATUS "PGO:             optimising with ${PORT_PGO_PROFILE}")
+        endif()
+        target_compile_options(ps3recomp_runtime PRIVATE ${_pgo_flag})
+        set_property(SOURCE ${_pgo_srcs} APPEND PROPERTY COMPILE_OPTIONS "${_pgo_flag}")
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------

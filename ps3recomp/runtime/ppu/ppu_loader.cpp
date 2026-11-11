@@ -36,6 +36,7 @@
 #define PPU_NO_INLINE_STORES  /* likewise for the vm_write* family */
 #include "ppu_recomp.h"
 #include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE timeline */
+#include "ps3emu/port_tracy.h"   /* PORT_TRACY build only */
 #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
 #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
 #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
@@ -3316,6 +3317,10 @@ extern "C" void lv2_syscall(ppu_context* ctx)
                               ps3_ft_span(PS3_FT_SYSCALL, t, (uint32_t)num, lr, t0, t1);
                       } }
     } _sg{ ctx, num, PS3_FT_ON() ? ps3_ft_now() : 0, (uint32_t)ctx->lr };
+#ifdef PORT_TRACY
+    struct _PtGuard { ~_PtGuard() { PT_END(); } } _ptg;
+    PT_BEGIN(PT_SYSCALL, num);
+#endif
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
     /* Guest-PC breadcrumb for the sampling profiler: record the syscall

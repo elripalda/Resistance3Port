@@ -2,6 +2,11 @@
 setlocal
 cd /d "%~dp0"
 if not exist logs mkdir logs
+rem settings and controls are also kept in Saved Games\Resistance 3\config, so they survive a reinstall or update:
+rem missing files are restored from there before the game starts and saved back after it closes. portable.txt turns this off.
+set "CFG_USER=%USERPROFILE%\Saved Games\Resistance 3\config"
+set "CFG_FILES=settings.ini settings.bat controls.txt mouselook.cfg"
+if not exist portable.txt if exist "%CFG_USER%" robocopy "%CFG_USER%" . %CFG_FILES% /XO /XN /XC /R:0 /W:0 /NJH /NJS /NFL /NDL /NP >nul
 if not exist build\Resistance3.exe (echo The game is not built yet - run Setup.bat first. & pause & exit /b 1)
 rem ---- settings the port needs (Launcher.exe's choices come after, from settings.bat) ----
 set "SPURS_PM_YIELD=0"
@@ -28,5 +33,14 @@ rem shader cache backup (outside the game folder, so Setup/updates can't wipe it
 set "SHC_BACKUP=%LOCALAPPDATA%\Resistance3Port\shadercache"
 if exist "%SHC_BACKUP%" robocopy "%SHC_BACKUP%" shadercache /E /XO /XN /XC /R:0 /W:0 /NJH /NJS /NFL /NDL /NP >nul
 echo Running... (log: %~dp0logs\run.log). Close the game window to stop.
-build\Resistance3.exe "%~dp0game\EBOOT.elf" 2>&1 | "%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -Command "$input | Tee-Object -FilePath logs\run.log"
+rem which build: PORT_GAME_EXE (e.g. build_cpu\Resistance3.exe) wins; on a CPU without AVX2 (the launcher
+rem sets PORT_CPU_V3=0) the build_baseline one when it has been built (build_cpu.bat baseline)
+if not defined PORT_GAME_EXE set "PORT_GAME_EXE=build\Resistance3.exe"
+if "%PORT_CPU_V3%"=="0" if exist build_baseline\Resistance3.exe set "PORT_GAME_EXE=build_baseline\Resistance3.exe"
+rem output goes to logs\run.log only (Launcher.exe starts this file hidden, so there is no console window)
+"%PORT_GAME_EXE%" "%~dp0game\EBOOT.elf" > logs\run.log 2>&1
+rem the game can hand over to a new process (level loads, freeze restart): wait until none is left
+:waitgame
+for %%E in (Resistance3.exe) do tasklist /FI "IMAGENAME eq %%E" 2>nul | find /i "%%E" >nul && (ping -n 3 127.0.0.1 >nul & goto waitgame)
 if exist shadercache robocopy shadercache "%SHC_BACKUP%" /E /XO /R:0 /W:0 /NJH /NJS /NFL /NDL /NP >nul
+if not exist portable.txt robocopy . "%CFG_USER%" %CFG_FILES% /R:0 /W:0 /NJH /NJS /NFL /NDL /NP >nul

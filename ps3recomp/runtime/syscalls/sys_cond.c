@@ -6,6 +6,7 @@
  * guest mutex, and a later waiter cannot steal an earlier waiter's wakeup.
  */
 #include "sys_cond.h"
+#include "ps3emu/port_hitch.h"   /* [hitch] */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>
@@ -118,7 +119,17 @@ int64_t sys_cond_destroy(ppu_context* ctx)
     return result;
 }
 
+static int64_t sys_cond_wait_body(ppu_context* ctx);
 int64_t sys_cond_wait(ppu_context* ctx)
+{
+    /* [hitch]: blocking waits of the game's frame-loop thread */
+    if (!port_hitch_on_main()) return sys_cond_wait_body(ctx);
+    const uint64_t ht = port_hitch_t0();
+    const int64_t r = sys_cond_wait_body(ctx);
+    port_hitch_end(PH_SYNC, ht);
+    return r;
+}
+static int64_t sys_cond_wait_body(ppu_context* ctx)
 {
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */

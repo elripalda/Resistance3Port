@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include "ps3emu/log_first.h"
+#include "ps3emu/port_hitch.h"   /* [hitch]: guest wait call sites of the frame loop */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -69,6 +70,7 @@ int ps3_perf_on(const char* name, int def)
  * Guest-memory write notification (see sys_timer.h)
  * -----------------------------------------------------------------------*/
 volatile long g_guest_mem_seq = 0;
+volatile long g_ps3_stall_seq = 0;
 static volatile long s_mem_waiters = 0;   /* threads in a notify-aware short usleep */
 void ps3_guest_mem_notify(uint32_t ea)
 {
@@ -82,6 +84,18 @@ void ps3_guest_mem_notify(uint32_t ea)
     }
 }
 void (*volatile g_guest_mem_notify)(uint32_t ea) = ps3_guest_mem_notify;
+/* Plain SPU DMA PUTs (spu_dma.h). PS3_USLEEP_NOTIFY covered only SPU atomics
+ * (PUTLLC/PUTLLUC); a job kernel that reports completion with a plain PUT left
+ * the PPU poll (R2's job wait at 0x006B8D3C: usleep(128)) sleeping out its
+ * full interval. PS3_USLEEP_NOTIFY_PUT=0 off. Free when nobody waits. */
+static volatile int s_notify_put = -1;
+void ps3_guest_mem_notify_put(uint32_t ea)
+{
+    if (!s_mem_waiters) return;
+    if (__builtin_expect(s_notify_put < 0, 0))
+        s_notify_put = ps3_perf_on("PS3_USLEEP_NOTIFY", 1) && ps3_perf_on("PS3_USLEEP_NOTIFY_PUT", 1);
+    if (s_notify_put) ps3_guest_mem_notify(ea);
+}
 
 /* ---------------------------------------------------------------------------
  * Per-thread wait accounting (see sys_timer.h)
@@ -104,6 +118,17 @@ ps3_waitstat* ps3_waitstat_self(void)
     g_ps3_waitstat[i].tid = tid;
     t_waitstat = &g_ps3_waitstat[i];
     return t_waitstat;
+}
+
+/* R3_SEMLOG: once per long RSX label wait, per thread (see ps3_waitstat.h) */
+void ps3_stall_chain(const char* tag)
+{
+    static PS3_TLS long t_seen;
+    const long s = g_ps3_stall_seq;
+    if (!s || s == t_seen) return;
+    t_seen = s;
+    extern void ppu_log_host_chain(const char*);
+    ppu_log_host_chain(tag);
 }
 
 int64_t ps3_qpc_freq(void)
@@ -335,7 +360,10 @@ int64_t sys_timer_usleep(ppu_context* ctx)
     if (s_tcache < 0) {
         s_notify = ps3_perf_on("PS3_USLEEP_NOTIFY", 1);
         s_tcache = ps3_perf_on("PS3_USLEEP_TIMER_CACHE", 1);
+        fprintf(stderr, "[usleep] PS3_USLEEP_NOTIFY=%d PS3_USLEEP_NOTIFY_PUT=%d PS3_USLEEP_TIMER_CACHE=%d\n",
+                s_notify, s_notify && ps3_perf_on("PS3_USLEEP_NOTIFY_PUT", 1), s_tcache);
     }
+    PS3_STALL_CHAIN("semstall-usleep");
     ps3_waitstat* ws = ps3_waitstat_self();
     LARGE_INTEGER ws_t0; ws_t0.QuadPart = 0;
     if (ws) QueryPerformanceCounter(&ws_t0);
@@ -366,7 +394,8 @@ int64_t sys_timer_usleep(ppu_context* ctx)
             Sleep((DWORD)(usec / 1000));
         }
         if (ws) { LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
-                  ws->long_n++; ws->long_qpc += (unsigned long long)(t1.QuadPart - ws_t0.QuadPart); }
+                  ws->long_n++; ws->long_qpc += (unsigned long long)(t1.QuadPart - ws_t0.QuadPart);
+                  port_hitch_guest_wait((uint32_t)ctx->lr, t1.QuadPart - ws_t0.QuadPart); }
     } else if (usec > 0) {
         /* Sub-millisecond sleep. Sleep()/waitable timers round up to the
          * ~0.5-1 ms scheduler quantum, far too coarse for a guest that relies
@@ -406,7 +435,8 @@ int64_t sys_timer_usleep(ppu_context* ctx)
             } while (qpc_now.QuadPart < qpc_deadline);
         }
         if (ws) { LARGE_INTEGER t1; QueryPerformanceCounter(&t1);
-                  ws->short_n++; ws->short_qpc += (unsigned long long)(t1.QuadPart - ws_t0.QuadPart); }
+                  ws->short_n++; ws->short_qpc += (unsigned long long)(t1.QuadPart - ws_t0.QuadPart);
+                  port_hitch_guest_wait((uint32_t)ctx->lr, t1.QuadPart - ws_t0.QuadPart); }
     }
 #else
     if (usec > 0) {

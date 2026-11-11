@@ -664,6 +664,9 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
         /* GET: main memory -> local store */
         memcpy(ls_ptr, ea_ptr, size);
+        { extern volatile uint32_t g_semlog_rd_ea;   /* R3_SEMLOG: long label wait */
+          extern void semlog_note_read(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+          if (g_semlog_rd_ea) semlog_note_read((uint32_t)ea, size, 1, (uint32_t)spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK); }
         /* SPU_STACKEA_WATCH (b): scan the just-loaded payload for a 0xD00Cxxxx
          * dword = the completion-word EA arriving in a job buffer. */
         { static int s_se = -1; if (s_se < 0) s_se = getenv("SPU_STACKEA_WATCH") ? 1 : 0;
@@ -772,6 +775,8 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
                 }
             }
         } }
+        /* a PPU short-usleep poll (job-completion wait) re-checks now */
+        { extern void ps3_guest_mem_notify_put(uint32_t); ps3_guest_mem_notify_put((uint32_t)ea); }
         /* Tell whoever is listening where this PUT landed.
          *
          * A title whose SPUs build the RSX command stream never tells libgcm
@@ -781,6 +786,12 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
          * find the pushbuffer; NULL for every title that does not. */
         { extern void (*g_spu_put_hook)(uint32_t ea, uint32_t size);
           if (g_spu_put_hook) g_spu_put_hook((uint32_t)ea, size); }
+        { extern volatile int g_semlog_on;   /* R3_SEMLOG: GCM label writers */
+          extern void semlog_note_mem(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+          if (g_semlog_on) semlog_note_mem((uint32_t)ea, size, 1, (uint32_t)spu->image_id, (uint32_t)spu->pc & SPU_LS_MASK); }
+        { extern volatile uint32_t g_semfix_base;   /* R3_SEMFIX: label release/clear order */
+          extern void semfix_note_spu(uint32_t, uint32_t);
+          if (g_semfix_base && (uint32_t)ea - g_semfix_base < 0x1000u) semfix_note_spu((uint32_t)ea, size); }
         /* Bink sync-area watch (armed by the PPU barrier probe): log SPU PUTs
          * that touch the per-SPU lane counters. */
         { extern uint32_t g_barrier_sync_watch;

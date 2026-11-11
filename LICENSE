@@ -1,11 +1,13 @@
 MIT License
 
-Copyright (c) 2026 the Resistance 2 PC port contributors
+Copyright (c) 2026 the Resistance 3 PC port contributors
 
 This licence covers the port's own code (project/, tools/, the scripts and the
 changes made to ps3recomp/). ps3recomp/ keeps its own MIT licence
-(ps3recomp/LICENSE); tools/ffx_bin/ is AMD's (tools/ffx_bin/LICENSE.txt).
-It grants nothing in Resistance 2, which belongs to Sony
+(ps3recomp/LICENSE); tools/ffx_vk/ is AMD's (tools/ffx_vk/LICENSE.txt). Third-party
+code keeps its own licence: ps3recomp/third_party/ (see each folder), and the RPCS3
+patch in ps3recomp/patches/ is GPL-2.0 like RPCS3.
+It grants nothing in Resistance 3, which belongs to Sony
 Interactive Entertainment; no part of the game is included.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

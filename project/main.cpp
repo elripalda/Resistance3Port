@@ -87,6 +87,7 @@ uint8_t* vm_base = nullptr;
 uint8_t* vm_sudo_base = nullptr;
 /* RSX page-protection fault handler: guest address, 1 = write. Returns 1 if handled. */
 int (*g_vm_access_violation_hook)(uint32_t guest_addr, int is_write) = nullptr;
+extern "C" void spu_jobtime_av(long long qpc_ticks);   /* spu_drain.c */
 /* Unclaimed protection fault on a guarded page: the RSX page-guard registry
  * re-applies (or drops) the page's protection itself (rsx_page_guard_reconcile;
  * set by the engine). Returns 1 when the access can be retried. */
@@ -583,9 +584,14 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
                 if (mbi.State == MEM_COMMIT)
                     vm_mark_committed(i, fault - base);
             }
-            if (i == 0 && g_vm_access_violation_hook &&
-                g_vm_access_violation_hook((uint32_t)(fault - base), is_write))
-                return EXCEPTION_CONTINUE_EXECUTION;
+            if (i == 0 && g_vm_access_violation_hook) {
+                /* [spu-jobs]: fault-hook time inside a timed SPU job */
+                LARGE_INTEGER avq0, avq1; QueryPerformanceCounter(&avq0);
+                const int claimed = g_vm_access_violation_hook((uint32_t)(fault - base), is_write);
+                QueryPerformanceCounter(&avq1);
+                spu_jobtime_av(avq1.QuadPart - avq0.QuadPart);
+                if (claimed) return EXCEPTION_CONTINUE_EXECUTION;
+            }
             /* Another thread may have lifted the protection while this fault was
              * dispatched (RSX invalidation racing a SPU DMA): just retry. */
             if (VirtualQuery((void*)fault, &mbi, sizeof(mbi)) && mbi.State == MEM_COMMIT &&
