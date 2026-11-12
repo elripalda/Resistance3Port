@@ -213,6 +213,12 @@ $assets = @()
 $setupAsset = Join-Path $Dist "$($Prof.Short)-Setup-$ver.exe"
 if (-not (Test-Path -LiteralPath $setupAsset)) { throw "Expected $setupAsset was not built" }
 $assets += $setupAsset
+# Zip times are local time without a time zone: a player behind our time zone would get files dated
+# in the future, which makes Ninja regenerate forever. Dating every entry a day back avoids that.
+function Set-ZipPastTimes($zip) {
+    $t = [DateTimeOffset]::Now.AddDays(-1)
+    foreach ($e in @($zip.Entries)) { $e.LastWriteTime = $t }
+}
 if (Test-Path -LiteralPath $setupExe) {
     $relZip = Join-Path $Dist "$($Prof.Short)-$ver.zip"
     if (Test-Path -LiteralPath $relZip) { Remove-Item -LiteralPath $relZip -Force }
@@ -220,13 +226,19 @@ if (Test-Path -LiteralPath $setupExe) {
     if ($LASTEXITCODE -ne 0) { throw "git archive failed" }
     Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
     $z = [System.IO.Compression.ZipFile]::Open($relZip, 'Update')
-    try { [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, $setupExe, "$($Prof.Short)-$ver/Setup.exe") } finally { $z.Dispose() }
+    try {
+        [void][System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($z, $setupExe, "$($Prof.Short)-$ver/Setup.exe")
+        Set-ZipPastTimes $z
+    } finally { $z.Dispose() }
     $assets += $relZip
 }
 if ($SourceZip) {
     $srcZip = Join-Path $Dist "$($Prof.Short)-$ver-source.zip"
     & git -C $Repo archive --format=zip "--prefix=$($Prof.Short)-$ver/" -o $srcZip HEAD
     if ($LASTEXITCODE -ne 0) { throw "git archive failed" }
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $z = [System.IO.Compression.ZipFile]::Open($srcZip, 'Update')
+    try { Set-ZipPastTimes $z } finally { $z.Dispose() }
     $assets += $srcZip
 }
 $sums = @($assets | ForEach-Object { '{0}  {1}' -f (Get-FileHash -LiteralPath $_ -Algorithm SHA256).Hash.ToLowerInvariant(), (Split-Path -Leaf $_) })

@@ -47,6 +47,8 @@ WizardSmallImageFile={#ArtDir}\wizsmall_*.png
 DisableWelcomePage=no
 #endif
 DirExistsWarning=no
+; store file times in UTC so they are not "in the future" for players west of the packing PC (Ninja loops on those)
+TimeStampsInUTC=yes
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Shortcuts:"
