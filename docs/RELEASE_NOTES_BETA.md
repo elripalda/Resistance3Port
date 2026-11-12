@@ -1,6 +1,6 @@
 # Resistance 3 PC port: community beta release notes
 
-**Version:** 0.2.2-beta (GitHub pre-release). **Release date:** _to be filled in on release_.
+**Version:** 0.2.3-beta (GitHub pre-release). **Release date:** _to be filled in on release_.
 
 A native PC port of *Resistance 3* (PS3) built by static recompilation: the game's PowerPC and SPU code is translated to C/C++ and compiled for Windows. Graphics go through RPCS3's Vulkan renderer, built into the game as a library.
 
@@ -8,6 +8,13 @@ A native PC port of *Resistance 3* (PS3) built by static recompilation: the game
 
 This is a **beta**. Only the intro and the opening Haven level have been played through so far, on one PC (Ryzen 5 5600X, GeForce RTX 5070, Windows 11). Expect bugs, and please report them (see *Reporting problems*).
 
+## 0.2.3-beta (last hotfix)
+
+This is the last hotfix. The next updates focus on performance and stability, based on your reports and playthroughs.
+
+- **Setup works without winget.** If winget is missing or fails on your PC, Setup downloads the official installers of the build tools (Visual Studio Build Tools, CMake, Ninja, LLVM, Python, Git) directly, checks them (SHA-256 or Microsoft's signature) and installs them.
+- **RecompLauncher support.** The port can be installed, set up and played from [RecompLauncher](https://recomplauncher.com): it checks your copy, builds the game, shows the main video settings on the game's page and starts the game. Your own Launcher.exe and Setup.exe work as before.
+- The release zip is now named `...-Windows-x64.zip`.
 ## 0.2.2-beta (setup hotfix)
 
 - **Fixed: the build could fail right away with a Ninja/CMake error** ("build.ninja still dirty", or CMake re-running in a loop) for players in time zones behind ours. Files from the download could be dated a few hours in the future. The installer and zips now carry correct times, and the build resets any future-dated files before it starts.

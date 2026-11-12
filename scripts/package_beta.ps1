@@ -8,7 +8,7 @@
   the game, and Setup builds the game on their PC. The release assets are therefore:
     * <PortShort>-Setup-<VERSION>.exe  built by tools\installer\build_installer.ps1 (Inno Setup): the
       port's files (git-tracked + new not-ignored files) plus Launcher.exe (R1 also RFoMSwitch.exe).
-    * <PortShort>-<VERSION>.zip, the release zip: git archive of HEAD plus Setup.exe (the one-click
+    * <PortShort>-<VERSION>-Windows-x64.zip, the release zip: git archive of HEAD (with recomplauncher.json on top) plus Setup.exe (the one-click
       setup, gitignored) at its root. docs\INSTALL.md and the README tell players to download this.
     * the source archive, which GitHub generates from the tag (or -SourceZip: git archive of HEAD).
     * SHA256SUMS.txt for the assets.
@@ -220,7 +220,7 @@ function Set-ZipPastTimes($zip) {
     foreach ($e in @($zip.Entries)) { $e.LastWriteTime = $t }
 }
 if (Test-Path -LiteralPath $setupExe) {
-    $relZip = Join-Path $Dist "$($Prof.Short)-$ver.zip"
+    $relZip = Join-Path $Dist "$($Prof.Short)-$ver-Windows-x64.zip"   # system + processor in the name: RecompLauncher picks the file by them
     if (Test-Path -LiteralPath $relZip) { Remove-Item -LiteralPath $relZip -Force }
     & git -C $Repo archive --format=zip "--prefix=$($Prof.Short)-$ver/" -o $relZip HEAD
     if ($LASTEXITCODE -ne 0) { throw "git archive failed" }

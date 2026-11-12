@@ -1,0 +1,450 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "Resistance 3",
+  "repo": "miroslavdanutalexandru-alt/Resistance3Port",
+  "game": {
+    "kind": "iso_or_folder",
+    "label": "Your own copy of Resistance 3, US disc BCUS98176, version 1.00: its disc image (.iso), or its folder with PS3_GAME in it (as RPCS3 uses). Other regions and patched versions don't work yet.",
+    "check": {
+      "iso9660": "PS3_DISC.SFB",
+      "file": "PS3_DISC.SFB"
+    }
+  },
+  "start": {
+    "program": [
+      "Launcher.exe"
+    ],
+    "args": [
+      "--play"
+    ]
+  },
+  "prepare": {
+    "program": [
+      "Setup.exe"
+    ],
+    "args": [
+      "--prepare",
+      "--game",
+      "{game}"
+    ],
+    "label": "Building the game for your PC (the first time takes 20-60 minutes; Windows may ask once to install the free build tools)",
+    "timeout": 14400
+  },
+  "config": [
+    {
+      "id": "main",
+      "format": "ini",
+      "file": [
+        {
+          "path": "{install}/settings.ini"
+        }
+      ]
+    }
+  ],
+  "settings": [
+    {
+      "id": "display",
+      "label": "Display mode",
+      "help": "Borderless fills the screen and Alt+Tabs instantly. Exclusive has the lowest latency. Alt+Enter switches in game.",
+      "choices": [
+        {
+          "label": "Borderless",
+          "set": {
+            "display": "borderless"
+          }
+        },
+        {
+          "label": "Exclusive",
+          "set": {
+            "display": "exclusive"
+          }
+        },
+        {
+          "label": "Windowed",
+          "set": {
+            "display": "windowed"
+          }
+        }
+      ],
+      "defaults": {
+        "display": "borderless"
+      }
+    },
+    {
+      "id": "window",
+      "label": "Window size",
+      "help": "The size of the game's window in Windowed mode.",
+      "choices": [
+        {
+          "label": "1280 x 720",
+          "set": {
+            "window": "1280x720"
+          }
+        },
+        {
+          "label": "1600 x 900",
+          "set": {
+            "window": "1600x900"
+          }
+        },
+        {
+          "label": "1920 x 1080",
+          "set": {
+            "window": "1920x1080"
+          }
+        },
+        {
+          "label": "2560 x 1440",
+          "set": {
+            "window": "2560x1440"
+          }
+        },
+        {
+          "label": "3840 x 2160",
+          "set": {
+            "window": "3840x2160"
+          }
+        }
+      ],
+      "defaults": {
+        "window": "1920x1080"
+      },
+      "when": {
+        "display": "windowed"
+      }
+    },
+    {
+      "id": "fps",
+      "label": "Frame rate",
+      "help": "The PS3 game runs at 30. 60 doubles how often it updates and draws without playing faster; it needs about twice the CPU and GPU time.",
+      "choices": [
+        {
+          "label": "30 (PS3 original)",
+          "set": {
+            "fps": "30"
+          }
+        },
+        {
+          "label": "60",
+          "set": {
+            "fps": "60"
+          }
+        },
+        {
+          "label": "120",
+          "set": {
+            "fps": "120"
+          }
+        },
+        {
+          "label": "144",
+          "set": {
+            "fps": "144"
+          }
+        },
+        {
+          "label": "Match display",
+          "set": {
+            "fps": "refresh"
+          }
+        },
+        {
+          "label": "Just under refresh (G-Sync / FreeSync)",
+          "set": {
+            "fps": "vrr"
+          }
+        },
+        {
+          "label": "Uncapped",
+          "set": {
+            "fps": "0"
+          }
+        }
+      ],
+      "defaults": {
+        "fps": "60"
+      }
+    },
+    {
+      "id": "vsync",
+      "label": "VSync",
+      "help": "Off is smoothest on G-Sync / FreeSync screens. On removes tearing on others. Auto picks for you.",
+      "choices": [
+        {
+          "label": "Off",
+          "set": {
+            "vsync": "0"
+          }
+        },
+        {
+          "label": "On",
+          "set": {
+            "vsync": "1"
+          }
+        },
+        {
+          "label": "Adaptive",
+          "set": {
+            "vsync": "adaptive"
+          }
+        },
+        {
+          "label": "Auto",
+          "set": {
+            "vsync": "auto"
+          }
+        }
+      ],
+      "defaults": {
+        "vsync": "0"
+      }
+    },
+    {
+      "id": "res",
+      "label": "Render resolution",
+      "help": "What the game draws at. Higher is sharper but costs GPU time. With DLSS or FSR upscaling, keep it at your screen's.",
+      "choices": [
+        {
+          "label": "1280 x 720 (PS3 original)",
+          "set": {
+            "res": "1"
+          }
+        },
+        {
+          "label": "1920 x 1080",
+          "set": {
+            "res": "1.5"
+          }
+        },
+        {
+          "label": "2560 x 1440",
+          "set": {
+            "res": "2"
+          }
+        },
+        {
+          "label": "3200 x 1800",
+          "set": {
+            "res": "2.5"
+          }
+        },
+        {
+          "label": "3840 x 2160",
+          "set": {
+            "res": "3"
+          }
+        },
+        {
+          "label": "Match screen",
+          "set": {
+            "res": "auto"
+          }
+        }
+      ],
+      "defaults": {
+        "res": "3"
+      }
+    },
+    {
+      "id": "aa",
+      "label": "Anti-aliasing",
+      "help": "Smooths jagged edges. DLSS needs a GeForce RTX card and falls back to FSR on others. FSR works on any card.",
+      "choices": [
+        {
+          "label": "Off (PS3 original)",
+          "set": {
+            "fsr": "0"
+          }
+        },
+        {
+          "label": "AMD FSR 3.1",
+          "set": {
+            "fsr": "1"
+          }
+        },
+        {
+          "label": "NVIDIA DLSS",
+          "set": {
+            "fsr": "2"
+          }
+        },
+        {
+          "label": "Intel XeSS (experimental)",
+          "set": {
+            "fsr": "4"
+          }
+        }
+      ],
+      "defaults": {
+        "fsr": "2"
+      }
+    },
+    {
+      "id": "upscale",
+      "label": "Upscaling",
+      "help": "With DLSS, FSR or XeSS on: draws the scene smaller and upscales it. Much faster; the HUD stays sharp.",
+      "choices": [
+        {
+          "label": "Native (DLAA)",
+          "set": {
+            "upscale": "1"
+          }
+        },
+        {
+          "label": "Quality",
+          "set": {
+            "upscale": "0.667"
+          }
+        },
+        {
+          "label": "Balanced",
+          "set": {
+            "upscale": "0.58"
+          }
+        },
+        {
+          "label": "Performance",
+          "set": {
+            "upscale": "0.5"
+          }
+        }
+      ],
+      "defaults": {
+        "upscale": "0.5"
+      }
+    },
+    {
+      "id": "aniso",
+      "label": "Texture filtering",
+      "help": "Keeps floors and walls sharp at an angle. 16x costs almost nothing.",
+      "choices": [
+        {
+          "label": "Trilinear (PS3 original)",
+          "set": {
+            "aniso": "0"
+          }
+        },
+        {
+          "label": "2x",
+          "set": {
+            "aniso": "2"
+          }
+        },
+        {
+          "label": "4x",
+          "set": {
+            "aniso": "4"
+          }
+        },
+        {
+          "label": "8x",
+          "set": {
+            "aniso": "8"
+          }
+        },
+        {
+          "label": "16x",
+          "set": {
+            "aniso": "16"
+          }
+        }
+      ],
+      "defaults": {
+        "aniso": "0"
+      }
+    },
+    {
+      "id": "sharpen",
+      "label": "Sharpening",
+      "help": "Counteracts the softness of scaling and anti-aliasing.",
+      "choices": [
+        {
+          "label": "Off",
+          "set": {
+            "sharpen": "0"
+          }
+        },
+        {
+          "label": "Low",
+          "set": {
+            "sharpen": "0.25"
+          }
+        },
+        {
+          "label": "Medium",
+          "set": {
+            "sharpen": "0.5"
+          }
+        },
+        {
+          "label": "High",
+          "set": {
+            "sharpen": "0.8"
+          }
+        }
+      ],
+      "defaults": {
+        "sharpen": "0.25"
+      }
+    },
+    {
+      "id": "renderer",
+      "label": "Renderer",
+      "help": "Compatible (RPCS3) is the most tested. Native Vulkan is faster on weaker PCs but experimental.",
+      "choices": [
+        {
+          "label": "Compatible",
+          "set": {
+            "renderer": "rpcs3"
+          }
+        },
+        {
+          "label": "Native Vulkan (experimental)",
+          "set": {
+            "renderer": "vulkan"
+          }
+        }
+      ],
+      "defaults": {
+        "renderer": "rpcs3"
+      },
+      "advanced": true
+    }
+  ],
+  "saves": [
+    "{install}/gamedata/dev_hdd0/home/00000001/savedata",
+    "{install}/settings.ini",
+    "{install}/controls.txt"
+  ],
+  "folders": {
+    "saves": [
+      {
+        "path": "{install}/gamedata/dev_hdd0/home/00000001/savedata"
+      }
+    ],
+    "logs": [
+      {
+        "path": "{install}/logs"
+      }
+    ]
+  },
+  "actions": [
+    {
+      "id": "saves",
+      "label": "Saves",
+      "help": "Your saved games.",
+      "open": "saves"
+    },
+    {
+      "id": "logs",
+      "label": "Logs",
+      "help": "Logs to attach when you report a problem.",
+      "open": "logs"
+    }
+  ],
+  "exit_codes": {
+    "3": "The game isn't built yet. Run its setup again from the game's page.",
+    "4": "The game's start script (run.bat) couldn't start. Reinstall the game, or report it with the logs folder."
+  }
+}

@@ -7,6 +7,7 @@
 #       Installs the given tools. Setup.exe runs this once, elevated (one UAC prompt).
 #       Uses winget with exact package IDs; without winget it downloads the pinned
 #       installers below, checks their SHA-256 / Microsoft signature and runs them.
+#       If winget is there but fails for a tool, that tool falls back to the direct download.
 #       -DryRun only prints the commands it would run; -NoWinget forces the direct downloads.
 #
 # The tools: Python 3.10+ (decrypt + code generator), CMake 3.20+ (4.2+ for the
@@ -220,7 +221,14 @@ foreach ($id in $order) {
     Say "== $label"
     try {
         if ($id -eq 'VSModify') { $c = Modify-VS }
-        elseif ($wingetOk) { $c = Install-Winget $id }
+        elseif ($wingetOk) {
+            $c = Install-Winget $id
+            # winget is there but broken on some PCs (source errors, store policy): fall back to the pinned download
+            if (-not (Winget-Code-Ok $c)) {
+                Say "  winget failed (exit code $c); downloading the official installer instead"
+                $c = Install-Direct $id
+            }
+        }
         else { $c = Install-Direct $id }
         $ok = Winget-Code-Ok $c
         Say $(if ($ok) { "  done (exit code $c)" } else { "  FAILED (exit code $c)" })

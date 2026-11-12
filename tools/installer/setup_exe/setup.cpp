@@ -227,7 +227,7 @@ static bool NeedsRpcs3() { return Exists(P(L"tools\\fetch_rpcs3.ps1")); }
 
 // ---------------------------------------------------------------- options
 struct Options {
-    bool dryRun = false, uninstall = false, help = false;
+    bool dryRun = false, uninstall = false, help = false, prepare = false;
     wstring game, parseLog;
     double ramGB = 0, freeGB = 0, ppuGB = 0;
     int cores = 0, reduce = -1;
@@ -237,6 +237,11 @@ struct Options {
 static HWND g_hwnd = nullptr;
 static bool g_console = false;
 static HANDLE g_out = nullptr;
+// --prepare (RecompLauncher): no window; "progress <0..1> <text>" lines on stdout; exit code 0 = ready
+static bool g_prepare = false;
+static int g_prepProg = 0;  // 0..1000
+static int g_result = 1;
+static wstring g_prepStep, g_prepLast;
 static FILE* g_log = nullptr;
 static std::mutex g_logMx;
 
@@ -285,6 +290,13 @@ struct UiState {
     bool dirty = false;
 } g_ui;
 static void Kick() { if (g_hwnd) PostMessageW(g_hwnd, WM_APP_UI, 0, 0); }
+static void PrepProgress(const wstring& text) {
+    wstring t = text;
+    for (auto& ch : t) if (ch == L'\r' || ch == L'\n') ch = L' ';
+    if (t == g_prepLast) return;
+    g_prepLast = t;
+    ConsoleWrite(Fmt(L"progress %d.%03d ", g_prepProg / 1000, g_prepProg % 1000) + t + L"\r\n");
+}
 
 // a line for the log box (or the console) and logs\setup.log
 static void Say(const wstring& s) {
@@ -295,12 +307,18 @@ static void Say(const wstring& s) {
 }
 static void SetStep(const wstring& s) {
     LogRaw(L"[step] " + s);
+    if (g_prepare) { g_prepStep = s; PrepProgress(s); return; }
     if (g_console) { ConsoleWrite(L"== " + s + L"\r\n"); return; }
     { std::lock_guard<std::mutex> lk(g_ui.mx); g_ui.step = s; g_ui.dirty = true; }
     Kick();
 }
 static wstring g_lastDetail;
 static void SetDetail(const wstring& s, int progress = -1) {
+    if (g_prepare) {
+        if (progress >= 0) g_prepProg = std::min(1000, std::max(0, progress));
+        PrepProgress(s.empty() ? g_prepStep : s);
+        return;
+    }
     if (g_console) {
         if (!s.empty() && s != g_lastDetail) ConsoleWrite(L"   " + s + L"\r\n");
         g_lastDetail = s;
@@ -945,7 +963,7 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
                 SetDetail(meter.Text(), meter.Progress());
                 lastShown = now;
             }
-            if (!g_console && now - lastClock >= 1000) {
+            if ((!g_console || g_prepare) && now - lastClock >= (ULONGLONG)(g_prepare ? 5000 : 1000)) {
                 lastClock = now;
                 wstring base;
                 ULONGLONG t0;
@@ -965,6 +983,11 @@ static int RunSetupOnce(const Choice& c, const Jobs& j, wstring& stopMsg) {
                         double el = (now - copyT0) / 1000.0, done = copyNow - copy0;
                         if (el > 15 && done > 200e6) clock += L"  \x2022  " + Duration((total - copyNow) / (done / el)) + L" left";
                         copyProg = 100 + (int)(100 * std::min(1.0, copyNow / total));
+                    }
+                    if (g_prepare) {
+                        if (copyProg >= 0) g_prepProg = copyProg;
+                        if (copyProg >= 0 || quiet) PrepProgress((meter.m && copyProg < 0 ? meter.Text() : base) + L"   (" + clock + L")");
+                        continue;
                     }
                     std::lock_guard<std::mutex> lk(g_ui.mx);
                     g_ui.step = base + L"   (" + clock + L")";
@@ -1154,6 +1177,13 @@ static void SetupWorker(Choice c) {
     SetDetail(L"Start the game with the launcher (Start menu or desktop).", 1000);
     MakeShortcuts(c.desktop);
     Say(L"SETUP COMPLETE.");
+    g_result = 0;
+    if (g_prepare) {
+        // the RecompLauncher shows settings.ini: write the values recommended for this PC (never over the player's own)
+        if (!Exists(P(L"settings.ini")) && Exists(P(L"Launcher.exe")))
+            Run(Arg(P(L"Launcher.exe")) + L" --resave", [](const wstring&) {});
+        goto out;
+    }
     if (c.launch && Exists(P(L"Launcher.exe"))) ShellExecuteW(nullptr, L"open", P(L"Launcher.exe").c_str(), nullptr, g_port.c_str(), SW_SHOWNORMAL);
     else if (!c.launch) Ask(g_prof.name + L" is ready. Start it with the launcher (Start menu or desktop shortcut).", MB_OK | MB_ICONINFORMATION);
 out:
@@ -1509,6 +1539,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         if (a == L"--help" || a == L"-h" || a == L"/?") g_opt.help = true;
         else if (a == L"--dry-run") g_opt.dryRun = true;
         else if (a == L"--uninstall") g_opt.uninstall = true;
+        else if (a == L"--prepare") g_opt.prepare = true;
         else if (a == L"--game") g_opt.game = next();
         else if (a == L"--ram-gb") g_opt.ramGB = _wtof(next().c_str());
         else if (a == L"--free-gb") g_opt.freeGB = _wtof(next().c_str());
@@ -1528,6 +1559,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
                      L"  --dry-run            check this PC and print what Setup would do; changes nothing\r\n"
                      L"  --game <iso|folder>  fill in the game copy (the installer passes it); with --dry-run: also check it\r\n"
                      L"  --uninstall          remove what Setup made (with --dry-run: only list it)\r\n"
+                     L"  --prepare            no window (RecompLauncher): install tools, copy the game (--game) and build;\r\n"
+                     L"                       prints \"progress <0..1> <text>\" lines; exit code 0 = ready to play\r\n"
                      L"  --ram-gb N, --free-gb N, --cores N, --ppu-gb N, --reduce N\r\n"
                      L"                       pretend this RAM / free RAM / core count / GB per big file / out-of-memory retry\r\n"
                      L"                       level when planning the build job counts (also for a real run)\r\n"
@@ -1538,6 +1571,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
         return 0;
     }
     if (g_opt.dryRun) OpenConsole();
+    if (g_opt.prepare && !g_opt.dryRun) { g_prepare = true; OpenConsole(); }
     if (!LoadProfile() || !Exists(P(L"setup.ps1"))) {
         wstring t = L"Setup.exe must be in the port folder, next to setup.ps1 and the tools folder (" + g_port +
                     L").\r\n\r\nUnzip the whole release zip first, then run Setup.exe from the unzipped folder.";
@@ -1558,9 +1592,28 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND other = FindWindowW(L"ResistancePortSetup", nullptr);
         if (other) { ShowWindow(other, SW_RESTORE); SetForegroundWindow(other); }
+        if (g_prepare) { ConsoleWrite(L"Setup is already running for this game. Finish or close it, then try again.\r\n"); return 1; }
         return 0;
     }
     OpenLog(L"setup.log");
+    if (g_prepare) {
+        Choice c;
+        c.game = g_opt.game;
+        c.launch = false;
+        c.desktop = false;  // the launcher starts the game; a Start menu entry is still made
+        wstring sdk = GetState(L"sdks");
+        if (sdk.empty())
+            sdk = MessageBoxW(nullptr, (L"Also download the optional NVIDIA DLSS and Intel XeSS SDKs for " + g_prof.name +
+                                        L"?\r\n\r\nYes = I accept NVIDIA's and Intel's SDK licences.\r\nNo = skip them (AMD FSR works without them).").c_str(),
+                              (g_prof.name + L" setup").c_str(), MB_YESNO | MB_ICONQUESTION | MB_TOPMOST | MB_SETFOREGROUND) == IDYES
+                      ? L"accept" : L"skip";
+        c.sdks = sdk == L"accept";
+        SetupWorker(c);
+        if (g_result) ConsoleWrite(L"Setup did not finish. Details: " + P(L"logs\\setup.log") + L"\r\n");
+        if (g_log) fclose(g_log);
+        if (mutex) CloseHandle(mutex);
+        return g_result;
+    }
     if (g_opt.uninstall) {
         int r = Uninstall();
         if (g_log) fclose(g_log);

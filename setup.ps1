@@ -69,11 +69,27 @@ function Refresh-Path {
 }
 function Have($cmd) { return [bool](Get-Command $cmd -ErrorAction SilentlyContinue) }
 function Winget-Install($id, $label, $extra) {
-    if (-not (Have 'winget')) { Fail "winget is not available. Install 'App Installer' from the Microsoft Store, then run Setup.bat again." }
     Info "Installing $label (this can take several minutes)..."
-    $a = @('install', '--id', $id, '-e', '--accept-package-agreements', '--accept-source-agreements', '--silent')
-    if ($extra) { $a += $extra }
-    & winget @a | Out-Host
+    if (Have 'winget') {
+        $a = @('install', '--id', $id, '-e', '--accept-package-agreements', '--accept-source-agreements', '--silent')
+        if ($extra) { $a += $extra }
+        & winget @a | Out-Host
+        $c = $LASTEXITCODE
+        Refresh-Path
+        # 0, already installed, no newer version, reboot needed
+        if ($c -eq 0 -or $c -eq 3010 -or $c -eq -1978335135 -or $c -eq -1978335189 -or $c -eq -1978334967) { return }
+        Info "winget failed (exit code $c). Downloading the official installer instead (Windows asks for permission)..."
+    } else {
+        Info "winget is not available. Downloading the official installer instead (Windows asks for permission)..."
+    }
+    # the same pinned, SHA-256 / signature checked downloads Setup.exe uses (tools\installer\prereqs.ps1)
+    $pr = Join-Path $Port 'tools\installer\prereqs.ps1'
+    $lg = Join-Path $Port 'logs\prereqs_install.log'
+    try {
+        Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -Verb RunAs -Wait -ArgumentList `
+            "-NoProfile -ExecutionPolicy Bypass -File `"$pr`" -Install -NoWinget -Ids $id -Log `"$lg`""
+    } catch { Fail "Could not install $label (the permission prompt was declined?). Install it yourself and run Setup again." }
+    if (Test-Path $lg) { Get-Content -LiteralPath $lg -Tail 5 | ForEach-Object { Info $_ } }
     Refresh-Path
 }
 function Sha1Of($p) { (Get-FileHash -Algorithm SHA1 -LiteralPath $p).Hash.ToLower() }
@@ -218,7 +234,7 @@ function Test-ThisPC([switch]$Full) {
         else { Chk-Warn "The Windows 10/11 SDK was not found. The build needs it: open Visual Studio Installer, Modify, and tick a Windows 11 SDK." }
     } else { $missing++; Chk-Todo "Install Visual Studio 2022 Build Tools with the C++ workload (winget; several GB, can take 15+ minutes)." }
     if (Have 'winget') { Chk-Ok "winget" }
-    elseif ($missing) { Chk-Err "winget is missing, and Setup needs it to install the tools above. Install 'App Installer' from the Microsoft Store (or install those tools yourself), then run Setup.bat again." }
+    elseif ($missing) { Chk-Note "winget is not available: Setup downloads the official installers for the tools above directly." }
 
     if (-not $Full) { return }
     if (Test-Url 'https://github.com') { Chk-Ok "Internet (github.com)" } else { Chk-Err "github.com can't be reached. Setup downloads tools and libraries from GitHub: check the internet connection, proxy or firewall." }
